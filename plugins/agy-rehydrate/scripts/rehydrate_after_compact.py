@@ -9,7 +9,7 @@ and multi-surface (Antigravity 2.0 App, Antigravity CLI, Antigravity IDE) operat
   - 3-gate file security (`status == "DONE"` verification + `workspacePaths` boundary + sensitive denylist)
   - Nested/quoted rehydration block stripping + dynamic sequential section numbering
 
-Zero third-party dependencies (Python 3.9+ standard library only).
+Zero third-party dependencies (Python 3.14+ standard library only).
 """
 
 from __future__ import annotations
@@ -451,8 +451,7 @@ def extract_edit_snippets(tool_name: str, args: dict[str, Any]) -> list[str]:
     for key in ("Replacement", "ReplacementContent"):
         val = args.get(key)
         if isinstance(val, str) and val.strip():
-            trimmed = val.strip("\r\n")[:600]
-            snippets.append(f"{line_pfx}{trimmed}")
+            snippets.append(f"{line_pfx}{val.strip('\r\n')[:600]}")
     chunks = args.get("ReplacementChunks")
     if isinstance(chunks, list):
         for ch in chunks:
@@ -461,8 +460,7 @@ def extract_edit_snippets(tool_name: str, args: dict[str, Any]) -> list[str]:
                 cpfx = f"@@LINES:{cs or ''}:{ce or ''}@@\n" if (cs or ce) else line_pfx
                 rc = ch.get("ReplacementContent")
                 if isinstance(rc, str) and rc.strip():
-                    trimmed_rc = rc.strip("\r\n")[:600]
-                    snippets.append(f"{cpfx}{trimmed_rc}")
+                    snippets.append(f"{cpfx}{rc.strip('\r\n')[:600]}")
                 elif cpfx:
                     snippets.append(cpfx.rstrip("\n"))
     if not snippets and line_pfx:
