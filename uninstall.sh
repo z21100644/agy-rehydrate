@@ -2,7 +2,8 @@
 set -eu
 
 PLUGIN_NAME="agy-rehydrate"
-DST="${HOME}/.gemini/config/plugins/$PLUGIN_NAME"
+PLUGINS_DST="${AGY_PLUGINS_DST:-${HOME}/.gemini/config/plugins}"
+DST="$PLUGINS_DST/$PLUGIN_NAME"
 
 if [ -d "$DST" ]; then
   rm -rf "$DST"

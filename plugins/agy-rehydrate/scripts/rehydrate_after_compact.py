@@ -14,7 +14,6 @@ Zero third-party dependencies (Python 3.14+ standard library only).
 
 from __future__ import annotations
 
-import argparse
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,8 +23,6 @@ from pathlib import Path
 import re
 import sys
 from typing import Any
-import unicodedata
-from urllib.parse import unquote, urlparse
 
 sys.dont_write_bytecode = True
 
@@ -295,14 +292,32 @@ def load_rehydrate_config(workspace: Path | None = None) -> RehydrateConfig:
     )
 
 
+_NORM_PATH_CACHE: dict[str, str] = {}
+_CANON_KEY_CACHE: dict[str, str] = {}
+STEP_INDEX_STR_RE = re.compile(r'"step_index"\s*:\s*(\d+)')
+
+
+def _fast_basename(path_str: str) -> str:
+    """Extract filename without constructing a `pathlib.Path` object."""
+    p = path_str.rstrip("\\/")
+    idx = max(p.rfind("\\"), p.rfind("/"))
+    return p[idx + 1 :] if idx >= 0 else p
+
+
 def normalize_local_path(raw: str) -> str:
     """Convert POSIX, Windows drive, or `file://` URI string into a safe local absolute path (blocking UNC)."""
+    cached = _NORM_PATH_CACHE.get(raw)
+    if cached is not None:
+        return cached
     val = raw.strip()
     if not val:
         return ""
-    if val.lower().startswith("file://"):
+    if val[:7].lower() == "file://":
+        from urllib.parse import unquote, urlparse
+
         parsed = urlparse(val)
         if parsed.netloc and parsed.netloc.lower() != "localhost":
+            _NORM_PATH_CACHE[raw] = ""
             return ""
         raw_path = unquote(parsed.path or "")
         if len(raw_path) >= 3 and raw_path[0] == "/" and WINDOWS_DRIVE_ABS_RE.match(raw_path[1:]):
@@ -311,17 +326,27 @@ def normalize_local_path(raw: str) -> str:
             val = raw_path
 
     if val.startswith("\\\\") or val.startswith("//"):
-        return ""
-    if WINDOWS_DRIVE_ABS_RE.match(val):
-        return os.path.normpath(val)
-    if val.startswith("/") and os.name != "nt":
-        return os.path.normpath(val)
-    return ""
+        res = ""
+    elif WINDOWS_DRIVE_ABS_RE.match(val):
+        res = os.path.normpath(val)
+    elif val.startswith("/") and os.name != "nt":
+        res = os.path.normpath(val)
+    else:
+        res = ""
+    if len(_NORM_PATH_CACHE) < 4096:
+        _NORM_PATH_CACHE[raw] = res
+    return res
 
 
 def canonical_path_key(path_str: str) -> str:
     """Return platform-normalized key so slash and Windows-case variants deduplicate cleanly."""
-    return os.path.normcase(os.path.normpath(path_str))
+    cached = _CANON_KEY_CACHE.get(path_str)
+    if cached is not None:
+        return cached
+    res = os.path.normcase(os.path.normpath(path_str))
+    if len(_CANON_KEY_CACHE) < 4096:
+        _CANON_KEY_CACHE[path_str] = res
+    return res
 
 
 def _is_subpath(child: Path, parent: Path) -> bool:
@@ -393,8 +418,10 @@ def is_compact_slash_cmd(txt: str) -> bool:
 
 def is_low_info_short_turn(txt: str) -> bool:
     """Filter ultra-short backchannels/elliptical turns (<=4 non-punct chars, no ASCII/digits/slashes)."""
-    if ASCII_ALNUM_OR_SLASH_RE.search(txt) or any(ch.isdigit() for ch in txt):
+    if len(txt) > 24 or ASCII_ALNUM_OR_SLASH_RE.search(txt) or any(ch.isdigit() for ch in txt):
         return False
+    import unicodedata
+
     core = "".join(
         ch
         for ch in txt
@@ -403,18 +430,62 @@ def is_low_info_short_turn(txt: str) -> bool:
     return len(core) <= SHORT_USER_MAX_CHARS
 
 
-def fold_user_paste(txt: str, seg_path: Path | None, line_no: int, step_idx: int) -> tuple[str, bool]:
-    """Fold long pasted blocks (>800 chars) keeping head, tail, and lossless JSONL line pointer."""
-    if len(txt) <= FOLD_PASTE_THRESHOLD_CHARS:
-        return txt, False
-    omitted = len(txt) - FOLD_PASTE_HEAD_CHARS - FOLD_PASTE_TAIL_CHARS
-    if omitted <= 120:
-        return txt, False
+UI_BADGE_LINE_RE = re.compile(
+    r"^(?:Ran |Analyzed |Edited |Created |Deleted |Viewed |Searched |Used tool:\s*\S|Error: Model produced invalid output\.)"
+)
+
+
+def _strip_leading_ui_tool_badges(txt: str) -> str:
+    """Collapse leading copied Antigravity UI step-badge lines (`Ran ...`, `Analyzed ...`) so prose isn't buried."""
+    lines = txt.splitlines()
+    badge_count = 0
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        if not stripped:
+            idx += 1
+            continue
+        if UI_BADGE_LINE_RE.match(stripped):
+            badge_count += 1
+            idx += 1
+            continue
+        break
+    if badge_count >= 3 and idx < len(lines):
+        rest = "\n".join(lines[idx:]).lstrip()
+        if rest:
+            return f"[{badge_count} UI tool-log lines]\n{rest}"
+    return txt
+
+
+def fold_user_paste(
+    txt: str,
+    seg_path: Path | None,
+    line_no: int,
+    step_idx: int,
+    truncated_prefixes: list[str] | None = None,
+) -> tuple[str, bool]:
+    """Fold long pasted blocks (>800 chars), recovering only the tail when `<CONTEXT_SUMMARY>` kept the prefix."""
     loc = f"{seg_path} line {line_no} (step {step_idx})" if seg_path else f"step {step_idx}"
+    if truncated_prefixes and len(txt) > 550:
+        norm_txt = _norm_prompt_for_dedup(txt)
+        if any(norm_txt.startswith(pfx) for pfx in truncated_prefixes):
+            tail_keep = min(len(txt), 550)
+            return (
+                f"[Opening preserved in <CONTEXT_SUMMARY>; recovered truncated tail "
+                f"({len(txt)} chars total; read_file {loc} for full text)]:\n"
+                f"...{txt[-tail_keep:]}"
+            ), True
+
+    cleaned = _strip_leading_ui_tool_badges(txt)
+    if len(cleaned) <= FOLD_PASTE_THRESHOLD_CHARS:
+        return cleaned, cleaned != txt
+    omitted = len(cleaned) - FOLD_PASTE_HEAD_CHARS - FOLD_PASTE_TAIL_CHARS
+    if omitted <= 120:
+        return cleaned, cleaned != txt
     folded = (
-        f"{txt[:FOLD_PASTE_HEAD_CHARS]}\n"
+        f"{cleaned[:FOLD_PASTE_HEAD_CHARS]}\n"
         f"  ...[folded {omitted} chars of pasted content; read_file {loc} if exact text needed]...\n"
-        f"{txt[-FOLD_PASTE_TAIL_CHARS:]}"
+        f"{cleaned[-FOLD_PASTE_TAIL_CHARS:]}"
     )
     return folded, True
 
@@ -484,7 +555,7 @@ def format_single_tool_call(
             line_range = extract_tool_line_range(arg_dict)
         else:
             snippets = extract_edit_snippets(name, arg_dict)
-        label = Path(fpath).name if fpath else ""
+        label = _fast_basename(fpath) if fpath else ""
         summary = f"{name}({label or fpath})" if (label or fpath) else name
     elif name in ("run_command", "run_in_terminal") and isinstance(args, dict):
         cmd = str(args.get("CommandLine") or args.get("Command") or "").strip().replace("\n", " ")
@@ -559,11 +630,10 @@ def is_eligible_text_file(
 
 def is_skill_or_spec(path_str: str) -> bool:
     """Check whether `path_str` is a `SKILL.md` or Spec/Plan/Template/Handoff Markdown file."""
-    name = Path(path_str).name
-    upper = name.upper()
-    return upper == "SKILL.MD" or (
-        upper.endswith(".MD") and any(k in upper for k in ("SPEC", "PLAN", "TEMPLATE", "HANDOFF"))
-    )
+    upper = _fast_basename(path_str).upper()
+    if not upper.endswith(".MD"):
+        return False
+    return upper == "SKILL.MD" or any(k in upper for k in ("SPEC", "PLAN", "TEMPLATE", "HANDOFF"))
 
 
 PROSE_DOC_EXTS = frozenset({".md", ".mdx", ".rst", ".txt", ".adoc"})
@@ -572,10 +642,10 @@ PROSE_DOC_STEMS = frozenset({"readme", "changelog", "history", "notice", "licens
 
 def _modified_file_tier(path_str: str) -> int:
     """Classify modified workspace files: `2` = primary code/config, `1` = test suite, `0` = prose doc."""
-    p = Path(path_str)
-    ext = p.suffix.lower()
-    name_low = p.name.lower()
-    stem_low = p.stem.lower().split(".")[0]
+    name_low = _fast_basename(path_str).lower()
+    dot_idx = name_low.rfind(".")
+    ext = name_low[dot_idx:] if dot_idx >= 0 else ""
+    stem_low = name_low.split(".", 1)[0]
     if ext in PROSE_DOC_EXTS or stem_low in PROSE_DOC_STEMS:
         return 0
     slash_low = path_str.replace("\\", "/").lower()
@@ -812,10 +882,69 @@ def read_modified_hunk_window(
 
 CHECKPOINT_ATTACHMENT_LINE_RE = re.compile(r"(?m)^[ \t]*-\s*\[Attachment:\s*([^\]]+)\][ \t]*\r?$")
 ATTACHMENT_URI_PAREN_RE = re.compile(r"\(([^()]+)\)\s*$")
+CHECKPOINT_TRUNCATED_TAIL_RE = re.compile(r"\r?\n?<truncated\s+\d+\s+bytes>\s*$")
 
 
 def _norm_prompt_for_dedup(txt: str) -> str:
     return re.sub(r"\s+", " ", txt).strip()
+
+
+def _split_checkpoint_user_requests(raw_block: str) -> list[tuple[int, str]]:
+    """Split `# User Requests` into `(req_no, item_text)` pairs without breaking on embedded Markdown numbered lists."""
+    items: list[tuple[int, str]] = []
+    cur_top = 0
+    sub_num = 0
+    cur_lines: list[str] = []
+    num_re = re.compile(r"^(\d+)\.\s+(.*)$")
+
+    for line in raw_block.splitlines():
+        m = num_re.match(line)
+        if m:
+            n = int(m.group(1))
+            rest = m.group(2)
+            if cur_top == 0 and n == 1:
+                cur_top = 1
+                cur_lines = [rest]
+                continue
+            if cur_top >= 1:
+                prev_nonempty = next((ln.strip() for ln in reversed(cur_lines) if ln.strip()), "")
+                prev_was_truncated = bool(CHECKPOINT_TRUNCATED_TAIL_RE.search(prev_nonempty))
+                if prev_was_truncated:
+                    sub_num = 0
+                if n == cur_top + 1 and sub_num == 0:
+                    items.append((cur_top, "\n".join(cur_lines).strip()))
+                    cur_top = n
+                    cur_lines = [rest]
+                    continue
+                if n == 1:
+                    sub_num = 1
+                elif sub_num > 0 and n == sub_num + 1:
+                    sub_num = n
+        if cur_top >= 1:
+            cur_lines.append(line)
+
+    if cur_top >= 1 and cur_lines:
+        items.append((cur_top, "\n".join(cur_lines).strip()))
+    return items
+
+
+def extract_checkpoint_truncated_prefixes(cp_content: str) -> list[str]:
+    """Extract normalized prefixes of `# User Requests` items truncated by `<truncated N bytes>`."""
+    if not cp_content or "<truncated " not in cp_content:
+        return []
+    m = CHECKPOINT_USER_REQS_RE.search(cp_content)
+    if not m:
+        return []
+    prefixes: list[str] = []
+    for _, item in _split_checkpoint_user_requests(m.group(1)):
+        cleaned = CHECKPOINT_ATTACHMENT_LINE_RE.sub("", item).strip()
+        if not CHECKPOINT_TRUNCATED_TAIL_RE.search(cleaned):
+            continue
+        pfx = CHECKPOINT_TRUNCATED_TAIL_RE.sub("", cleaned).strip()
+        norm_pfx = _norm_prompt_for_dedup(pfx)
+        if len(norm_pfx) >= 120:
+            prefixes.append(norm_pfx)
+    return prefixes
 
 
 def extract_checkpoint_user_norms(cp_content: str) -> set[str]:
@@ -825,10 +954,8 @@ def extract_checkpoint_user_norms(cp_content: str) -> set[str]:
     m = CHECKPOINT_USER_REQS_RE.search(cp_content)
     if not m:
         return set()
-    raw_block = m.group(1)
-    parts = re.split(r"(?m)^\d+\.\s+", raw_block)
     norms: set[str] = set()
-    for item in parts[1:]:
+    for _, item in _split_checkpoint_user_requests(m.group(1)):
         cleaned = item.strip()
         if not cleaned or is_compact_slash_cmd(cleaned):
             continue
@@ -853,11 +980,8 @@ def extract_checkpoint_attachment_refs(cp_content: str, media_step_by_name: dict
     m = CHECKPOINT_USER_REQS_RE.search(cp_content)
     if not m:
         return []
-    raw_block = m.group(1)
     refs: list[str] = []
-    for req_match in re.finditer(r"(?m)^(\d+)\.\s+(.*?)(?=^\d+\.\s+|\Z)", raw_block, re.S):
-        req_no = req_match.group(1)
-        req_body = req_match.group(2)
+    for req_no, req_body in _split_checkpoint_user_requests(m.group(1)):
         for att_match in CHECKPOINT_ATTACHMENT_LINE_RE.finditer(req_body):
             att_desc = att_match.group(1).strip()
             uri_match = ATTACHMENT_URI_PAREN_RE.search(att_desc)
@@ -1022,12 +1146,16 @@ def validate_cached_ancestors(cached: Any, cur_first_step: int) -> list[dict[str
     return cleaned if cleaned[-1]["max_step"] + 1 == cur_first_step else None
 
 
-def resolve_fork_ancestors(full_path: Path, cached_ancestors: Any = None) -> list[dict[str, Any]]:
+def resolve_fork_ancestors(
+    full_path: Path,
+    cached_ancestors: Any = None,
+    first_info: tuple[int, float | None] | None = None,
+) -> list[dict[str, Any]]:
     """Trace `/fork` parent conversations up to `MAX_FORK_DEPTH` hops with strict step-range isolation."""
-    first_info = read_first_step_info(full_path)
-    if first_info is None or first_info[0] <= 0:
+    effective_first = first_info if first_info is not None else read_first_step_info(full_path)
+    if effective_first is None or effective_first[0] <= 0:
         return []
-    cur_first_step, cur_first_epoch = first_info
+    cur_first_step, cur_first_epoch = effective_first
     valid_cache = validate_cached_ancestors(cached_ancestors, cur_first_step)
     if valid_cache is not None:
         return valid_cache
@@ -1182,6 +1310,7 @@ def scan_compact_tail(compact_path: Path, prev_offset: int, prev_cp: int | None)
 def format_user_timeline(
     user_messages: list[tuple[int, str, Path | None, int]],
     budget_chars: int = DEFAULT_BUDGET_ALL_USER_CHARS,
+    truncated_prefixes: list[str] | None = None,
 ) -> tuple[str, int, int, int, int]:
     """Render earlier user request timeline with short-turn denoising and long-paste folding."""
     total_real = sum(1 for _, txt, _, _ in user_messages if not txt.startswith("--- [/fork branch "))
@@ -1205,8 +1334,12 @@ def format_user_timeline(
                 filtered_short += 1
                 continue
             out_txt = txt
-            if idx <= fold_cutoff or "[Quoted POST-COMPACT REHYDRATION" in txt:
-                out_txt, did_fold = fold_user_paste(txt, spath, lno, step_s)
+            has_trunc_pfx = False
+            if truncated_prefixes and len(txt) > 550:
+                norm_t = _norm_prompt_for_dedup(txt)
+                has_trunc_pfx = any(norm_t.startswith(p) for p in truncated_prefixes)
+            if has_trunc_pfx or idx <= fold_cutoff or "[Quoted POST-COMPACT REHYDRATION" in txt:
+                out_txt, did_fold = fold_user_paste(txt, spath, lno, step_s, truncated_prefixes=truncated_prefixes)
                 if did_fold:
                     folded_pastes += 1
             kept_real += 1
@@ -1305,7 +1438,10 @@ def _render_dialogue_entry(
     if role == "banner" or role == "in_progress":
         return body, False
     if role == "user":
-        clipped = body if len(body) <= 4500 else (body[:3200] + "\n...[turn clipped]...\n" + body[-1000:])
+        cleaned_u = _strip_leading_ui_tool_badges(body) if len(body) > 900 else body
+        clipped = (
+            cleaned_u if len(cleaned_u) <= 4500 else (cleaned_u[:3200] + "\n...[turn clipped]...\n" + cleaned_u[-1000:])
+        )
         return f"[Step {step_idx} | User]:\n{clipped}", False
     if condense_assistant and len(body) > OLDER_ASSISTANT_FOLD_THRESHOLD_CHARS:
         omitted = len(body) - OLDER_ASSISTANT_HEAD_CHARS - OLDER_ASSISTANT_TAIL_CHARS
@@ -1359,8 +1495,22 @@ def build_rehydration(
 
     with open(full_path, "r", encoding="utf-8", errors="replace") as f:
         last_cp: int | None = None
+        last_nonempty_line = ""
         for line in f:
             if not line.strip():
+                continue
+            if up_to_checkpoint_step is not None:
+                m_s = STEP_INDEX_STR_RE.search(line[:180])
+                if m_s:
+                    s_cand = int(m_s.group(1))
+                    if s_cand > up_to_checkpoint_step:
+                        break
+                    if s_cand > max_seen_step:
+                        max_seen_step = s_cand
+            last_nonempty_line = line
+            has_cp = '"CHECKPOINT"' in line
+            has_sys_marker = last_cp is not None and MARKER_PREFIX in line and '"SYSTEM_MESSAGE"' in line[:220]
+            if not has_cp and not has_sys_marker:
                 continue
             try:
                 obj = json.loads(line)
@@ -1370,7 +1520,8 @@ def build_rehydration(
             if isinstance(step_idx, int):
                 if up_to_checkpoint_step is not None and step_idx > up_to_checkpoint_step:
                     break
-                max_seen_step = max(max_seen_step, step_idx)
+                if step_idx > max_seen_step:
+                    max_seen_step = step_idx
             stype = obj.get("type")
             if stype == "CHECKPOINT" and isinstance(step_idx, int):
                 checkpoints.append(step_idx)
@@ -1379,6 +1530,17 @@ def build_rehydration(
             elif stype == "SYSTEM_MESSAGE" and last_cp is not None:
                 if MARKER_PREFIX in str(obj.get("content") or ""):
                     already_rehydrated_after.add(last_cp)
+        if up_to_checkpoint_step is None and last_nonempty_line:
+            m_last = STEP_INDEX_STR_RE.search(last_nonempty_line[:180])
+            if m_last:
+                max_seen_step = max(max_seen_step, int(m_last.group(1)))
+            else:
+                try:
+                    s_last = json.loads(last_nonempty_line).get("step_index", -1)
+                    if isinstance(s_last, int):
+                        max_seen_step = max(max_seen_step, s_last)
+                except json.JSONDecodeError:
+                    pass
 
     simulated = False
     if (
@@ -1411,7 +1573,9 @@ def build_rehydration(
 
     cur_first_info = read_first_step_info(full_path)
     cur_first_step = cur_first_info[0] if cur_first_info is not None else 0
-    resolved_ancestors = ancestors if ancestors is not None else resolve_fork_ancestors(full_path)
+    resolved_ancestors = (
+        ancestors if ancestors is not None else resolve_fork_ancestors(full_path, first_info=cur_first_info)
+    )
     segments: list[dict[str, Any]] = [
         *resolved_ancestors,
         {"cid": cur_cid, "path": str(full_path), "min_step": cur_first_step, "max_step": target_cp - 1},
@@ -1424,11 +1588,20 @@ def build_rehydration(
     read_touch: dict[str, tuple[str, int, tuple[int | None, int | None]]] = {}
     skill_spec_touch: dict[str, tuple[str, int, bool]] = {}
     pending_tools: list[str] = []
+    turn_buffered_assistants: list[tuple[int, list[str], str]] = []
     pending_call_queue: deque[tuple[str, str, str, tuple[int | None, int | None], list[str], int]] = deque()
     cur_batch_summaries: list[str] = []
     last_user_step = -1
     in_progress_turn = False
     window_raw_chars = 0
+
+    def _flush_uncompleted_assistants() -> None:
+        if not turn_buffered_assistants:
+            return
+        for b_step, b_tools, b_body in turn_buffered_assistants:
+            tpfx = f"  (Tools run: {_summarize_tool_chain(b_tools, max_items=6)})\n" if b_tools else ""
+            dialogue_entries.append((b_step, "assistant", tpfx, b_body))
+        turn_buffered_assistants.clear()
 
     for seg_idx, seg in enumerate(segments):
         seg_path = Path(seg["path"])
@@ -1438,6 +1611,7 @@ def build_rehydration(
             continue
         pending_call_queue.clear()
         _flush_step_batch(cur_batch_summaries, pending_tools)
+        _flush_uncompleted_assistants()
 
         if seg_idx > 0:
             fork_banner = (
@@ -1451,6 +1625,50 @@ def build_rehydration(
             for line_no, line in enumerate(f, 1):
                 if not line.strip():
                     continue
+                hdr = line[:240]
+                m_step = STEP_INDEX_STR_RE.search(hdr)
+                if m_step is not None:
+                    fast_sidx = int(m_step.group(1))
+                    if fast_sidx < seg_min:
+                        continue
+                    if fast_sidx > seg_max:
+                        break
+                    if (
+                        '"USER_INPUT"' not in hdr
+                        and '"PLANNER_RESPONSE"' not in hdr
+                        and '"CHECKPOINT"' not in hdr
+                        and '"SYSTEM_MESSAGE"' not in hdr
+                    ):
+                        if not pending_call_queue:
+                            if fast_sidx > prev_cp_step:
+                                window_raw_chars += max(0, len(line) - 140)
+                            continue
+                        if (
+                            len(line) > 2048
+                            and '"ERROR"' not in hdr
+                            and '"error"' not in hdr
+                            and "Encountered error in step execution:" not in line[:640]
+                            and '"error"' not in line[-320:]
+                            and ('"status": "DONE"' in hdr or '"status":"DONE"' in hdr)
+                        ):
+                            if fast_sidx > prev_cp_step:
+                                window_raw_chars += max(0, len(line) - 140)
+                            in_progress_turn = True
+                            tname, tsummary, fpath, lrange, esnips, call_step = pending_call_queue.popleft()
+                            cur_batch_summaries.append(tsummary)
+                            if fpath:
+                                if is_skill_or_spec(fpath):
+                                    _record_skill_spec_touch(
+                                        skill_spec_touch, fpath, call_step, tname in WRITE_TOOL_NAMES
+                                    )
+                                elif tname in WRITE_TOOL_NAMES:
+                                    _record_modified_touch(modified_touch, fpath, call_step, esnips)
+                                elif tname in READ_TOOL_NAMES:
+                                    _record_read_touch(read_touch, fpath, call_step, lrange)
+                            if not pending_call_queue:
+                                _flush_step_batch(cur_batch_summaries, pending_tools)
+                            continue
+
                 try:
                     obj = json.loads(line)
                 except json.JSONDecodeError:
@@ -1467,15 +1685,16 @@ def build_rehydration(
                         window_raw_chars += len(json.dumps(obj.get("tool_calls"), ensure_ascii=False))
                 if stype == "USER_INPUT":
                     pending_call_queue.clear()
-                    cur_batch_summaries.clear()
+                    _flush_step_batch(cur_batch_summaries, pending_tools)
+                    _flush_uncompleted_assistants()
                     pending_tools.clear()
                     raw_media = obj.get("media")
                     if isinstance(raw_media, list):
                         for m_item in raw_media:
                             if isinstance(m_item, dict):
-                                m_uri = str(m_item.get("uri") or "").strip().replace("\\", "/")
+                                m_uri = str(m_item.get("uri") or "").strip()
                                 if m_uri:
-                                    media_step_by_name[Path(m_uri).name.lower()] = step_idx
+                                    media_step_by_name[_fast_basename(m_uri).lower()] = step_idx
                     utext = extract_user_text(str(obj.get("content") or ""))
                     if utext and not is_compact_slash_cmd(utext):
                         last_user_step = step_idx
@@ -1486,23 +1705,40 @@ def build_rehydration(
                     pending_call_queue.clear()
                     _flush_step_batch(cur_batch_summaries, pending_tools)
                     mcontent = strip_nested_rehydration(str(obj.get("content") or "").strip())
-                    if mcontent:
-                        tool_prefix = ""
-                        if pending_tools:
-                            joined_tools = _summarize_tool_chain(pending_tools, max_items=6)
-                            tool_prefix = f"  (Tools run: {joined_tools})\n"
-                            pending_tools.clear()
-                        dialogue_entries.append((step_idx, "assistant", tool_prefix, mcontent))
-
                     tcs = obj.get("tool_calls") or []
                     valid_tcs = [tc for tc in tcs if isinstance(tc, dict)]
                     if valid_tcs:
                         in_progress_turn = True
+                        if mcontent:
+                            turn_buffered_assistants.append((step_idx, list(pending_tools), mcontent))
+                            pending_tools.clear()
                         for tc in valid_tcs:
                             tname, tsummary, fpath, lrange, esnips = format_single_tool_call(tc)
                             pending_call_queue.append((tname, tsummary, fpath, lrange, esnips, step_idx))
                     elif mcontent:
                         in_progress_turn = False
+                        merged_tools = [t for _, tls, _ in turn_buffered_assistants for t in tls] + list(pending_tools)
+                        turn_buffered_assistants.clear()
+                        pending_tools.clear()
+                        if (
+                            dialogue_entries
+                            and dialogue_entries[-1][1] == "assistant"
+                            and dialogue_entries[-1][0] > last_user_step
+                        ):
+                            prev_tpfx = dialogue_entries[-1][2]
+                            prev_tools = (
+                                [prev_tpfx.strip()[len("(Tools run: ") : -1]]
+                                if prev_tpfx.strip().startswith("(Tools run: ") and prev_tpfx.strip().endswith(")")
+                                else []
+                            )
+                            merged_tools = prev_tools + merged_tools
+                            dialogue_entries.pop()
+                        tool_prefix = (
+                            f"  (Tools run: {_summarize_tool_chain(merged_tools, max_items=6)})\n"
+                            if merged_tools
+                            else ""
+                        )
+                        dialogue_entries.append((step_idx, "assistant", tool_prefix, mcontent))
                 elif stype not in ("CHECKPOINT", "SYSTEM_MESSAGE") and pending_call_queue:
                     in_progress_turn = True
                     tname, tsummary, fpath, lrange, esnips, call_step = pending_call_queue.popleft()
@@ -1526,6 +1762,7 @@ def build_rehydration(
         in_progress_turn = False
 
     _flush_step_batch(cur_batch_summaries, pending_tools)
+    _flush_uncompleted_assistants()
     if pending_tools:
         dialogue_entries.append(
             (
@@ -1564,8 +1801,8 @@ def build_rehydration(
     if cfg.adaptive:
         win_base = max(window_raw_chars, 6000)
         if session_mode == "completed_qa":
-            ratio_cap = max(1600, min(7200, int(win_base * 0.10)))
-            content_pool = max(880, ratio_cap - frame_reserve)
+            ratio_cap = max(2200, min(7200, int(win_base * 0.10)))
+            content_pool = max(1480, ratio_cap - frame_reserve)
             if "maxRecentEntries" not in cfg.explicit_keys:
                 eff_recent_entries = 4
             if "budgetRecentTurnsChars" not in cfg.explicit_keys:
@@ -1593,16 +1830,23 @@ def build_rehydration(
     real_turn_count = 0
     seen_latest_assistant = False
     folded_assistant_count = 0
-    for s_idx, role, tool_pfx, body in reversed(dialogue_entries):
+    for rev_idx, (s_idx, role, tool_pfx, body) in enumerate(reversed(dialogue_entries)):
         is_banner = role == "banner"
         if not is_banner and real_turn_count >= eff_recent_entries:
             break
         condense = role == "assistant" and seen_latest_assistant
         rendered, did_fold = _render_dialogue_entry(s_idx, role, tool_pfx, body, condense_assistant=condense)
-        if used_turns + len(rendered) > eff_recent_budget:
-            if kept_turn_pairs:
+        pair_user_reserve = (
+            180
+            if condense and (real_turn_count + 1 < eff_recent_entries) and (rev_idx + 1 < len(dialogue_entries))
+            else 0
+        )
+        avail_budget = eff_recent_budget - pair_user_reserve
+        if used_turns + len(rendered) > avail_budget:
+            rem_turn_chars = avail_budget - used_turns
+            if kept_turn_pairs and rem_turn_chars < (220 if role == "user" else 550):
                 break
-            rendered = _clip_text_middle(rendered, max(360, eff_recent_budget))
+            rendered = _clip_text_middle(rendered, max(220, rem_turn_chars))
         if role == "assistant":
             seen_latest_assistant = True
             if did_fold:
@@ -1620,6 +1864,7 @@ def build_rehydration(
     non_banner_steps = [s for s, entry in kept_turn_pairs if not entry.startswith("--- [/fork branch ")]
     verbatim_start_step = min(non_banner_steps) if non_banner_steps else target_cp
     summary_user_norms = extract_checkpoint_user_norms(target_cp_content) if cfg.adaptive else set()
+    truncated_summary_prefixes = extract_checkpoint_truncated_prefixes(target_cp_content) if cfg.adaptive else []
 
     earlier_user_messages: list[tuple[int, str, Path | None, int]] = []
     deduped_summary_prompts = 0
@@ -1639,20 +1884,34 @@ def build_rehydration(
         else:
             break
 
+    eligibility_cache: dict[tuple[str, int], bool] = {}
+
+    def _cached_eligible(path_str: str, extra_mode: int = 0) -> bool:
+        ck = (canonical_path_key(path_str), extra_mode)
+        hit = eligibility_cache.get(ck)
+        if hit is not None:
+            return hit
+        if extra_mode == 1:
+            extra_roots = [r for r in skill_extra_roots if r is not None]
+        elif extra_mode == 2:
+            extra_roots = [effective_artifact_dir] if effective_artifact_dir else []
+        else:
+            extra_roots = None
+        ok = is_eligible_text_file(
+            path_str,
+            workspace_roots=workspace_roots,
+            allow_skill_or_artifact_roots=extra_roots,
+        )
+        eligibility_cache[ck] = ok
+        return ok
+
     eligible_skills: list[tuple[str, int, bool]] = []
     for _, (spath, sstep, was_mod) in sorted(skill_spec_touch.items(), key=lambda x: x[1][1], reverse=True):
         age = max(0, target_cp - sstep)
         if age > (max_mod_spec_age if was_mod else DEFAULT_MAX_READ_SKILL_AGE_STEPS):
             continue
-        is_skill_md = Path(spath).name.upper() == "SKILL.MD"
-        extra_roots = (
-            skill_extra_roots if is_skill_md else ([effective_artifact_dir] if effective_artifact_dir else [])
-        )
-        if is_eligible_text_file(
-            spath,
-            workspace_roots=workspace_roots,
-            allow_skill_or_artifact_roots=[r for r in extra_roots if r is not None],
-        ):
+        is_skill_md = _fast_basename(spath).upper() == "SKILL.MD"
+        if _cached_eligible(spath, 1 if is_skill_md else 2):
             eligible_skills.append((spath, sstep, was_mod))
 
     def _mod_sort_key(item: tuple[str, tuple[str, int, list[str]]]) -> tuple[int, int, int, int]:
@@ -1661,31 +1920,40 @@ def build_rehydration(
         tier = _modified_file_tier(p)
         return (hot_band, tier, st, len(snips))
 
-    mod_candidates = [
-        (key, p, st, (None, None), snips)
-        for key, (p, st, snips) in sorted(modified_touch.items(), key=_mod_sort_key, reverse=True)
-        if key not in skill_spec_touch
-        and _is_recent_mod_step(st)
-        and is_eligible_text_file(p, workspace_roots=workspace_roots)
-    ][: cfg.max_modified_files]
+    mod_candidates: list[tuple[str, str, int, tuple[int | None, int | None], list[str]]] = []
+    if cfg.max_modified_files > 0:
+        for key, (p, st, snips) in sorted(modified_touch.items(), key=_mod_sort_key, reverse=True):
+            if key in skill_spec_touch or not _is_recent_mod_step(st):
+                continue
+            if _cached_eligible(p, 0):
+                mod_candidates.append((key, p, st, (None, None), snips))
+                if len(mod_candidates) >= cfg.max_modified_files:
+                    break
     mod_keys = {key for key, _, _, _, _ in mod_candidates}
 
-    eligible_reads = [
-        (key, p, st, lr, [])
+    raw_read_items = [
+        (key, p, st, lr)
         for key, (p, st, lr) in sorted(read_touch.items(), key=lambda x: x[1][1], reverse=True)
-        if key not in skill_spec_touch
-        and key not in mod_keys
-        and is_eligible_text_file(p, workspace_roots=workspace_roots)
+        if key not in skill_spec_touch and key not in mod_keys
     ]
+    ref_candidates: list[tuple[str, str, int, tuple[int | None, int | None], list[str]]] = []
     if cfg.max_referenced_files > 0:
-        ref_candidates = eligible_reads[: cfg.max_referenced_files]
+        for key, p, st, lr in raw_read_items:
+            if _cached_eligible(p, 0):
+                ref_candidates.append((key, p, st, lr, []))
+                if len(ref_candidates) >= cfg.max_referenced_files:
+                    break
+        total_eligible_reads = sum(1 for _, p, _, _ in raw_read_items if _cached_eligible(p, 0))
     elif in_progress_turn and last_user_step >= 0:
-        ref_candidates = [item for item in eligible_reads if item[2] >= last_user_step][
-            :DEFAULT_MAX_IN_PROGRESS_READ_FILES
-        ]
+        for key, p, st, lr in raw_read_items:
+            if st >= last_user_step and _cached_eligible(p, 0):
+                ref_candidates.append((key, p, st, lr, []))
+                if len(ref_candidates) >= DEFAULT_MAX_IN_PROGRESS_READ_FILES:
+                    break
+        total_eligible_reads = len(raw_read_items)
     else:
-        ref_candidates = []
-    skipped_referenced_count = max(0, len(eligible_reads) - len(ref_candidates))
+        total_eligible_reads = len(raw_read_items)
+    skipped_referenced_count = max(0, total_eligible_reads - len(ref_candidates))
 
     if content_pool is None:
         rem_pool = None
@@ -1716,7 +1984,11 @@ def build_rehydration(
             kept_earlier_count,
             filtered_short_count,
             folded_paste_count,
-        ) = format_user_timeline(earlier_user_messages, budget_chars=eff_user_budget)
+        ) = format_user_timeline(
+            earlier_user_messages,
+            budget_chars=eff_user_budget,
+            truncated_prefixes=truncated_summary_prefixes,
+        )
     else:
         earlier_user_block = ""
         earlier_real_count = sum(1 for _, txt, _, _ in earlier_user_messages if not txt.startswith("--- [/fork branch "))
@@ -2060,13 +2332,6 @@ def run_hook() -> int:
             sys.stdout.write("{}\n")
             return 0
 
-        ws_roots = resolve_workspace_roots_from_payload(payload)
-        primary_ws = ws_roots[0] if ws_roots else None
-        cfg = load_rehydrate_config(primary_ws)
-        if not cfg.enabled:
-            sys.stdout.write("{}\n")
-            return 0
-
         compact_path, full_path, state_path = find_transcript_files(payload)
         if compact_path is None or full_path is None or state_path is None:
             sys.stdout.write("{}\n")
@@ -2086,7 +2351,15 @@ def run_hook() -> int:
         latest_cp, max_step, new_offset = scan_compact_tail(compact_path, prev_offset, prev_cp)
 
         if latest_cp is None or latest_cp == prev_cp:
-            save_state(state_path, latest_cp, new_offset, cached_ancestors)
+            if not had_state or latest_cp != prev_cp or new_offset != prev_offset:
+                save_state(state_path, latest_cp, new_offset, cached_ancestors)
+            sys.stdout.write("{}\n")
+            return 0
+
+        ws_roots = resolve_workspace_roots_from_payload(payload)
+        primary_ws = ws_roots[0] if ws_roots else None
+        cfg = load_rehydrate_config(primary_ws)
+        if not cfg.enabled:
             sys.stdout.write("{}\n")
             return 0
 
@@ -2183,6 +2456,8 @@ def resolve_target_transcript(target: str) -> tuple[str, str, Path, Path] | None
 
 def run_cli(argv: list[str]) -> int:
     """Read-only diagnostic CLI for `/rehydrate` (`status`, `inspect`, `preview`, `show-config`)."""
+    import argparse
+
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--cwd", default=None, help="Workspace root directory")
 

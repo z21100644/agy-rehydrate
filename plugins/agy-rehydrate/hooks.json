@@ -4,7 +4,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "cd /d %PLUGIN_ROOT% && (python -B scripts/rehydrate_after_compact.py --hook || py -3 -B scripts/rehydrate_after_compact.py --hook) || (IFS=; cd ${PLUGIN_ROOT:-.} && (python3 -B scripts/rehydrate_after_compact.py --hook || python -B scripts/rehydrate_after_compact.py --hook))",
+        "command": "python -B scripts/rehydrate_after_compact.py --hook || python3 -B scripts/rehydrate_after_compact.py --hook || py -3 -B scripts/rehydrate_after_compact.py --hook",
         "timeout": 10
       }
     ]
