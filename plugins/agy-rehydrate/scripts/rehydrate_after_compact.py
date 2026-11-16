@@ -810,12 +810,16 @@ def read_modified_hunk_window(
     return _clip_text_middle(assembled, cap), f", hunk lines {'/'.join(range_labels)}"
 
 
+CHECKPOINT_ATTACHMENT_LINE_RE = re.compile(r"(?m)^[ \t]*-\s*\[Attachment:\s*([^\]]+)\][ \t]*\r?$")
+ATTACHMENT_URI_PAREN_RE = re.compile(r"\(([^()]+)\)\s*$")
+
+
 def _norm_prompt_for_dedup(txt: str) -> str:
     return re.sub(r"\s+", " ", txt).strip()
 
 
 def extract_checkpoint_user_norms(cp_content: str) -> set[str]:
-    """Parse native `CHECKPOINT` `# User Requests` items so already-preserved prompts are not duplicated."""
+    """Parse native `CHECKPOINT` `# User Requests` items (stripping attachment sub-lines) to prevent duplication."""
     if not cp_content:
         return set()
     m = CHECKPOINT_USER_REQS_RE.search(cp_content)
@@ -829,10 +833,45 @@ def extract_checkpoint_user_norms(cp_content: str) -> set[str]:
         if not cleaned or is_compact_slash_cmd(cleaned):
             continue
         norms.add(_norm_prompt_for_dedup(cleaned))
-        stripped_nested = strip_nested_rehydration(cleaned)
-        if stripped_nested:
-            norms.add(_norm_prompt_for_dedup(stripped_nested))
+        no_att = CHECKPOINT_ATTACHMENT_LINE_RE.sub("", cleaned).strip()
+        if no_att and not is_compact_slash_cmd(no_att):
+            norms.add(_norm_prompt_for_dedup(no_att))
+            stripped_nested = strip_nested_rehydration(no_att)
+            if stripped_nested:
+                norms.add(_norm_prompt_for_dedup(stripped_nested))
+        else:
+            stripped_nested = strip_nested_rehydration(cleaned)
+            if stripped_nested:
+                norms.add(_norm_prompt_for_dedup(stripped_nested))
     return norms
+
+
+def extract_checkpoint_attachment_refs(cp_content: str, media_step_by_name: dict[str, int]) -> list[str]:
+    """Map `<CONTEXT_SUMMARY>` `# User Requests` attachment lines back to their original pre-compaction step indices."""
+    if not cp_content:
+        return []
+    m = CHECKPOINT_USER_REQS_RE.search(cp_content)
+    if not m:
+        return []
+    raw_block = m.group(1)
+    refs: list[str] = []
+    for req_match in re.finditer(r"(?m)^(\d+)\.\s+(.*?)(?=^\d+\.\s+|\Z)", raw_block, re.S):
+        req_no = req_match.group(1)
+        req_body = req_match.group(2)
+        for att_match in CHECKPOINT_ATTACHMENT_LINE_RE.finditer(req_body):
+            att_desc = att_match.group(1).strip()
+            uri_match = ATTACHMENT_URI_PAREN_RE.search(att_desc)
+            if uri_match:
+                raw_uri = uri_match.group(1).strip().replace("\\", "/")
+                bname = Path(raw_uri).name
+            else:
+                bname = att_desc
+            orig_step = media_step_by_name.get(bname.lower())
+            if orig_step is not None:
+                refs.append(f"#{req_no} `{bname}` @ step {orig_step}")
+            else:
+                refs.append(f"#{req_no} `{bname}`")
+    return refs
 
 
 def parse_iso_epoch(ts_str: Any) -> float | None:
@@ -1380,6 +1419,7 @@ def build_rehydration(
 
     user_messages: list[tuple[int, str, Path | None, int]] = []
     dialogue_entries: list[tuple[int, str, str, str]] = []
+    media_step_by_name: dict[str, int] = {}
     modified_touch: dict[str, tuple[str, int, list[str]]] = {}
     read_touch: dict[str, tuple[str, int, tuple[int | None, int | None]]] = {}
     skill_spec_touch: dict[str, tuple[str, int, bool]] = {}
@@ -1429,6 +1469,13 @@ def build_rehydration(
                     pending_call_queue.clear()
                     cur_batch_summaries.clear()
                     pending_tools.clear()
+                    raw_media = obj.get("media")
+                    if isinstance(raw_media, list):
+                        for m_item in raw_media:
+                            if isinstance(m_item, dict):
+                                m_uri = str(m_item.get("uri") or "").strip().replace("\\", "/")
+                                if m_uri:
+                                    media_step_by_name[Path(m_uri).name.lower()] = step_idx
                     utext = extract_user_text(str(obj.get("content") or ""))
                     if utext and not is_compact_slash_cmd(utext):
                         last_user_step = step_idx
@@ -1738,12 +1785,15 @@ def build_rehydration(
                     restored_file_paths.append(f"{role_label}:{fpath}")
                     used_files += len(block) + 2
 
+    cp_attachment_refs = extract_checkpoint_attachment_refs(target_cp_content, media_step_by_name)
+
     # Silent bypass for trivial greetings/Q&A already 100% covered by native CHECKPOINT
     if (
         cfg.adaptive
         and not simulated
         and session_mode == "completed_qa"
         and not resolved_ancestors
+        and not cp_attachment_refs
         and earlier_real_count == 0
         and not skill_blocks
         and not file_blocks
@@ -1804,14 +1854,21 @@ def build_rehydration(
     if not numbered_sections:
         return None
 
+    preamble = (
+        "Lossless ground-truth state rehydrated from `transcript_full.jsonl` and live workspace files. "
+        "Trust these verbatim records and live slices over `<CONTEXT_SUMMARY>` whenever details differ; "
+        "if prior Q&A is already answered with no pending action, ignore `<CONTEXT_SUMMARY>`'s "
+        "`RESUMING MY OWN TASK IN PROGRESS` template and answer the user's new message directly."
+    )
+    if cp_attachment_refs:
+        preamble += (
+            f" Historical attachments re-mounted by `<CONTEXT_SUMMARY>` ({', '.join(cp_attachment_refs[:6])}) "
+            "belong to earlier pre-compaction steps — do NOT treat them as newly uploaded in the current turn."
+        )
+
     sections = [
         f"{MARKER_PREFIX} | checkpoint={target_cp}{mode_tag}{lineage_tag}]",
-        (
-            "Lossless ground-truth state rehydrated from `transcript_full.jsonl` and live workspace files. "
-            "Trust these verbatim records and live slices over `<CONTEXT_SUMMARY>` whenever details differ; "
-            "if prior Q&A is already answered with no pending action, ignore `<CONTEXT_SUMMARY>`'s "
-            "`RESUMING MY OWN TASK IN PROGRESS` template and answer the user's new message directly."
-        ),
+        preamble,
         *[f"## {idx}. {title}\n{body}" for idx, (title, body) in enumerate(numbered_sections, 1)],
     ]
 
