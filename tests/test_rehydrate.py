@@ -417,13 +417,15 @@ class RehydrateRegressionTests(unittest.TestCase):
                 f"sys.stdin = io.StringIO({repr(payload)})",
                 "rc = m.run_hook()",
                 "assert rc == 0",
-                "assert not m._COMPILED_REGEX, m._COMPILED_REGEX",
-                "assert m._RE_MOD is None",
-                "assert m._PATH_CLS is None",
-                "assert m._DATETIME_CLS is None",
-                "assert m._DEQUE_CLS is None",
-                "for banned in ('dataclasses', 'pathlib', 'datetime', 'argparse', 'urllib', 'unicodedata'):",
+                "for legacy in ('_RE_MOD', '_PATH_CLS', '_DATETIME_CLS', '_DEQUE_CLS', '_COMPILED_REGEX'):",
+                "    assert legacy not in m.__dict__, f'legacy global {legacy} leaked on entrypoint'",
+                "for banned in (",
+                "    'dataclasses', 'pathlib', 'datetime', 'argparse', 'urllib', 'unicodedata',",
+                "    'rehydrate_helpers', 'rehydrate_engine', 'rehydrate_cli',",
+                "):",
                 "    assert banned not in sys.modules, f'{banned} imported on normal turn'",
+                "import rehydrate_helpers as mh",
+                "assert not mh._COMPILED_REGEX and mh._RE_MOD is None and mh._PATH_CLS is None and mh._DATETIME_CLS is None and mh._DEQUE_CLS is None",
             ]
         )
         p_probe = subprocess.run(
@@ -774,13 +776,134 @@ class RehydrateRegressionTests(unittest.TestCase):
             fences = sum(1 for ln in blk.splitlines() if ln.lstrip().startswith("```"))
             self.assertEqual(fences % 2, 0, f"{label} unbalanced fences:\n{blk}")
 
+    def test_multi_workspace_config_and_reordered_jsonl_keys(self) -> None:
+        ws1 = self.tmp_root / "ws_primary"
+        ws2 = self.tmp_root / "ws_secondary"
+        (ws1 / ".agents").mkdir(parents=True, exist_ok=True)
+        (ws2 / ".agents").mkdir(parents=True, exist_ok=True)
+
+        # Secondary workspace applies when primary has no .agents/rehydrate.json
+        (ws2 / ".agents" / "rehydrate.json").write_text(
+            json.dumps({"maxModifiedFiles": 5, "maxReferencedFiles": 2}),
+            encoding="utf-8",
+        )
+        cfg_sec_only = mod.load_rehydrate_config([ws1, ws2])
+        self.assertEqual(cfg_sec_only.max_modified_files, 5)
+        self.assertEqual(cfg_sec_only.max_referenced_files, 2)
+
+        # Primary workspace overrides conflicting keys in secondary while preserving non-conflicting keys
+        (ws1 / ".agents" / "rehydrate.json").write_text(
+            json.dumps({"maxModifiedFiles": 4}),
+            encoding="utf-8",
+        )
+        cfg_merged = mod.load_rehydrate_config([ws1, ws2])
+        self.assertEqual(cfg_merged.max_modified_files, 4)
+        self.assertEqual(cfg_merged.max_referenced_files, 2)
+
+        p_cli = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPTS_DIR / "rehydrate_after_compact.py"),
+                "--cwd",
+                str(ws1),
+                "--cwd",
+                str(ws2),
+                "show-config",
+            ],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        cli_cfg = json.loads(p_cli.stdout)
+        self.assertEqual(cli_cfg["workspace"], str(ws1.resolve()))
+        self.assertEqual(cli_cfg["workspaces"], [str(ws1.resolve()), str(ws2.resolve())])
+        self.assertEqual(cli_cfg["maxModifiedFiles"], 4)
+        self.assertEqual(cli_cfg["maxReferencedFiles"], 2)
+
+        # JSONL key-order independence: place "content" first (>2,500 chars) and "step_index" at very end
+        target_py = ws2 / "mod_target.py"
+        target_py.write_text("REORDERED_OK = 1\n", encoding="utf-8")
+        long_ok_tool = "Created At: 2026-11-16T21:00:00+08:00\nCompleted At: 2026-11-16T21:00:01+08:00\nCommand exited with code 0.\n\nCommand output:\n" + (
+            "ok payload line\n" * 200
+        )
+        long_err_tool = "Created At: 2026-11-16T21:00:02+08:00\nCompleted At: 2026-11-16T21:00:03+08:00\nCommand exited with code 1.\n\nCommand output:\n" + (
+            "err payload line\n" * 200
+        )
+        long_write_ok = "Wrote mod_target.py.\n\n" + ("write detail line\n" * 180)
+        std_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>run checks and update mod_target.py</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "run_command", "args": {"CommandLine": "ok_cmd"}},
+                    {"name": "run_command", "args": {"CommandLine": "fail_cmd"}},
+                    {"name": "edit_file", "args": {"Path": str(target_py), "Replacement": "REORDERED_OK = 1"}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": long_ok_tool},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": long_err_tool},
+            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": long_write_ok},
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "Finished edits and checks."},
+            {
+                "step_index": 6,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. run checks and update mod_target.py\n<summary>Done</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+
+        def _reorder_row(row: dict) -> dict:
+            order = ("content", "tool_calls", "status", "type", "step_index")
+            reordered = {k: row[k] for k in order if k in row}
+            for k, v in row.items():
+                if k not in reordered:
+                    reordered[k] = v
+            return reordered
+
+        logs_std = self.tmp_root / "brain" / "cid-std" / ".system_generated" / "logs"
+        logs_reo = self.tmp_root / "brain" / "cid-reo" / ".system_generated" / "logs"
+        _write_jsonl(logs_std / "transcript_full.jsonl", std_rows)
+        _write_jsonl(logs_reo / "transcript_full.jsonl", [_reorder_row(r) for r in std_rows])
+
+        res_std = mod.build_rehydration(logs_std / "transcript_full.jsonl", workspace_roots=[ws1, ws2])
+        res_reo = mod.build_rehydration(logs_reo / "transcript_full.jsonl", workspace_roots=[ws1, ws2])
+        self.assertIsNotNone(res_std)
+        self.assertIsNotNone(res_reo)
+        assert res_std is not None and res_reo is not None
+        msg_std, st_std = res_std
+        msg_reo, st_reo = res_reo
+        self.assertEqual(msg_reo, msg_std)
+        self.assertEqual(
+            {k: v for k, v in st_reo.items() if k != "window_raw_chars"},
+            {k: v for k, v in st_std.items() if k != "window_raw_chars"},
+        )
+        self.assertGreater(st_reo["window_raw_chars"], 10000)
+        self.assertGreater(st_std["window_raw_chars"], 10000)
+        self.assertIn("run_command(`ok_cmd`),", msg_reo)
+        self.assertNotIn("run_command(`ok_cmd`) [ERROR]", msg_reo)
+        self.assertIn("run_command(`fail_cmd`) [ERROR]", msg_reo)
+        self.assertIn("REORDERED_OK = 1", msg_reo)
+
+        # Also verify scan_compact_tail handles trailing step_index cleanly on full & incremental scans
+        cp_found, max_found, off1 = mod.scan_compact_tail(logs_reo / "transcript_full.jsonl", 0, None)
+        self.assertEqual(cp_found, 6)
+        self.assertEqual(max_found, 6)
+        with open(logs_reo / "transcript_full.jsonl", "a", encoding="utf-8") as af:
+            af.write(json.dumps({"content": "<USER_REQUEST>next prompt</USER_REQUEST>", "type": "USER_INPUT", "step_index": 7}) + "\n")
+        cp2, max2, _ = mod.scan_compact_tail(logs_reo / "transcript_full.jsonl", off1, cp_found)
+        self.assertEqual(cp2, 6)
+        self.assertEqual(max2, 7)
+
     def test_line_endings_and_no_pycache(self) -> None:
-        self.assertEqual(list(REPO_ROOT.rglob("__pycache__")), [])
+        self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])
         hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))
         cmd = hooks_data["agy-rehydrate"]["PreInvocation"][0]["command"]
         self.assertIn(" -S -B scripts/", cmd)
         for path in REPO_ROOT.rglob("*"):
-            if not path.is_file() or ".tmp_" in str(path):
+            if not path.is_file() or ".tmp_" in str(path) or "__pycache__" in path.parts or ".git" in path.parts:
                 continue
             raw = path.read_bytes()
             suf = path.suffix.lower()

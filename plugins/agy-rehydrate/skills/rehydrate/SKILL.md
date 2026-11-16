@@ -29,7 +29,7 @@ python -B "<plugin-dir>/scripts/rehydrate_after_compact.py" --cwd "<workspace>" 
 python -B "<plugin-dir>/scripts/rehydrate_after_compact.py" --cwd "<workspace>" show-config
 ```
 
-You can pass a specific `<conversation-id>` (or UUID prefix) instead of `latest`.
+You can pass a specific `<conversation-id>` (or UUID prefix) instead of `latest`, and repeat `--cwd` for multi-root workspaces (first `--cwd` takes highest `.agents/rehydrate.json` precedence).
 
 ## Optional Workspace Tuning (`.agents/rehydrate.json`)
 
