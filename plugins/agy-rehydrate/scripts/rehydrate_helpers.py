@@ -756,6 +756,58 @@ def extract_edit_snippets(tool_name: str, args: dict[str, Any]) -> list[str]:
     return snippets
 
 
+def _clip_inline_label(text: str, max_chars: int = 140) -> str:
+    """Collapse internal whitespace and truncate an inline tool summary label."""
+    s = " ".join(text.split())
+    if len(s) <= max_chars:
+        return s
+    return s[: max(1, max_chars - 3)].rstrip() + "..."
+
+
+def format_ask_question_exchange(questions: list[str], raw_content: str) -> str:
+    """Format an `ask_question` Q&A exchange by stripping leading timestamp metadata and echoes."""
+    if not raw_content:
+        return ""
+    lines = raw_content.replace("\r\n", "\n").splitlines()
+    idx = 0
+    while idx < len(lines):
+        s = lines[idx].strip()
+        if not s or s.startswith("Created At:") or s.startswith("Completed At:"):
+            idx += 1
+            continue
+        break
+    cleaned_ans = strip_nested_rehydration("\n".join(lines[idx:])).strip()
+    if not cleaned_ans:
+        return ""
+
+    q_clean = [" ".join(q.split()) for q in questions if q and q.strip()]
+    if not q_clean:
+        return " ".join(cleaned_ans.split())
+    if len(q_clean) == 1:
+        return f"{q_clean[0]} -> {' '.join(cleaned_ans.split())}"
+
+    ans_re = _re().compile(r"^A(\d+)\s*:\s*(.*)$")
+    parsed_pairs: list[str] = []
+    all_matched = True
+    for ln in cleaned_ans.splitlines():
+        s_ln = ln.strip()
+        if not s_ln:
+            continue
+        m = ans_re.match(s_ln)
+        if not m:
+            all_matched = False
+            break
+        q_idx = int(m.group(1))
+        ans_part = " ".join(m.group(2).split())
+        if not (1 <= q_idx <= len(q_clean)) or not ans_part:
+            all_matched = False
+            break
+        parsed_pairs.append(f"Q{q_idx} ({q_clean[q_idx - 1]}) -> A{q_idx}: {ans_part}")
+    if all_matched and parsed_pairs:
+        return "; ".join(parsed_pairs)
+    return f"{' / '.join(q_clean)} -> {' '.join(cleaned_ans.split())}"
+
+
 def format_single_tool_call(
     tc: dict[str, Any],
 ) -> tuple[str, str, str, tuple[int | None, int | None], list[str]]:
@@ -779,6 +831,15 @@ def format_single_tool_call(
         if len(cmd) > 60:
             cmd = cmd[:57] + "..."
         summary = f"{name}(`{cmd}`)"
+    elif name == "ask_question" and isinstance(args, dict):
+        raw_qs = args.get("questions") or []
+        if isinstance(raw_qs, list):
+            snippets = [
+                str(q.get("question") or "").strip()
+                for q in raw_qs
+                if isinstance(q, dict) and str(q.get("question") or "").strip()
+            ]
+        summary = "ask_question"
     else:
         summary = name
     return name, summary, fpath, line_range, snippets
@@ -984,6 +1045,69 @@ def _clip_text_middle(text: str, max_chars: int) -> str:
     return f"{head}{mid_msg}{tail}"
 
 
+def _clip_markdown_to_budget(
+    text: str,
+    max_chars: int,
+    marker_template: str = "  ...[truncated ~{omitted} chars to fit budget; read_file for full content]...",
+) -> str:
+    """Clip Markdown text within `max_chars` while keeping code fences balanced and preserving line/link safety."""
+    if len(text) <= max_chars:
+        return text
+
+    def _fence_count(s: str) -> int:
+        return sum(1 for ln in s.splitlines() if ln.lstrip().startswith("```"))
+
+    def _safe_prefix(s: str, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        sub = s if len(s) <= limit else s[:limit]
+        if _fence_count(sub) % 2 == 1 and limit >= 4:
+            sub2 = s[: limit - 4].rstrip("\r\n")
+            sub = f"{sub2}\n```" if _fence_count(sub2) % 2 == 1 else sub2
+        return sub[:limit]
+
+    if max_chars < 260:
+        return _safe_prefix(text, max_chars)
+
+    for reserve in (120, 280):
+        avail = max(120, max_chars - reserve)
+        h_target = int(avail * 0.66)
+        t_target = max(40, avail - h_target)
+        folded, did_fold = _fold_markdown_middle(
+            text, h_target, t_target, marker_template, min_omitted=40
+        )
+        if did_fold and len(folded) <= max_chars:
+            return folded
+
+    safe_cap = max(60, max_chars - 8)
+    head_len = int(safe_cap * 0.68)
+    tail_len = max(0, safe_cap - head_len - 84)
+    if head_len > 80:
+        nl_h = text.rfind("\n", int(head_len * 0.65), head_len + 1)
+        if nl_h > 0:
+            head_len = nl_h
+    if tail_len > 80:
+        raw_tail_start = len(text) - tail_len
+        nl_t = text.find("\n", raw_tail_start, len(text) - int(tail_len * 0.65))
+        if nl_t >= 0 and nl_t + 1 < len(text):
+            tail_len = len(text) - (nl_t + 1)
+    omitted = max(0, len(text) - head_len - tail_len)
+    mid_msg = f"\n... [truncated ~{omitted} chars in middle; read_file for full content] ...\n"
+    raw_head = text[:head_len]
+    raw_tail = text[-tail_len:] if tail_len > 0 else ""
+    excess = len(raw_head) + len(mid_msg) + len(raw_tail) - safe_cap
+    if excess > 0:
+        if len(raw_tail) > excess + 20:
+            raw_tail = raw_tail[excess:]
+        elif len(raw_head) > excess + 20:
+            raw_head = raw_head[: len(raw_head) - excess]
+    head, tail = _balance_code_fences(raw_head, raw_tail)
+    res = f"{head}{mid_msg}{tail}"
+    if len(res) > max_chars:
+        return _safe_prefix(text, max_chars)
+    return res
+
+
 def read_text_clipped(path_str: str, max_chars: int) -> str | None:
     """Read UTF-8 file up to `max_chars`, keeping 68% head + tail if middle truncation is required."""
     if max_chars <= 0:
@@ -1181,32 +1305,37 @@ def _split_checkpoint_user_requests(raw_block: str) -> list[tuple[int, str]]:
     cur_top = 0
     sub_num = 0
     cur_lines: list[str] = []
-    num_re = _re().compile(r"^(\d+)\.\s+(.*)$")
+    num_re = _re().compile(r"^(\d+)\.(?:[ \t]+(.*))?$")
     trunc_re = _rx("CHECKPOINT_TRUNCATED_TAIL")
 
     for line in raw_block.splitlines():
         m = num_re.match(line)
         if m:
             n = int(m.group(1))
-            rest = m.group(2)
+            rest = m.group(2) or ""
             if cur_top == 0 and n == 1:
                 cur_top = 1
+                sub_num = 0
                 cur_lines = [rest]
                 continue
             if cur_top >= 1:
                 prev_nonempty = next((ln.strip() for ln in reversed(cur_lines) if ln.strip()), "")
-                prev_was_truncated = bool(trunc_re.search(prev_nonempty))
-                if prev_was_truncated:
+                if trunc_re.search(prev_nonempty):
                     sub_num = 0
-                if n == cur_top + 1 and sub_num == 0:
+                if n == cur_top + 1 and (sub_num == 0 or n != sub_num + 1 or is_compact_slash_cmd(rest)):
                     items.append((cur_top, "\n".join(cur_lines).strip()))
                     cur_top = n
+                    sub_num = 0
                     cur_lines = [rest]
                     continue
                 if n == 1:
                     sub_num = 1
                 elif sub_num > 0 and n == sub_num + 1:
                     sub_num = n
+        elif cur_top >= 1:
+            s_ln = line.strip()
+            if s_ln.startswith("#") or s_ln in ("---", "***", "___"):
+                sub_num = 0
         if cur_top >= 1:
             cur_lines.append(line)
 

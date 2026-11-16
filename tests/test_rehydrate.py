@@ -897,6 +897,153 @@ class RehydrateRegressionTests(unittest.TestCase):
         self.assertEqual(cp2, 6)
         self.assertEqual(max2, 7)
 
+    def test_duplicate_long_user_fold_fence_safe_budget_cap_and_ask_question(self) -> None:
+        # 1. Verify _split_checkpoint_user_requests handles CP-666-style item with embedded 1..4 sublists
+        #    followed immediately by `(N+1). 3. ...` and `(N+2). /compact`.
+        long_step10 = (
+            "**整體評估：架構與測試均已完整。**\n\n"
+            "### 1. 第一節重點\n"
+            + ("重點說明與效能數據細節列。\n" * 95)
+            + "\n### 2. 已完成項目\n"
+            + "1. **子項一**\n   * 詳細內容甲\n"
+            + "2. **子項二**\n   * 詳細內容乙\n"
+            + "3. **子項三**\n   * 詳細內容丙\n"
+            + "4. **子項四**\n   * 詳細內容丁\n\n"
+            + "### 3. 後續建議\n"
+            + "1. **建議一**\n   * 細節戊\n"
+            + "2. **建議二**\n   * 細節己\n"
+            + "3. **建議三**\n   * 細節庚\n"
+            + "4. **建議四**\n   * 細節辛\n\n"
+            + "結論收尾確認。"
+        )
+        self.assertGreater(len(long_step10), 1200)
+        cp_block = (
+            "1. 前期獨立問題\n"
+            f"2. \n{long_step10}\n"
+            "3. 3. 剩餘小細節：檢查同步\n"
+            "4. /compact \n"
+        )
+        split_items = mod._split_checkpoint_user_requests(cp_block)
+        self.assertEqual([no for no, _ in split_items], [1, 2, 3, 4])
+
+        # 2. End-to-end test: ask_question in < verbatim_start_step (## 1) and >= verbatim_start_step (pinned in
+        #    >6-step tool chain with >2,048-byte GENERIC step), plus duplicate long user prompt folding in ## 2.
+        app_py = self.ws / "app.py"
+        app_py.write_text("APP_READY = True\n", encoding="utf-8")
+
+        logs = self.tmp_root / "brain" / "cid-edge" / ".system_generated" / "logs"
+        rows: list[dict] = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>初始評估請求</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "請先確認插件範圍。",
+                "tool_calls": [
+                    {
+                        "name": "ask_question",
+                        "args": {"questions": [{"is_multi_select": False, "question": "是否刪除舊插件？", "options": ["A1", "A2"]}]},
+                    }
+                ],
+            },
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-17T00:00:00+08:00\nCompleted At: 2026-11-17T00:00:01+08:00\nA1: (Recommended) 刪除並保留核心兩支",
+            },
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "已完成早期清理。"},
+            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>前期獨立問題</USER_REQUEST>"},
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "前期獨立回覆。"},
+            {"step_index": 10, "type": "USER_INPUT", "content": f"<USER_REQUEST>{long_step10}</USER_REQUEST>"},
+        ]
+
+        # 10-call tool loop between steps 11 and 30 where call #5 is ask_question with >2,200-char GENERIC output
+        step_cursor = 11
+        for call_no in range(1, 11):
+            if call_no == 1:
+                tc = {"name": "edit_file", "args": {"Path": str(app_py), "Replacement": "APP_READY = True"}}
+                res_txt = "Edited app.py"
+            elif call_no == 5:
+                tc = {
+                    "name": "ask_question",
+                    "args": {"questions": [{"is_multi_select": False, "question": "確認拆分方案？", "options": ["A1", "A2"]}]},
+                }
+                res_txt = (
+                    "Created At: 2026-11-17T00:10:00+08:00\n"
+                    "Completed At: 2026-11-17T00:10:05+08:00\n"
+                    "A1: (Recommended) 拆分為四模組；"
+                    + ("補充架構說明文字 " * 260)
+                )
+            else:
+                tc = {"name": "run_command", "args": {"CommandLine": f"check_{call_no}"}}
+                res_txt = f"Command exited with code 0.\n\nCommand output:\nok_{call_no}"
+            rows.append({"step_index": step_cursor, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [tc]})
+            step_cursor += 1
+            rows.append({"step_index": step_cursor, "type": "GENERIC", "status": "DONE", "content": res_txt})
+            step_cursor += 1
+
+        # step_cursor is now 31
+        rows.extend(
+            [
+                {"step_index": 31, "type": "PLANNER_RESPONSE", "content": "已依選擇完成四模組拆分。"},
+                {"step_index": 32, "type": "USER_INPUT", "content": "<USER_REQUEST>3. 剩餘小細節：檢查同步</USER_REQUEST>"},
+                {"step_index": 33, "type": "PLANNER_RESPONSE", "content": "已完成同步檢查。"},
+                {"step_index": 34, "type": "USER_INPUT", "content": "<USER_REQUEST>/compact</USER_REQUEST>"},
+                {
+                    "step_index": 35,
+                    "type": "CHECKPOINT",
+                    "content": f"<CONTEXT_SUMMARY>\n# User Requests\n{cp_block}<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
+                },
+            ]
+        )
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+
+        sec1 = msg.split("## 1.", 1)[1].split("## 2.", 1)[0]
+        self.assertIn("初始評估請求", sec1)
+        self.assertIn("[ask_question] 是否刪除舊插件？ -> A1: (Recommended) 刪除並保留核心兩支", sec1)
+        self.assertNotIn("確認拆分方案？", sec1)
+        self.assertNotIn("整體評估：架構與測試均已完整", sec1)
+        self.assertNotIn("剩餘小細節：檢查同步", sec1)
+
+        self.assertEqual(st["folded_user_turns"], 1)
+        sec2 = msg.split("## 2.", 1)[1]
+        self.assertIn("...[user prompt already verbatim in <CONTEXT_SUMMARY> # User Requests;", sec2)
+        self.assertIn("(+", msg)
+        self.assertIn("ask_question(確認拆分方案？ -> A1: (Recommended) 拆分為四模組；", msg)
+
+        # 3. Fence-safe _enforce_total_cap & _clip_markdown_to_budget across odd fence splits
+        file_a = "### [Modified] `a.py`\n```python\n" + "".join(f"a_{i:03d} = {i}\n" for i in range(60)) + "```\n"
+        file_b = "### [Modified] `b.py`\n```python\n" + "".join(f"b_{i:03d} = {i}\n" for i in range(40)) + "```"
+        sec_hdr = "## 2. Restored Active Workspace Files"
+        raw_secs = [
+            "[POST-COMPACT REHYDRATION v1 | checkpoint=1]",
+            "Preamble",
+            "## 1. User\n- [#1 @ step 0]: prompt",
+            f"{sec_hdr}\n{file_a}\n{file_b}",
+        ]
+        raw_len = len("\n\n".join(raw_secs))
+        base_prefix_len = len("\n\n".join(raw_secs[:3])) + 2 + len(sec_hdr) + 1
+        for cap_delta in (350, 520, 750):
+            target_cap = raw_len - cap_delta
+            capped = mod._enforce_total_cap(raw_secs, target_cap)
+            joined = "\n\n".join(capped)
+            self.assertLessEqual(len(joined), target_cap)
+            fences = sum(1 for ln in joined.splitlines() if ln.lstrip().startswith("```"))
+            self.assertEqual(fences % 2, 0, f"Unbalanced fences at delta={cap_delta}:\n{joined}")
+        tight_cap = base_prefix_len + 180
+        capped_tight = mod._enforce_total_cap(raw_secs, tight_cap)
+        joined_tight = "\n\n".join(capped_tight)
+        self.assertLessEqual(len(joined_tight), tight_cap)
+        self.assertEqual(
+            sum(1 for ln in joined_tight.splitlines() if ln.lstrip().startswith("```")) % 2,
+            0,
+            joined_tight,
+        )
+
     def test_line_endings_and_no_pycache(self) -> None:
         self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])
         hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))

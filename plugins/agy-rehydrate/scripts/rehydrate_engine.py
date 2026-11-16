@@ -55,6 +55,8 @@ from rehydrate_helpers import (
     TURN_CLIP_THRESHOLD_CHARS,
     WRITE_TOOL_NAMES,
     RehydrateConfig,
+    _clip_inline_label,
+    _clip_markdown_to_budget,
     _clip_text_middle,
     _datetime_cls,
     _deque_cls,
@@ -76,6 +78,7 @@ from rehydrate_helpers import (
     extract_edit_snippets,
     extract_user_text,
     fold_user_paste,
+    format_ask_question_exchange,
     format_single_tool_call,
     is_compact_slash_cmd,
     is_eligible_text_file,
@@ -471,11 +474,22 @@ def _render_dialogue_entry(
     tool_prefix: str,
     body: str,
     condense_assistant: bool,
+    condense_user_in_summary: bool = False,
 ) -> tuple[str, bool]:
     if role == "banner" or role == "in_progress":
         return body, False
     if role == "user":
         cleaned_u = _strip_leading_ui_tool_badges(body) if len(body) > 900 else body
+        if condense_user_in_summary and len(cleaned_u) > FOLD_PASTE_THRESHOLD_CHARS:
+            folded_u, did_fold_u = _fold_markdown_middle(
+                cleaned_u,
+                FOLD_PASTE_HEAD_CHARS,
+                FOLD_PASTE_TAIL_CHARS,
+                "  ...[user prompt already verbatim in <CONTEXT_SUMMARY> # User Requests; {omitted} chars folded]...",
+                min_omitted=150,
+            )
+            if did_fold_u:
+                return f"[Step {step_idx} | User]:\n{folded_u}", True
         if len(cleaned_u) > TURN_CLIP_THRESHOLD_CHARS:
             clipped, _ = _fold_markdown_middle(
                 cleaned_u,
@@ -518,13 +532,27 @@ def _flush_step_batch(batch: list[list[str]], pending_tools: list[list[list[str]
 
 
 def _summarize_tool_chain(tools: list[str], max_items: int = 6) -> str:
-    """Keep opening steps + final edit/verification steps when tool batches exceed `max_items`."""
+    """Keep opening steps, middle `ask_question` decisions, and final edit/verification steps."""
     if len(tools) <= max_items:
         return " -> ".join(tools)
     head_n = max(1, max_items // 3)
     tail_n = max(1, max_items - head_n)
-    omitted = len(tools) - head_n - tail_n
-    return " -> ".join([*tools[:head_n], f"(+{omitted} steps)", *tools[-tail_n:]])
+    if len(tools) <= head_n + tail_n:
+        return " -> ".join(tools)
+    mid_aq = [i for i in range(head_n, len(tools) - tail_n) if "ask_question(" in tools[i]][-3:]
+    if not mid_aq:
+        omitted = len(tools) - head_n - tail_n
+        return " -> ".join([*tools[:head_n], f"(+{omitted} steps)", *tools[-tail_n:]])
+    keep_indices = [*range(head_n), *mid_aq, *range(len(tools) - tail_n, len(tools))]
+    parts: list[str] = []
+    prev_idx = -1
+    for idx in keep_indices:
+        gap = idx - prev_idx - 1
+        if gap > 0:
+            parts.append(f"(+{gap} steps)")
+        parts.append(tools[idx])
+        prev_idx = idx
+    return " -> ".join(parts)
 
 
 def _format_batch_labels(batches: list[list[list[str]]]) -> list[str]:
@@ -772,6 +800,7 @@ def build_rehydration(
                         hdr_chk = line[:768]
                         if (
                             len(line) > 2048
+                            and pending_call_queue[0][0] != "ask_question"
                             and ('"content":' in hdr_chk or '"content" :' in hdr_chk)
                             and '"ERROR"' not in hdr
                             and '"error"' not in hdr
@@ -871,6 +900,11 @@ def build_rehydration(
                     tname, tsummary, fpath, lrange, esnips, call_step = pending_call_queue.popleft()
                     tc_state, task_id = classify_tool_step(obj)
                     if tc_state == "ok":
+                        if tname == "ask_question":
+                            aq_exchange = format_ask_question_exchange(esnips, str(obj.get("content") or ""))
+                            if aq_exchange:
+                                tsummary = f"ask_question({_clip_inline_label(aq_exchange, 140)})"
+                                user_messages.append((step_idx, f"[ask_question] {aq_exchange}", seg_path, line_no))
                         cur_batch_summaries.append([tsummary, "ok", ""])
                         if fpath:
                             if is_skill_or_spec(fpath):
@@ -974,18 +1008,36 @@ def build_rehydration(
             if "budgetRecentTurnsChars" not in cfg.explicit_keys:
                 eff_recent_budget = min(14000, int(content_pool * 0.42))
 
+    summary_user_counts = extract_checkpoint_user_norm_counts(target_cp_content) if cfg.adaptive else {}
+    truncated_summary_prefixes = extract_checkpoint_truncated_prefixes(target_cp_content) if cfg.adaptive else []
+    turn_summary_counts = dict(summary_user_counts)
+
     kept_turn_pairs: list[tuple[int, str]] = []
     used_turns = 0
     real_turn_count = 0
     seen_latest_assistant = False
     folded_assistant_count = 0
+    folded_user_count = 0
     for rev_idx, (s_idx, role, tool_batches, body) in enumerate(reversed(dialogue_entries)):
         is_banner = role == "banner"
         if not is_banner and real_turn_count >= eff_recent_entries:
             break
         condense = role == "assistant" and seen_latest_assistant
+        condense_u = False
+        if role == "user" and not body.startswith("--- [/fork branch ") and turn_summary_counts:
+            norm_u = _norm_prompt_for_dedup(body)
+            if turn_summary_counts.get(norm_u, 0) > 0:
+                turn_summary_counts[norm_u] -= 1
+                condense_u = True
         tool_pfx = _format_tool_batches(tool_batches) if role == "assistant" else ""
-        rendered, did_fold = _render_dialogue_entry(s_idx, role, tool_pfx, body, condense_assistant=condense)
+        rendered, did_fold = _render_dialogue_entry(
+            s_idx,
+            role,
+            tool_pfx,
+            body,
+            condense_assistant=condense,
+            condense_user_in_summary=condense_u,
+        )
         pair_user_reserve = (
             180
             if condense and (real_turn_count + 1 < eff_recent_entries) and (rev_idx + 1 < len(dialogue_entries))
@@ -996,11 +1048,13 @@ def build_rehydration(
             rem_turn_chars = avail_budget - used_turns
             if kept_turn_pairs and rem_turn_chars < (220 if role == "user" else 550):
                 break
-            rendered = _clip_text_middle(rendered, max(220, rem_turn_chars))
+            rendered = _clip_markdown_to_budget(rendered, max(220, rem_turn_chars))
         if role == "assistant":
             seen_latest_assistant = True
             if did_fold:
                 folded_assistant_count += 1
+        elif role == "user" and did_fold:
+            folded_user_count += 1
         kept_turn_pairs.append((s_idx, rendered))
         used_turns += len(rendered) + 2
         if not is_banner:
@@ -1013,8 +1067,6 @@ def build_rehydration(
 
     non_banner_steps = [s for s, entry in kept_turn_pairs if not entry.startswith("--- [/fork branch ")]
     verbatim_start_step = min(non_banner_steps) if non_banner_steps else target_cp
-    summary_user_counts = extract_checkpoint_user_norm_counts(target_cp_content) if cfg.adaptive else {}
-    truncated_summary_prefixes = extract_checkpoint_truncated_prefixes(target_cp_content) if cfg.adaptive else []
 
     if summary_user_counts:
         rem_counts = dict(summary_user_counts)
@@ -1270,19 +1322,45 @@ def build_rehydration(
         numbered_sections.append((sec1_title, earlier_user_block))
 
     if kept_turns:
-        if session_mode == "completed_qa" and len(kept_turns) <= 2 and folded_assistant_count == 0:
+        if (
+            session_mode == "completed_qa"
+            and len(kept_turns) <= 2
+            and folded_assistant_count == 0
+            and folded_user_count == 0
+        ):
             sec2_title = f"Final Pre-Compaction Exchange ({len(kept_turns)} entries verbatim)"
             sec2_body = "\n\n".join(kept_turns)
-        elif folded_assistant_count > 0:
-            sec2_title = (
-                f"Recent Pre-Compaction Dialogue ({len(kept_turns)} entries; "
-                f"latest turn verbatim, {folded_assistant_count} earlier replies condensed)"
-            )
-            sec2_note = (
-                "*(Note: User prompts, tool trajectories, and the final assistant reply are verbatim; "
-                "middle paragraphs of earlier assistant replies are condensed because `<CONTEXT_SUMMARY>` "
-                "already summarizes them.)*"
-            )
+        elif folded_assistant_count > 0 or folded_user_count > 0:
+            if folded_assistant_count > 0 and folded_user_count > 0:
+                sec2_title = (
+                    f"Recent Pre-Compaction Dialogue ({len(kept_turns)} entries; "
+                    f"latest turn verbatim, {folded_assistant_count} earlier replies & "
+                    f"{folded_user_count} duplicate prompt condensed)"
+                )
+                sec2_note = (
+                    "*(Note: Recent unique user prompts, tool trajectories, and the final assistant reply are verbatim; "
+                    "duplicate long user prompts and middle paragraphs of earlier assistant replies are condensed "
+                    "because `<CONTEXT_SUMMARY>` already preserves them.)*"
+                )
+            elif folded_assistant_count > 0:
+                sec2_title = (
+                    f"Recent Pre-Compaction Dialogue ({len(kept_turns)} entries; "
+                    f"latest turn verbatim, {folded_assistant_count} earlier replies condensed)"
+                )
+                sec2_note = (
+                    "*(Note: User prompts, tool trajectories, and the final assistant reply are verbatim; "
+                    "middle paragraphs of earlier assistant replies are condensed because `<CONTEXT_SUMMARY>` "
+                    "already summarizes them.)*"
+                )
+            else:
+                sec2_title = (
+                    f"Recent Pre-Compaction Dialogue ({len(kept_turns)} entries; "
+                    f"duplicate long prompt condensed)"
+                )
+                sec2_note = (
+                    "*(Note: Tool trajectories and replies are verbatim; duplicate long user prompts are condensed "
+                    "because `<CONTEXT_SUMMARY>` already preserves them.)*"
+                )
             sec2_body = f"{sec2_note}\n\n" + "\n\n".join(kept_turns)
         else:
             sec2_title = f"Recent Pre-Compaction Verbatim Dialogue ({len(kept_turns)} entries kept verbatim)"
@@ -1343,6 +1421,7 @@ def build_rehydration(
         "folded_paste_msgs": folded_paste_count,
         "kept_turns": len(kept_turns),
         "folded_assistant_turns": folded_assistant_count,
+        "folded_user_turns": folded_user_count,
         "verbatim_start_step": verbatim_start_step,
         "skills": len(skill_blocks),
         "skill_paths": restored_skill_paths,
@@ -1373,9 +1452,7 @@ def _enforce_total_cap(sections: list[str], cap: int) -> list[str]:
         hdr, sep, body = out[idx].partition("\n")
         if sep and len(body) - overflow >= 220:
             target_body_len = len(body) - overflow
-            clipped_body = _clip_text_middle(body, target_body_len)
-            if len(clipped_body) > target_body_len:
-                clipped_body = clipped_body[:target_body_len]
+            clipped_body = _clip_markdown_to_budget(body, target_body_len)
             out[idx] = f"{hdr}\n{clipped_body}"
             break
         if len(out) > 3:
@@ -1384,7 +1461,14 @@ def _enforce_total_cap(sections: list[str], cap: int) -> list[str]:
             continue
         if sep and body:
             keep = max(80, len(body) - overflow)
-            out[idx] = f"{hdr}\n{body[:keep]}"
+            sub = body[:keep]
+            if sum(1 for ln in sub.splitlines() if ln.lstrip().startswith("```")) % 2 == 1 and keep >= 4:
+                sub2 = body[: keep - 4].rstrip("\r\n")
+                if sum(1 for ln in sub2.splitlines() if ln.lstrip().startswith("```")) % 2 == 1:
+                    sub = f"{sub2}\n```"
+                else:
+                    sub = sub2
+            out[idx] = f"{hdr}\n{sub}"
         break
     return out
 
