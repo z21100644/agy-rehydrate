@@ -4,7 +4,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python -B scripts/rehydrate_after_compact.py --hook || python3 -B scripts/rehydrate_after_compact.py --hook || py -3 -B scripts/rehydrate_after_compact.py --hook",
+        "command": "python -S -B scripts/rehydrate_after_compact.py --hook || python3 -S -B scripts/rehydrate_after_compact.py --hook || py -3 -S -B scripts/rehydrate_after_compact.py --hook",
         "timeout": 10
       }
     ]

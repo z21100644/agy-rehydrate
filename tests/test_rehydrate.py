@@ -319,6 +319,7 @@ class RehydrateRegressionTests(unittest.TestCase):
         self.assertTrue(installed_hooks.is_file())
         hooks_data = json.loads(installed_hooks.read_text(encoding="utf-8"))
         cmd_str = hooks_data["agy-rehydrate"]["PreInvocation"][0]["command"]
+        self.assertIn(" -S -B scripts/rehydrate_after_compact.py --hook", cmd_str)
         self.assertIn(" -B scripts/rehydrate_after_compact.py --hook", cmd_str)
         self.assertNotIn("||", cmd_str)
 
@@ -397,6 +398,397 @@ class RehydrateRegressionTests(unittest.TestCase):
         ins_data = json.loads(p_ins.stdout)
         self.assertTrue(ins_data["simulated"])
         self.assertEqual(ins_data["session_mode"], "completed_qa")
+
+    def test_fast_path_hook_skips_heavy_imports_and_uses_s_flag(self) -> None:
+        logs = self.tmp_root / "brain" / "cid-fast" / ".system_generated" / "logs"
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>normal query</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "normal answer"},
+        ]
+        _write_jsonl(logs / "transcript.jsonl", rows)
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
+
+        probe_code = "\n".join(
+            [
+                "import io, sys",
+                f"sys.path.insert(0, {repr(str(SCRIPTS_DIR))})",
+                "import rehydrate_after_compact as m",
+                f"sys.stdin = io.StringIO({repr(payload)})",
+                "rc = m.run_hook()",
+                "assert rc == 0",
+                "assert not m._COMPILED_REGEX, m._COMPILED_REGEX",
+                "assert m._RE_MOD is None",
+                "assert m._PATH_CLS is None",
+                "assert m._DATETIME_CLS is None",
+                "assert m._DEQUE_CLS is None",
+                "for banned in ('dataclasses', 'pathlib', 'datetime', 'argparse', 'urllib', 'unicodedata'):",
+                "    assert banned not in sys.modules, f'{banned} imported on normal turn'",
+            ]
+        )
+        p_probe = subprocess.run(
+            [sys.executable, "-S", "-B", "-c", probe_code],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        self.assertEqual(json.loads(p_probe.stdout.strip()), {})
+
+        p_cli = subprocess.run(
+            [sys.executable, "-S", "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
+            input=payload,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        self.assertEqual(json.loads(p_cli.stdout.strip()), {})
+
+    def test_sync_nonzero_exit_and_async_running_task_resolution(self) -> None:
+        ok_py = self.ws / "ok_file.py"
+        denied_py = self.ws / "denied_done.py"
+        ok_py.write_text("VALUE = 42\n", encoding="utf-8")
+        denied_py.write_text("SHOULD_NOT_APPEAR = 999\n", encoding="utf-8")
+
+        # 1. Resolved background tasks, sync non-zero exit vs fake exit string inside stdout,
+        #    DONE step with Encountered error, and flat interim assistant merging.
+        logs = self.tmp_root / "brain" / "cid-async" / ".system_generated" / "logs"
+        tool_calls_batch = [
+            {"name": "run_command", "args": {"CommandLine": "false_cmd"}},
+            {"name": "run_command", "args": {"CommandLine": "grep_exit1_text"}},
+            {"name": "write_file", "args": {"Path": str(denied_py)}},
+            {"name": "write_file", "args": {"Path": str(ok_py)}},
+            {"name": "run_command", "args": {"CommandLine": "bg_ok_job"}},
+            {"name": "run_command", "args": {"CommandLine": "bg_fail_job"}},
+        ]
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>run checks and update ok_file.py</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": tool_calls_batch},
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-16T21:00:00+08:00\nCompleted At: 2026-11-16T21:00:01+08:00\nCommand exited with code 1.\n\nCommand output:\nfail",
+            },
+            {
+                "step_index": 3,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-16T21:00:02+08:00\nCompleted At: 2026-11-16T21:00:03+08:00\nCommand exited with code 0.\n\nCommand output:\nCommand exited with code 1.",
+            },
+            {
+                "step_index": 4,
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "Created At: 2026-11-16T21:00:04+08:00\nCompleted At: 2026-11-16T21:00:05+08:00\nEncountered error in step execution: blocked",
+            },
+            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "Wrote ok_file.py"},
+            {
+                "step_index": 6,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-16T21:00:06+08:00\nTool is running as a background task with task id: cid-async/task-1\nTask logs...",
+            },
+            {
+                "step_index": 7,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-16T21:00:07+08:00\nTool is running as a background task with task id: cid-async/task-2\nTask logs...",
+            },
+            {"step_index": 8, "type": "PLANNER_RESPONSE", "content": "Waiting for background tasks."},
+            {
+                "step_index": 9,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": 'sender=cid-async/task-1 content=Task id "cid-async/task-1" finished with result:\nCommand exited with code 0.\n\nCommand output:\npassed',
+            },
+            {
+                "step_index": 10,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": 'sender=cid-async/task-2 content=Task id "cid-async/task-2" finished with result:\nCommand exited with code 1.\n\nCommand output:\nboom',
+            },
+            {"step_index": 11, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "final_echo"}}]},
+            {"step_index": 12, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0."},
+            {"step_index": 13, "type": "PLANNER_RESPONSE", "content": "Done after async jobs."},
+            {"step_index": 14, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. run checks and update ok_file.py\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        self.assertEqual(st["session_mode"], "active_coding")
+        self.assertIn("run_command(`false_cmd`) [ERROR]", msg)
+        self.assertIn("run_command(`grep_exit1_text`),", msg)
+        self.assertNotIn("run_command(`grep_exit1_text`) [ERROR]", msg)
+        self.assertIn("write_file(denied_done.py) [ERROR]", msg)
+        self.assertIn("run_command(`bg_ok_job`),", msg)
+        self.assertNotIn("run_command(`bg_ok_job`) [ERROR]", msg)
+        self.assertNotIn("run_command(`bg_ok_job`) [RUNNING]", msg)
+        self.assertIn("run_command(`bg_fail_job`) [ERROR]", msg)
+        self.assertEqual(msg.count("(Tools run:"), 1)
+        self.assertNotIn("SHOULD_NOT_APPEAR", msg)
+        self.assertIn("VALUE = 42", msg)
+
+        # 2. Unresolved RUNNING task at compaction preserves mid_turn + [RUNNING]
+        logs_run = self.tmp_root / "brain" / "cid-running" / ".system_generated" / "logs"
+        rows_run = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>launch background suite</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "still_running"}}]},
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Tool is running as a background task with task id: cid-running/task-3",
+            },
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Launched background suite; waiting for result."},
+            {"step_index": 4, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. launch background suite\n<summary>Running</summary>\n</CONTEXT_SUMMARY>"},
+        ]
+        _write_jsonl(logs_run / "transcript_full.jsonl", rows_run)
+        res_run = mod.build_rehydration(logs_run / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_run)
+        assert res_run is not None
+        msg_run, st_run = res_run
+        self.assertEqual(st_run["session_mode"], "mid_turn")
+        self.assertIn("run_command(`still_running`) [RUNNING]", msg_run)
+
+    def test_primary_code_not_evicted_by_wrappers_and_two_turn_window(self) -> None:
+        src_py = self.ws / "guardrails.py"
+        hj = self.ws / "hooks.json"
+        ibat = self.ws / "install.bat"
+        ish = self.ws / "install.sh"
+        src_py.write_text("PRIMARY_CODE = True\n", encoding="utf-8")
+        hj.write_text("{}\n", encoding="utf-8")
+        ibat.write_text("@echo off\n", encoding="utf-8")
+        ish.write_text("#!/bin/sh\n", encoding="utf-8")
+
+        logs_a = self.tmp_root / "brain" / "cid-tier" / ".system_generated" / "logs"
+        rows_a = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>optimize guardrails and wrappers</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": str(src_py), "Replacement": "PRIMARY_CODE = True"}},
+                    {"name": "edit_file", "args": {"Path": str(hj), "Replacement": "{}"}},
+                    {"name": "edit_file", "args": {"Path": str(ibat), "Replacement": "@echo off"}},
+                    {"name": "edit_file", "args": {"Path": str(ish), "Replacement": "#!/bin/sh"}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 6, "type": "PLANNER_RESPONSE", "content": "Updated all 4 files." * 20},
+            {"step_index": 7, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. optimize guardrails and wrappers\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
+        ]
+        _write_jsonl(logs_a / "transcript_full.jsonl", rows_a)
+        res_a = mod.build_rehydration(logs_a / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_a)
+        assert res_a is not None
+        _, st_a = res_a
+        self.assertTrue(st_a["file_paths"][0].endswith("guardrails.py"))
+
+        # Turn N-1 primary code edit > 60 steps before checkpoint must survive Turn N cleanup wrappers + docs
+        qg = self.ws / "quality_gate.py"
+        ub = self.ws / "uninstall.bat"
+        us = self.ws / "uninstall.sh"
+        tp = self.ws / "tests" / "test_packaging.py"
+        rd = self.ws / "README.md"
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        qg.write_text("QUALITY_GATE_CODE = 1\n", encoding="utf-8")
+        ub.write_text("@echo off\n", encoding="utf-8")
+        us.write_text("#!/bin/sh\n", encoding="utf-8")
+        tp.write_text("class T: pass\n", encoding="utf-8")
+        rd.write_text("# README\n" + ("doc line\n" * 40), encoding="utf-8")
+
+        logs_b = self.tmp_root / "brain" / "cid-2turn" / ".system_generated" / "logs"
+        rows_b = [
+            {"step_index": 100, "type": "USER_INPUT", "content": "<USER_REQUEST>optimize quality_gate.py</USER_REQUEST>"},
+            {"step_index": 105, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": str(qg), "Replacement": "QUALITY_GATE_CODE = 1"}}]},
+            {"step_index": 106, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 120, "type": "PLANNER_RESPONSE", "content": "Optimized quality_gate.py." * 15},
+            {"step_index": 160, "type": "USER_INPUT", "content": "<USER_REQUEST>remove low-ROI plugins and update uninstall/README</USER_REQUEST>"},
+            {
+                "step_index": 170,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": str(ub), "Replacement": "@echo off"}},
+                    {"name": "edit_file", "args": {"Path": str(us), "Replacement": "#!/bin/sh"}},
+                    {"name": "edit_file", "args": {"Path": str(tp), "Replacement": "class T: pass"}},
+                    {"name": "edit_file", "args": {"Path": str(rd), "Replacement": "# README"}},
+                ],
+            },
+            {"step_index": 171, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 172, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 173, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 174, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 182, "type": "PLANNER_RESPONSE", "content": "Cleanup complete." * 15},
+            {"step_index": 184, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. optimize quality_gate.py\n2. remove low-ROI plugins and update uninstall/README\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
+        ]
+        _write_jsonl(logs_b / "transcript_full.jsonl", rows_b)
+        res_b = mod.build_rehydration(logs_b / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_b)
+        assert res_b is not None
+        msg_b, st_b = res_b
+        self.assertTrue(any(p.endswith("quality_gate.py") for p in st_b["file_paths"]), st_b["file_paths"])
+        self.assertNotIn("README.md", "\n".join(st_b["file_paths"]))
+        self.assertIn("QUALITY_GATE_CODE = 1", msg_b)
+
+    def test_markdown_line_safe_folding_and_counter_prompt_dedup(self) -> None:
+        long_url = "file:///d:/antigravity/some_very_long_repository_directory/plugins/config.json"
+        rich_reply = (
+            "Summary sentence opening with clear verdict.\n\n"
+            + ("Detail bullet point line that builds up toward the fold threshold.\n" * 6)
+            + f"1. **Target Link**: ([config.json]({long_url}))\n\n"
+            + "### Metrics Table\n"
+            + "| Case | Median |\n"
+            + "| :--- | :--- |\n"
+            + "| Row 1 | 50 ms |\n"
+            + "| Row 2 | 55 ms |\n"
+            + "```python\n"
+            + ("x = 1234567890\n" * 35)
+            + "y = 999\n"
+            + "```\n"
+            + "Final line after code block."
+        )
+        logs = self.tmp_root / "brain" / "cid-md" / ".system_generated" / "logs"
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>開始最佳化</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到早期開始。"},
+            {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>中間獨立問題</USER_REQUEST>"},
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "中間回答。"},
+            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>檢查報表</USER_REQUEST>"},
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": rich_reply},
+            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>開始最佳化</USER_REQUEST>"},
+            {"step_index": 7, "type": "PLANNER_RESPONSE", "content": "已完成第二次最佳化。"},
+            {
+                "step_index": 8,
+                "type": "CHECKPOINT",
+                "content": (
+                    "<CONTEXT_SUMMARY>\n# User Requests\n"
+                    "1. 檢查報表\n2. 開始最佳化\n"
+                    "<summary>Summary.</summary>\n</CONTEXT_SUMMARY>"
+                ),
+            },
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        self.assertEqual(st["folded_assistant_turns"], 1)
+        # Earlier step 0 identical short prompt must NOT be suppressed by step 6 copy inside # User Requests
+        self.assertIn("- [#1 @ step 0]: 開始最佳化", msg)
+        # Folded reply must not tear the long markdown link mid-URL or leave unclosed ``` fences
+        if "[config.json](" in msg:
+            self.assertIn(f"[config.json]({long_url})", msg)
+        step5_block = msg.split("[Step 5 | Assistant]:", 1)[1].split("[Step 6 | User]:", 1)[0]
+        fence_lines = sum(1 for ln in step5_block.splitlines() if ln.lstrip().startswith("```"))
+        self.assertEqual(fence_lines % 2, 0, step5_block)
+
+    def test_latest_turn_markdown_safe_clip_and_4500_threshold(self) -> None:
+        link_url = "file:///d:/antigravity/agy-rehydrate/tests/test_rehydrate.py"
+        link_md = f"[test_rehydrate.py]({link_url})"
+        code_target = self.ws / "core.py"
+        code_target.write_text("CORE = 1\n", encoding="utf-8")
+
+        # 1. Latest assistant reply of exactly 4,502 chars with link straddling char 3,200 stays unclipped.
+        head_4502 = "Opening summary line for active coding reply.\n" + ("Detailed line entry for checkpointing work.\n" * 71)
+        self.assertLess(len(head_4502), 3190)
+        pad_to_3185 = "x" * (3185 - len(head_4502))
+        mid_4502 = f"{pad_to_3185}See {link_md} for tests.\n"
+        tail_needed = 4502 - len(head_4502) - len(mid_4502)
+        self.assertGreater(tail_needed, 200)
+        tail_4502 = ("Tail verification detail line.\n" * (tail_needed // 31))
+        tail_4502 += "z" * (4502 - len(head_4502) - len(mid_4502) - len(tail_4502))
+        reply_4502 = head_4502 + mid_4502 + tail_4502
+        self.assertEqual(len(reply_4502), 4502)
+
+        logs_a = self.tmp_root / "brain" / "cid-4502" / ".system_generated" / "logs"
+        _write_jsonl(
+            logs_a / "transcript_full.jsonl",
+            [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>run edits</USER_REQUEST>"},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": str(code_target), "Replacement": "CORE = 1"}}]},
+                {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok " + ("log line\n" * 10000)},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "content": reply_4502},
+                {"step_index": 4, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. run edits\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
+            ],
+        )
+        res_a = mod.build_rehydration(logs_a / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_a)
+        assert res_a is not None
+        msg_a, _ = res_a
+        self.assertNotIn("turn clipped", msg_a)
+        self.assertIn(link_md, msg_a)
+
+        # 2. Oversized user (~5,800 chars) & latest assistant (~6,200 chars) turns fold on line boundaries,
+        #    keep the link straddling char 3,300 intact, and balance ``` fences across total - 1,100.
+        def _make_structured_turn(target_len: int) -> str:
+            pre = "Intro line for oversized structured turn.\n" + ("Preamble line with consistent width padding.\n" * 72)
+            pre += f"6. **Regression**: check {link_md} thoroughly.\n"
+            self.assertGreater(len(pre), 3310)
+            self.assertLess(len(pre), 3430)
+            mid = "Mid section line between link and code fence.\n" * 35
+            code_lines = ["```python\n"] + [f"val_{i:03d} = {i * 10}\n" for i in range(60)] + ["```\n"]
+            code_blk = "".join(code_lines)
+            post = "Final closing line after fenced block."
+            cur = len(pre) + len(mid) + len(code_blk) + len(post)
+            if cur < target_len:
+                extra_lines = (target_len - cur) // 46 + 1
+                mid += "Mid section line between link and code fence.\n" * extra_lines
+            return pre + mid + code_blk + post
+
+        user_big = _make_structured_turn(5800)
+        asst_big = _make_structured_turn(6200)
+        self.assertGreater(len(user_big), 5700)
+        self.assertGreater(len(asst_big), 6100)
+
+        logs_b = self.tmp_root / "brain" / "cid-bigturn" / ".system_generated" / "logs"
+        _write_jsonl(
+            logs_b / "transcript_full.jsonl",
+            [
+                {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{user_big}</USER_REQUEST>"},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "bg"}}]},
+                {"step_index": 2, "type": "GENERIC", "status": "RUNNING", "content": "Tool is running as a background task with task id: cid-bigturn/t1\n" + ("x" * 135000)},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "content": asst_big},
+                {"step_index": 4, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. big turn\n<summary>Running</summary>\n</CONTEXT_SUMMARY>"},
+            ],
+        )
+        res_b = mod.build_rehydration(logs_b / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_b)
+        assert res_b is not None
+        msg_b, st_b = res_b
+        self.assertEqual(st_b["session_mode"], "mid_turn")
+        user_blk = msg_b.split("[Step 0 | User]:", 1)[1].split("[Step 3 | Assistant]:", 1)[0]
+        asst_blk = msg_b.split("[Step 3 | Assistant]:", 1)[1].split("## ", 1)[0]
+        for label, blk in (("user", user_blk), ("assistant", asst_blk)):
+            self.assertIn("...[turn clipped (", blk, label)
+            self.assertIn(link_md, blk, label)
+            self.assertIn("Final closing line after fenced block.", blk, label)
+            fences = sum(1 for ln in blk.splitlines() if ln.lstrip().startswith("```"))
+            self.assertEqual(fences % 2, 0, f"{label} unbalanced fences:\n{blk}")
+
+    def test_line_endings_and_no_pycache(self) -> None:
+        self.assertEqual(list(REPO_ROOT.rglob("__pycache__")), [])
+        hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))
+        cmd = hooks_data["agy-rehydrate"]["PreInvocation"][0]["command"]
+        self.assertIn(" -S -B scripts/", cmd)
+        for path in REPO_ROOT.rglob("*"):
+            if not path.is_file() or ".tmp_" in str(path):
+                continue
+            raw = path.read_bytes()
+            suf = path.suffix.lower()
+            if suf == ".bat":
+                stripped = raw.replace(b"\r\n", b"")
+                self.assertNotIn(b"\n", stripped, f"Expected CRLF line endings in {path}")
+            elif suf in {".sh", ".py", ".json", ".md", ".svg"}:
+                self.assertNotIn(b"\r", raw, f"Expected LF line endings in {path}")
 
 
 if __name__ == "__main__":
