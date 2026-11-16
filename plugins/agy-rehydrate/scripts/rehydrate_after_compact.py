@@ -566,6 +566,30 @@ def is_skill_or_spec(path_str: str) -> bool:
     )
 
 
+PROSE_DOC_EXTS = frozenset({".md", ".mdx", ".rst", ".txt", ".adoc"})
+PROSE_DOC_STEMS = frozenset({"readme", "changelog", "history", "notice", "license", "copying", "authors", "contributing"})
+
+
+def _modified_file_tier(path_str: str) -> int:
+    """Classify modified workspace files: `2` = primary code/config, `1` = test suite, `0` = prose doc."""
+    p = Path(path_str)
+    ext = p.suffix.lower()
+    name_low = p.name.lower()
+    stem_low = p.stem.lower().split(".")[0]
+    if ext in PROSE_DOC_EXTS or stem_low in PROSE_DOC_STEMS:
+        return 0
+    slash_low = path_str.replace("\\", "/").lower()
+    if (
+        ".test." in name_low
+        or ".spec." in name_low
+        or name_low.startswith("test_")
+        or stem_low.endswith("_test")
+        or any(seg in slash_low for seg in ("/test/", "/tests/", "/__tests__/"))
+    ):
+        return 1
+    return 2
+
+
 def default_custom_skill_roots(artifact_dir: Path | None = None) -> list[Path]:
     """Return allowed non-workspace roots for Section 3 custom `SKILL.md` and session plan artifacts."""
     home = Path.home()
@@ -708,7 +732,7 @@ def read_modified_hunk_window(
         return None, ""
     if not full_text:
         return None, ""
-    if len(full_text) <= max_chars:
+    if len(full_text) <= min(max_chars, 2200):
         return full_text, ""
 
     if not snippets:
@@ -741,10 +765,11 @@ def read_modified_hunk_window(
         return _clip_text_middle(full_text, max_chars), ""
 
     cap = max_chars
-    scaled_ctx = max(context_lines, min(120, cap // 110))
+    scaled_ctx = max(context_lines, min(120, cap // 110)) if context_lines >= 30 else context_lines
     assembled = ""
     range_labels: list[str] = []
-    radius_steps = sorted({scaled_ctx, context_lines, 28, 15, 8}, reverse=True)
+    base_radii = {scaled_ctx, context_lines, 28, 15, 8} if context_lines >= 30 else {context_lines, 8}
+    radius_steps = sorted(base_radii, reverse=True)
     for ctx in radius_steps:
         raw_spans = [(max(1, s - ctx), min(total_lines, e + ctx)) for s, e in anchor_spans]
         raw_spans.sort()
@@ -1267,6 +1292,16 @@ def _flush_step_batch(batch: list[str], pending_tools: list[str]) -> None:
     batch.clear()
 
 
+def _summarize_tool_chain(tools: list[str], max_items: int = 6) -> str:
+    """Keep opening steps + final edit/verification steps when tool batches exceed `max_items`."""
+    if len(tools) <= max_items:
+        return " -> ".join(tools)
+    head_n = max(1, max_items // 3)
+    tail_n = max(1, max_items - head_n)
+    omitted = len(tools) - head_n - tail_n
+    return " -> ".join([*tools[:head_n], f"(+{omitted} steps)", *tools[-tail_n:]])
+
+
 def build_rehydration(
     full_path: Path,
     up_to_checkpoint_step: int | None = None,
@@ -1397,9 +1432,7 @@ def build_rehydration(
                     if mcontent:
                         tool_prefix = ""
                         if pending_tools:
-                            joined_tools = " -> ".join(pending_tools[:6])
-                            if len(pending_tools) > 6:
-                                joined_tools += f" (+{len(pending_tools) - 6} steps)"
+                            joined_tools = _summarize_tool_chain(pending_tools, max_items=6)
                             tool_prefix = f"  (Tools run: {joined_tools})\n"
                             pending_tools.clear()
                         dialogue_entries.append((step_idx, "assistant", tool_prefix, mcontent))
@@ -1438,13 +1471,19 @@ def build_rehydration(
     _flush_step_batch(cur_batch_summaries, pending_tools)
     if pending_tools:
         dialogue_entries.append(
-            (target_cp - 1, "in_progress", "", f"[Pre-Compaction In-Progress Tools]: {' -> '.join(pending_tools[:6])}")
+            (
+                target_cp - 1,
+                "in_progress",
+                "",
+                f"[Pre-Compaction In-Progress Tools]: {_summarize_tool_chain(pending_tools, max_items=6)}",
+            )
         )
 
+    def _is_recent_mod_step(st: int) -> bool:
+        return (last_user_step >= 0 and st >= last_user_step) or max(0, target_cp - st) <= cfg.max_modified_age_steps
+
     max_mod_spec_age = max(120, cfg.max_modified_age_steps * 2)
-    has_recent_mod = any(
-        max(0, target_cp - st) <= cfg.max_modified_age_steps for _, st, _ in modified_touch.values()
-    ) or any(
+    has_recent_mod = any(_is_recent_mod_step(st) for _, st, _ in modified_touch.values()) or any(
         was_mod and max(0, target_cp - st) <= max_mod_spec_age for _, st, was_mod in skill_spec_touch.values()
     )
 
@@ -1559,11 +1598,17 @@ def build_rehydration(
         ):
             eligible_skills.append((spath, sstep, was_mod))
 
+    def _mod_sort_key(item: tuple[str, tuple[str, int, list[str]]]) -> tuple[int, int, int, int]:
+        _, (p, st, snips) = item
+        hot_band = 1 if ((last_user_step >= 0 and st >= last_user_step) or max(0, target_cp - st) <= 35) else 0
+        tier = _modified_file_tier(p)
+        return (hot_band, tier, st, len(snips))
+
     mod_candidates = [
         (key, p, st, (None, None), snips)
-        for key, (p, st, snips) in sorted(modified_touch.items(), key=lambda x: x[1][1], reverse=True)
+        for key, (p, st, snips) in sorted(modified_touch.items(), key=_mod_sort_key, reverse=True)
         if key not in skill_spec_touch
-        and max(0, target_cp - st) <= cfg.max_modified_age_steps
+        and _is_recent_mod_step(st)
         and is_eligible_text_file(p, workspace_roots=workspace_roots)
     ][: cfg.max_modified_files]
     mod_keys = {key for key, _, _, _, _ in mod_candidates}
@@ -1673,7 +1718,8 @@ def build_rehydration(
                 if role_label == "Referenced":
                     content, range_note = read_scoped_text_clipped(fpath, max_slice, lrange)
                 elif cfg.adaptive:
-                    content, range_note = read_modified_hunk_window(fpath, snips, max_slice)
+                    hunk_ctx = 12 if _modified_file_tier(fpath) == 0 else 45
+                    content, range_note = read_modified_hunk_window(fpath, snips, max_slice, context_lines=hunk_ctx)
                 else:
                     content, range_note = read_text_clipped(fpath, max_slice), ""
                 if content:
