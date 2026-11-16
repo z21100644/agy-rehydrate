@@ -1342,7 +1342,17 @@ def build_rehydration(
                     already_rehydrated_after.add(last_cp)
 
     simulated = False
-    if checkpoints:
+    if (
+        simulate_if_no_checkpoint
+        and checkpoints
+        and checkpoints[-1] in already_rehydrated_after
+        and max_seen_step > checkpoints[-1] + 2
+    ):
+        target_cp = max_seen_step + 1
+        prev_cp_step = checkpoints[-1]
+        target_cp_content = ""
+        simulated = True
+    elif checkpoints:
         target_cp = checkpoints[-1]
         prev_cp_step = checkpoints[-2] if len(checkpoints) >= 2 else -1
         target_cp_content = checkpoint_contents.get(target_cp, "")
@@ -2134,11 +2144,13 @@ def run_cli(argv: list[str]) -> int:
         "inspect", parents=[common], help="Dry-run rehydration stats and restored file list for a session"
     )
     p_inspect.add_argument("target", nargs="?", default="latest", help="'latest', conversation ID/prefix, or path")
+    p_inspect.add_argument("--checkpoint", type=int, default=None, help="Inspect a specific checkpoint step index")
 
     p_preview = sub.add_parser(
         "preview", parents=[common], help="Preview rendered rehydration sections for a session"
     )
     p_preview.add_argument("target", nargs="?", default="latest", help="'latest', conversation ID/prefix, or path")
+    p_preview.add_argument("--checkpoint", type=int, default=None, help="Preview a specific checkpoint step index")
     p_preview.add_argument("--full", action="store_true", help="Print full rehydrated markdown text")
 
     sub.add_parser("show-config", parents=[common], help="Display effective budgets merged with .agents/rehydrate.json")
@@ -2205,14 +2217,15 @@ def run_cli(argv: list[str]) -> int:
         return 1
     prod, cid, _, full_path = resolved
     ancestors = resolve_fork_ancestors(full_path)
+    explicit_cp = getattr(args, "checkpoint", None)
     try:
         res = build_rehydration(
             full_path,
-            up_to_checkpoint_step=999_999_999,
+            up_to_checkpoint_step=explicit_cp if explicit_cp is not None else 999_999_999,
             ancestors=ancestors,
             config=cfg,
             workspace_roots=[workspace],
-            simulate_if_no_checkpoint=True,
+            simulate_if_no_checkpoint=(explicit_cp is None),
         )
     except OSError as exc:
         print(f"Cannot read transcript {full_path} ({exc}); rerun outside sandbox if inspecting another session.")
