@@ -991,6 +991,15 @@ def is_trackable_workspace_path(
     if not norm:
         return False, None
 
+    # Fail closed: with no trusted root the scope is unknown, never unrestricted
+    allowed_prefixes = (
+        _allowed_prefixes
+        if _allowed_prefixes is not None
+        else _prepare_root_prefixes([*(workspace_roots or ()), *(allow_skill_or_artifact_roots or ())], resolve_cache)
+    )
+    if not allowed_prefixes:
+        return False, None
+
     # Pre-resolve fast deny on obvious blacklisted paths/extensions/excluded roots (never bypasses post-resolve checks)
     norm_slash = norm.replace("\\", "/").lower()
     norm_slash_dir = norm_slash if norm_slash.endswith("/") else norm_slash + "/"
@@ -1027,17 +1036,8 @@ def is_trackable_workspace_path(
     res_norm = _norm_path_for_prefix(res_str)
     if excl_prefixes and any(_is_subpath_norm(res_norm, ep) for ep in excl_prefixes):
         return False, None
-
-    if _allowed_prefixes is not None:
-        if _allowed_prefixes and not any(_is_subpath_norm(res_norm, ap) for ap in _allowed_prefixes):
-            return False, None
-    elif workspace_roots:
-        allowed_roots = list(workspace_roots)
-        if allow_skill_or_artifact_roots:
-            allowed_roots.extend(allow_skill_or_artifact_roots)
-        allowed_prefixes = _prepare_root_prefixes(allowed_roots, resolve_cache)
-        if not any(_is_subpath_norm(res_norm, ap) for ap in allowed_prefixes):
-            return False, None
+    if not any(_is_subpath_norm(res_norm, ap) for ap in allowed_prefixes):
+        return False, None
 
     return True, resolved
 

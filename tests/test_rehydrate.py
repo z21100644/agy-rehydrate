@@ -2762,6 +2762,81 @@ class RehydrateRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_missing_workspace_roots_fail_closed_to_trusted_roots(self) -> None:
+        import rehydrate_helpers as helpers
+
+        # 1. Hook payload without `workspacePaths`/`cwd` must never re-read tool-touched paths outside trusted roots
+        brain_cid = self.tmp_root / "brain" / "cid-no-ws-roots"
+        logs = brain_cid / ".system_generated" / "logs"
+        outside_dir = self.tmp_root / "outside_no_ws_roots"
+        outside_src = outside_dir / "billing.py"
+        outside_spec = outside_dir / "API_SPEC.md"
+        outside_skill = outside_dir / "SKILL.md"
+        artifact_plan = brain_cid / "implementation_plan.md"
+        artifact_skill = brain_cid / "skills" / "deploy" / "SKILL.md"
+        for fpath, marker in (
+            (outside_src, "OUTSIDE_SRC_MARKER = 1"),
+            (outside_spec, "OUTSIDE_SPEC_MARKER"),
+            (outside_skill, "OUTSIDE_SKILL_MARKER"),
+            (artifact_plan, "ARTIFACT_PLAN_MARKER"),
+            (artifact_skill, "ARTIFACT_SKILL_MARKER"),
+        ):
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(marker + "\n", encoding="utf-8")
+
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>依計畫調整 billing.py</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": str(outside_src), "Replacement": "OUTSIDE_SRC_MARKER = 1"}},
+                    {"name": "read_file", "args": {"Path": str(outside_spec)}},
+                    {"name": "read_file", "args": {"Path": str(outside_skill)}},
+                    {"name": "edit_file", "args": {"Path": str(artifact_plan), "Replacement": "ARTIFACT_PLAN_MARKER"}},
+                    {"name": "read_file", "args": {"Path": str(artifact_skill)}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 6, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 7, "type": "PLANNER_RESPONSE", "content": "已依計畫完成 billing.py 的調整。"},
+            {
+                "step_index": 8,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 依計畫調整 billing.py\n<summary>Done</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs / "transcript.jsonl", rows)
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        p_hook = subprocess.run(
+            [sys.executable, "-S", "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
+            input=json.dumps({"transcriptPath": str(logs / "transcript.jsonl")}),
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        hook_res = json.loads(p_hook.stdout.strip())
+        self.assertIn("injectSteps", hook_res)
+        injected_txt = "\n".join(st_item["systemMessage"]["systemMessage"] for st_item in hook_res["injectSteps"])
+        # Transcript dialogue plus fixed trusted roots (session artifact dir) are still restored
+        self.assertIn("已依計畫完成 billing.py 的調整。", injected_txt)
+        self.assertIn("ARTIFACT_PLAN_MARKER", injected_txt)
+        self.assertIn("ARTIFACT_SKILL_MARKER", injected_txt)
+        # Unknown workspace scope is never treated as unrestricted for workspace files, specs, or skills
+        self.assertNotIn("OUTSIDE_SRC_MARKER", injected_txt)
+        self.assertNotIn("OUTSIDE_SPEC_MARKER", injected_txt)
+        self.assertNotIn("OUTSIDE_SKILL_MARKER", injected_txt)
+
+        # 2. Scope gate itself denies when no trusted root (or an empty allow-list) is supplied
+        self.assertTrue(helpers.is_eligible_text_file(str(outside_src), workspace_roots=[outside_dir]))
+        self.assertFalse(helpers.is_eligible_text_file(str(outside_src)))
+        self.assertFalse(helpers.is_eligible_text_file(str(outside_src), _allowed_prefixes=()))
+
     def test_line_endings_and_no_pycache(self) -> None:
         self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])
         hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))

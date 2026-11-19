@@ -1349,25 +1349,18 @@ def build_rehydration(
     )
 
     path_resolve_cache: dict[str, Path | None] = {}
-    ws_allowed_prefixes = _prepare_root_prefixes(workspace_roots, path_resolve_cache) if workspace_roots else None
+    # Allow-lists are always explicit: a scope with no trusted root gets an empty tuple (deny), never "unrestricted"
+    ws_allowed_prefixes = _prepare_root_prefixes(workspace_roots, path_resolve_cache)
     scratch_excl_prefixes = (
         _prepare_root_prefixes(scratch_excluded_roots, path_resolve_cache) if scratch_excluded_roots else ()
     )
-    skill_allowed_prefixes = (
-        _prepare_root_prefixes(
-            [*workspace_roots, *(r for r in skill_extra_roots if r is not None)],
-            path_resolve_cache,
-        )
-        if workspace_roots
-        else None
+    skill_allowed_prefixes = _prepare_root_prefixes(
+        [*(workspace_roots or ()), *(r for r in skill_extra_roots if r is not None)],
+        path_resolve_cache,
     )
-    art_allowed_prefixes = (
-        _prepare_root_prefixes(
-            [*workspace_roots, *([effective_artifact_dir] if effective_artifact_dir else [])],
-            path_resolve_cache,
-        )
-        if workspace_roots
-        else None
+    art_allowed_prefixes = _prepare_root_prefixes(
+        [*(workspace_roots or ()), *([effective_artifact_dir] if effective_artifact_dir else [])],
+        path_resolve_cache,
     )
 
     eligibility_cache: dict[tuple[str, int], bool] = {}
