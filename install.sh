@@ -15,7 +15,7 @@ fi
 PYTHON_BIN=""
 for CAND in python3 python; do
   if command -v "$CAND" >/dev/null 2>&1; then
-    RESOLVED="$("$CAND" -B -c "import sys; print(sys.executable if sys.version_info >= (3, 9) else '')" 2>/dev/null || true)"
+    RESOLVED="$("$CAND" -B -c "import sys; print(sys.executable if sys.version_info >= (3, 11, 2) else '')" 2>/dev/null || true)"
     if [ -n "$RESOLVED" ]; then
       PYTHON_BIN="$RESOLVED"
       break

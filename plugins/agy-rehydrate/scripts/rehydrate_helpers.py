@@ -739,7 +739,8 @@ def extract_edit_snippets(tool_name: str, args: dict[str, Any]) -> list[str]:
     for key in ("Replacement", "ReplacementContent"):
         val = args.get(key)
         if isinstance(val, str) and val.strip():
-            snippets.append(f"{line_pfx}{val.strip('\r\n')[:600]}")
+            cleaned = val.strip("\r\n")[:600]
+            snippets.append(f"{line_pfx}{cleaned}")
     chunks = args.get("ReplacementChunks")
     if isinstance(chunks, list):
         for ch in chunks:
@@ -748,7 +749,8 @@ def extract_edit_snippets(tool_name: str, args: dict[str, Any]) -> list[str]:
                 cpfx = f"@@LINES:{cs or ''}:{ce or ''}@@\n" if (cs or ce) else line_pfx
                 rc = ch.get("ReplacementContent")
                 if isinstance(rc, str) and rc.strip():
-                    snippets.append(f"{cpfx}{rc.strip('\r\n')[:600]}")
+                    cleaned_rc = rc.strip("\r\n")[:600]
+                    snippets.append(f"{cpfx}{cleaned_rc}")
                 elif cpfx:
                     snippets.append(cpfx.rstrip("\n"))
     if not snippets and line_pfx:

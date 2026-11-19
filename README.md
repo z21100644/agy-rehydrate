@@ -4,7 +4,7 @@
 
 Standalone native plugin for **Google Antigravity** (Desktop App 2.x, CLI `agy`, and IDE), adapted from [AGY Post-Compact Rehydration](https://agy-rehydrate.pages.dev/) with full cross-platform support (**Windows / macOS / Linux**) and multi-surface compatibility.
 
-Zero third-party dependencies — requires only `Python 3.14+` in `PATH`.
+Zero third-party dependencies — requires only `Python 3.11.2+` in `PATH`.
 
 ---
 

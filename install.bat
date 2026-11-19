@@ -17,12 +17,12 @@ if not exist "%PLUGIN_SRC%\plugin.json" (
 
 set "PYTHON_LAUNCHER="
 set "PYTHON_BIN="
-python -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul && set "PYTHON_LAUNCHER=python"
+python -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11, 2) else 1)" >nul 2>nul && set "PYTHON_LAUNCHER=python"
 if not defined PYTHON_LAUNCHER (
-  py -3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul && set "PYTHON_LAUNCHER=py -3"
+  py -3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11, 2) else 1)" >nul 2>nul && set "PYTHON_LAUNCHER=py -3"
 )
 if not defined PYTHON_LAUNCHER (
-  python3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >nul 2>nul && set "PYTHON_LAUNCHER=python3"
+  python3 -B -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11, 2) else 1)" >nul 2>nul && set "PYTHON_LAUNCHER=python3"
 )
 if defined PYTHON_LAUNCHER (
   for /f "delims=" %%E in ('%PYTHON_LAUNCHER% -B -c "import sys; print(sys.executable)" 2^>nul') do set "PYTHON_BIN=%%E"

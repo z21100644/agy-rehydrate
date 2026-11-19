@@ -4,7 +4,7 @@
 
 基於 [AGY Post-Compact Rehydration](https://agy-rehydrate.pages.dev/) 封裝並強化的 **Google Antigravity（App 2.x 桌面端、CLI `agy` 與 IDE）** 原生獨立插件，完整支援 **Windows（PowerShell／CMD）、macOS 與 Linux** 跨平台運作。
 
-全程採用**零第三方套件依賴**設計：僅需系統 `PATH` 具備 `Python 3.14+` 即可開箱即用。
+全程採用**零第三方套件依賴**設計：僅需系統 `PATH` 具備 `Python 3.11.2+` 即可開箱即用。
 
 ---
 
