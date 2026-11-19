@@ -1044,6 +1044,834 @@ class RehydrateRegressionTests(unittest.TestCase):
             joined_tight,
         )
 
+    def test_record_read_touch_range_merging_preserves_open_bounds(self) -> None:
+        p = str(self.ws / "lines_demo.py")
+
+        store1: dict = {}
+        mod._record_read_touch(store1, p, 1, (None, 50))
+        mod._record_read_touch(store1, p, 2, (100, 200))
+        self.assertEqual(store1[mod.canonical_path_key(p)][2], (None, 200))
+
+        store2: dict = {}
+        mod._record_read_touch(store2, p, 1, (100, 200))
+        mod._record_read_touch(store2, p, 2, (None, 50))
+        self.assertEqual(store2[mod.canonical_path_key(p)][2], (None, 200))
+
+        store3: dict = {}
+        mod._record_read_touch(store3, p, 1, (None, 50))
+        mod._record_read_touch(store3, p, 2, (100, None))
+        self.assertEqual(store3[mod.canonical_path_key(p)][2], (None, None))
+
+        store4: dict = {}
+        mod._record_read_touch(store4, p, 1, (50, None))
+        mod._record_read_touch(store4, p, 2, (10, 40))
+        self.assertEqual(store4[mod.canonical_path_key(p)][2], (10, None))
+
+        store5: dict = {}
+        mod._record_read_touch(store5, p, 1, (20, 50))
+        mod._record_read_touch(store5, p, 2, (100, 200))
+        self.assertEqual(store5[mod.canonical_path_key(p)][2], (20, 200))
+
+        # End-to-end check: reading (None, 50) then (100, 200) must preserve lines 1..200 (not drop 1..99)
+        demo_file = self.ws / "lines_demo.py"
+        demo_file.write_text("".join(f"line_{i:03d} = {i}\n" for i in range(1, 251)), encoding="utf-8")
+        logs = self.tmp_root / "brain" / "cid-read-merge" / ".system_generated" / "logs"
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Inspect lines_demo.py ranges</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "Reading first 50 lines then lines 100-200.",
+                "tool_calls": [
+                    {"name": "view_file", "args": {"AbsolutePath": str(demo_file), "EndLine": 50}},
+                    {"name": "view_file", "args": {"AbsolutePath": str(demo_file), "StartLine": 100, "EndLine": 200}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Viewed lines 1-50."},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Viewed lines 100-200."},
+            {
+                "step_index": 4,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Inspect lines_demo.py ranges\n<summary>Mid-read.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, _ = res
+        self.assertIn("lines 1-200", msg)
+        self.assertIn("line_001 = 1", msg)
+        self.assertIn("line_200 = 200", msg)
+        self.assertNotIn("line_240 = 240", msg)
+
+    def test_non_dict_jsonl_rows_and_corrupt_state_do_not_crash(self) -> None:
+        brain = self.tmp_root / "brain"
+        logs = brain / "cid-nondict" / ".system_generated" / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        code_file = self.ws / "robust.py"
+        code_file.write_text("ROBUST_OK = True\n", encoding="utf-8")
+
+        raw_lines = [
+            "null",
+            "[]",
+            "123",
+            '"just a string"',
+            "true",
+            json.dumps({"step_index": True, "type": "CHECKPOINT", "content": "bool step_index"}),
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-11-18T10:00:00Z",
+                    "content": "<USER_REQUEST>Update robust.py safely</USER_REQUEST>",
+                }
+            ),
+            "null",
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-18T10:00:05Z",
+                    "content": "",
+                    "tool_calls": [
+                        {"name": "edit_file", "args": {"Path": str(code_file), "Replacement": "ROBUST_OK = True"}}
+                    ],
+                }
+            ),
+            "[1, 2, 3]",
+            json.dumps({"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Updated robust.py."}),
+            json.dumps(
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-11-18T10:00:10Z",
+                    "content": "Updated robust.py successfully.",
+                }
+            ),
+            json.dumps(
+                {
+                    "step_index": 4,
+                    "type": "CHECKPOINT",
+                    "created_at": "2026-11-18T10:00:15Z",
+                    "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Update robust.py safely\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
+                }
+            ),
+            "null",
+            "[]",
+        ]
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+            (logs / fname).write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+
+        hist_path = self.tmp_root / "history.jsonl"
+        hist_path.write_text(
+            "\n".join(
+                [
+                    "null",
+                    "[]",
+                    "42",
+                    json.dumps({"conversationId": "cid-nondict", "workspace": str(self.ws), "display": "/fork", "timestamp": 1795000000000}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Direct API calls must all ignore non-dict rows cleanly
+        first_info = mod.read_first_step_info(logs / "transcript_full.jsonl")
+        self.assertIsNotNone(first_info)
+        assert first_info is not None
+        self.assertEqual(first_info[0], 0)
+
+        step_hit = mod.find_step_epoch_in_transcript(logs / "transcript_full.jsonl", 3)
+        self.assertIsNotNone(step_hit)
+        assert step_hit is not None
+        self.assertEqual(step_hit[0], 4)
+
+        ws_map, fevents = mod.load_history_fork_hints(brain)
+        self.assertIn("cid-nondict", ws_map)
+        self.assertEqual(len(fevents), 1)
+
+        cp_found, max_found, _ = mod.scan_compact_tail(logs / "transcript.jsonl", 0, None)
+        self.assertEqual(cp_found, 4)
+        self.assertEqual(max_found, 4)
+
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        self.assertEqual(st["checkpoint"], 4)
+        self.assertIn("ROBUST_OK = True", msg)
+
+        # Non-dict rehydrate_state.json must not crash hook subprocess or CLI `list`
+        state_file = logs / "rehydrate_state.json"
+        state_file.write_text("[]", encoding="utf-8")
+        payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
+        p_hook = subprocess.run(
+            [sys.executable, "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
+            input=payload,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        hook_out = json.loads(p_hook.stdout.strip())
+        self.assertIn("injectSteps", hook_out)
+
+        fake_home = self.tmp_root / "fake_home"
+        fake_logs = fake_home / ".gemini" / "antigravity" / "brain" / "cid-nondict-cli" / ".system_generated" / "logs"
+        fake_logs.mkdir(parents=True, exist_ok=True)
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+            (fake_logs / fname).write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
+        (fake_logs / "rehydrate_state.json").write_text("null", encoding="utf-8")
+        cli_env = dict(os.environ)
+        cli_env["HOME"] = str(fake_home)
+        cli_env["USERPROFILE"] = str(fake_home)
+        p_status = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(SCRIPTS_DIR / "rehydrate_after_compact.py"),
+                "status",
+                "--limit",
+                "5",
+            ],
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            env=cli_env,
+            check=True,
+        )
+        self.assertIn("cid-nondict-cli", p_status.stdout)
+
+    def test_find_step_epoch_reordered_huge_tail_and_fork_scoring(self) -> None:
+        brain = self.tmp_root / "brain"
+
+        # 1. Reordered JSONL (>180 KB, step_index at end of line > 2 KB, plus non-dict rows near midpoint)
+        reo_logs = brain / "cid-reo-search" / ".system_generated" / "logs"
+        reo_logs.mkdir(parents=True, exist_ok=True)
+        reo_path = reo_logs / "transcript_full.jsonl"
+        reo_lines: list[str] = []
+        for s in range(60):
+            if s == 30:
+                reo_lines.extend(["null"] * 20)
+            pad = ("x" * 2800) + f"_step_{s}"
+            row_str = json.dumps(
+                {
+                    "content": pad,
+                    "created_at": f"2026-11-18T08:{s // 60:02d}:{s % 60:02d}Z",
+                    "type": "PLANNER_RESPONSE",
+                    "step_index": s,
+                }
+            )
+            reo_lines.append(row_str)
+        reo_path.write_text("\n".join(reo_lines) + "\n", encoding="utf-8")
+        self.assertGreater(reo_path.stat().st_size, 160000)
+
+        hit_reo = mod.find_step_epoch_in_transcript(reo_path, 12)
+        self.assertIsNotNone(hit_reo)
+        assert hit_reo is not None
+        self.assertEqual(hit_reo[0], 59)
+        self.assertIsNotNone(hit_reo[1])
+
+        # 2. Huge trailing line > 512 KB must NOT falsely treat an earlier target_step as exact_tip
+        huge_logs = brain / "cid-huge-tail" / ".system_generated" / "logs"
+        huge_logs.mkdir(parents=True, exist_ok=True)
+        huge_path = huge_logs / "transcript_full.jsonl"
+        huge_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T09:00:00Z", "content": "start"},
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T09:01:00Z", "content": "mid"},
+            {
+                "step_index": 6,
+                "type": "GENERIC",
+                "created_at": "2026-11-18T09:02:00Z",
+                "content": "Z" * 620000,
+            },
+        ]
+        _write_jsonl(huge_path, huge_rows)
+        hit_mid = mod.find_step_epoch_in_transcript(huge_path, 5)
+        self.assertIsNotNone(hit_mid)
+        assert hit_mid is not None
+        self.assertEqual(hit_mid[0], 6)  # NOT 5 (must not fake exact_tip!)
+
+        # Huge final step itself IS exact_tip when EOF immediately follows
+        hit_tip = mod.find_step_epoch_in_transcript(huge_path, 6)
+        self.assertIsNotNone(hit_tip)
+        assert hit_tip is not None
+        self.assertEqual(hit_tip[0], 6)
+
+        # Huge trailing corrupt/non-JSON line after step 5 must return -1 (unknown), NOT 5
+        corrupt_tail_path = huge_logs / "transcript_corrupt_tail.jsonl"
+        corrupt_tail_path.write_text(
+            json.dumps(huge_rows[0]) + "\n" + json.dumps(huge_rows[1]) + "\n" + ("{" + "Q" * 620000) + "\n",
+            encoding="utf-8",
+        )
+        hit_corrupt = mod.find_step_epoch_in_transcript(corrupt_tail_path, 5)
+        self.assertIsNotNone(hit_corrupt)
+        assert hit_corrupt is not None
+        self.assertEqual(hit_corrupt[0], -1)
+
+        # 3. /fork scoring without history `/fork` entry:
+        #    Recent parent that kept chatting (exact_tip=0, delta=30s) MUST beat old unrelated exact_tip=1 (delta=3h)
+        ws_a = str((self.ws / "proj_a").resolve())
+        ws_b = str((self.ws / "proj_b").resolve())
+        hist_rows = [
+            {"conversationId": "parent-recent-continued", "workspace": ws_a, "display": "msg", "timestamp": 1795000000000},
+            {"conversationId": "unrelated-old-exact-tip", "workspace": ws_a, "display": "msg", "timestamp": 1795000000000},
+            {"conversationId": "child-fork-score", "workspace": ws_a, "display": "msg", "timestamp": 1795000000000},
+            {"conversationId": "unrelated-other-ws", "workspace": ws_b, "display": "msg", "timestamp": 1795000000000},
+        ]
+        _write_jsonl(self.tmp_root / "history.jsonl", hist_rows)
+
+        p_recent = brain / "parent-recent-continued" / ".system_generated" / "logs"
+        _write_jsonl(
+            p_recent / "transcript_full.jsonl",
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T09:50:00Z", "content": "init"},
+                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T09:59:30Z", "content": "fork point"},
+                {"step_index": 10, "type": "USER_INPUT", "created_at": "2026-11-18T10:05:00Z", "content": "continued later"},
+            ],
+        )
+        p_old = brain / "unrelated-old-exact-tip" / ".system_generated" / "logs"
+        _write_jsonl(
+            p_old / "transcript_full.jsonl",
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T06:50:00Z", "content": "old"},
+                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T07:00:00Z", "content": "old tip"},
+            ],
+        )
+        # Also create 15 unrelated large step-0 conversations to verify fast resolution
+        for idx in range(15):
+            u_logs = brain / f"unrelated-noise-{idx:02d}" / ".system_generated" / "logs"
+            u_rows = [
+                {"step_index": k, "type": "GENERIC", "created_at": f"2026-11-18T05:{k:02d}:00Z", "content": "N" * 4000}
+                for k in range(30)
+            ]
+            _write_jsonl(u_logs / "transcript_full.jsonl", u_rows)
+            _write_jsonl(
+                u_logs / "transcript.jsonl",
+                [{"step_index": k, "type": "GENERIC", "created_at": f"2026-11-18T05:{k:02d}:00Z", "content": "short"} for k in range(30)],
+            )
+
+        child_logs = brain / "child-fork-score" / ".system_generated" / "logs"
+        _write_jsonl(
+            child_logs / "transcript_full.jsonl",
+            [
+                {"step_index": 10, "type": "USER_INPUT", "created_at": "2026-11-18T10:00:00Z", "content": "forked task"},
+                {"step_index": 11, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T10:00:05Z", "content": "ok"},
+            ],
+        )
+
+        t0 = time.monotonic()
+        ancestors = mod.resolve_fork_ancestors(child_logs / "transcript_full.jsonl")
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(len(ancestors), 1)
+        self.assertEqual(ancestors[0]["cid"], "parent-recent-continued")
+
+        # 4. Unconfirmed stale candidate (>24h) and disjoint-workspace candidate must be rejected;
+        #    explicit `/fork` event in history.jsonl MUST still match a multi-day delayed fork
+        brain2 = self.tmp_root / "brain_stale"
+        p_stale = brain2 / "parent-multiday" / ".system_generated" / "logs"
+        _write_jsonl(
+            p_stale / "transcript_full.jsonl",
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-10T10:00:00Z", "content": "day1"},
+                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-10T10:10:00Z", "content": "day1 tip"},
+            ],
+        )
+        p_other_ws = brain2 / "parent-other-ws" / ".system_generated" / "logs"
+        _write_jsonl(
+            p_other_ws / "transcript_full.jsonl",
+            [
+                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T09:50:00Z", "content": "other"},
+                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T09:59:45Z", "content": "other tip"},
+            ],
+        )
+        c_stale = brain2 / "child-day8" / ".system_generated" / "logs"
+        _write_jsonl(
+            c_stale / "transcript_full.jsonl",
+            [
+                {"step_index": 10, "type": "USER_INPUT", "created_at": "2026-11-18T10:00:00Z", "content": "day8 child"},
+            ],
+        )
+        hist2 = self.tmp_root / "history.jsonl"
+        _write_jsonl(
+            hist2,
+            [
+                {"conversationId": "parent-multiday", "workspace": ws_a, "display": "old", "timestamp": 1794305400000},
+                {"conversationId": "parent-other-ws", "workspace": ws_b, "display": "other", "timestamp": 1795000000000},
+                {"conversationId": "child-day8", "workspace": ws_a, "display": "child", "timestamp": 1795000000000},
+            ],
+        )
+        self.assertEqual(mod.resolve_fork_ancestors(c_stale / "transcript_full.jsonl"), [])
+
+        # Adding an explicit `/fork` event on `parent-multiday` right before child start unlocks multi-day match
+        fork_ts_ms = int(mod.parse_iso_epoch("2026-11-18T09:59:55Z") * 1000)
+        _write_jsonl(
+            hist2,
+            [
+                {"conversationId": "parent-multiday", "workspace": ws_a, "display": "/fork", "timestamp": fork_ts_ms},
+                {"conversationId": "parent-other-ws", "workspace": ws_b, "display": "other", "timestamp": fork_ts_ms},
+                {"conversationId": "child-day8", "workspace": ws_a, "display": "child", "timestamp": fork_ts_ms},
+            ],
+        )
+        confirmed = mod.resolve_fork_ancestors(c_stale / "transcript_full.jsonl")
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["cid"], "parent-multiday")
+
+    def test_same_turn_multiple_final_replies_and_interrupted_turn_tools(self) -> None:
+        worker_py = self.ws / "worker_bg.py"
+        worker_py.write_text("WORKER_BG = 1\n", encoding="utf-8")
+
+        # 1. Multiple final replies in the same turn + interrupted turns (tools-only & narration+tools)
+        logs = self.tmp_root / "brain" / "cid-multi-reply" / ".system_generated" / "logs"
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Start migration step A</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "migrate_step_a"}}],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\n\nok"},
+            # User interrupts turn 0 before any assistant reply
+            {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>Actually run step B with narration</USER_REQUEST>"},
+            {
+                "step_index": 4,
+                "type": "PLANNER_RESPONSE",
+                "content": "Starting step B migration now.",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "migrate_step_b"}}],
+            },
+            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\n\nok"},
+            # User interrupts turn 3 after narration + tool
+            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>Launch async job and summarize twice</USER_REQUEST>"},
+            {
+                "step_index": 7,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "async_verify"}}],
+            },
+            {
+                "step_index": 8,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-18T10:00:01Z\nTool is running as a background task with task id: cid-multi-reply/task-bg-99\nTask logs...",
+            },
+            {"step_index": 9, "type": "PLANNER_RESPONSE", "content": "First complete conclusion: ALPHA_VERDICT."},
+            {
+                "step_index": 10,
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "content": 'sender=cid-multi-reply/task-bg-99 content=Task id "cid-multi-reply/task-bg-99" finished with result:\nCommand exited with code 0.\n\nCommand output:\npassed',
+            },
+            {"step_index": 11, "type": "PLANNER_RESPONSE", "content": "Follow-up update: BETA_VERDICT."},
+            {
+                "step_index": 12,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Start migration step A\n2. Actually run step B with narration\n3. Launch async job and summarize twice\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        cfg_all = mod.RehydrateConfig(max_recent_entries=10, explicit_keys=frozenset({"maxRecentEntries"}))
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", config=cfg_all, workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, _ = res
+
+        # Interrupted tools-only turn preserved
+        self.assertIn("[Interrupted Turn Tools]: run_command(`migrate_step_a`)", msg)
+        # Interrupted narration+tool turn attaches tool to the flushed assistant entry
+        self.assertIn("run_command(`migrate_step_b`)", msg)
+        self.assertIn("Starting step B migration now.", msg)
+        # Same-turn multiple final replies BOTH preserved with Follow-up marker and single (Tools run:)
+        self.assertIn("ALPHA_VERDICT", msg)
+        self.assertIn("[Follow-up @ step 11]:", msg)
+        self.assertIn("BETA_VERDICT", msg)
+        step11_block = msg.split("[Step 11 | Assistant]:", 1)[1]
+        self.assertEqual(step11_block.count("(Tools run:"), 1)
+
+        # 2. Mid-turn `/compact` MUST NOT wipe pending_tools or turn_running_task_ids
+        logs_mc = self.tmp_root / "brain" / "cid-mid-compact" / ".system_generated" / "logs"
+        mc_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Inspect worker_bg.py and run bg_worker</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "read_file", "args": {"Path": str(worker_py)}},
+                    {"name": "run_command", "args": {"CommandLine": "bg_worker"}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "WORKER_BG = 1"},
+            {
+                "step_index": 3,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "content": "Created At: 2026-11-18T10:01:00Z\nTool is running as a background task with task id: cid-mid-compact/task-live-77\nTask logs...",
+            },
+            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>/compact</USER_REQUEST>"},
+            {
+                "step_index": 5,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Inspect worker_bg.py and run bg_worker\n<summary>In progress.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs_mc / "transcript_full.jsonl", mc_rows)
+        res_mc = mod.build_rehydration(logs_mc / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_mc)
+        assert res_mc is not None
+        msg_mc, st_mc = res_mc
+        self.assertTrue(st_mc["in_progress_turn"])
+        self.assertEqual(st_mc["session_mode"], "mid_turn")
+        self.assertIn("[Pre-Compaction In-Progress Tools]:", msg_mc)
+        self.assertIn("read_file(worker_bg.py)", msg_mc)
+        self.assertIn("run_command(`bg_worker`) [RUNNING]", msg_mc)
+
+    def test_earlier_timeline_budget_header_cap_stats_and_skipped_eligibility(self) -> None:
+        # 1. Earlier user timeline budget omission/clipping must NOT claim "verbatim" in section header
+        logs_tl = self.tmp_root / "brain" / "cid-tl-budget" / ".system_generated" / "logs"
+        tl_rows: list[dict] = []
+        step = 0
+        for idx in range(1, 13):
+            tl_rows.append(
+                {
+                    "step_index": step,
+                    "type": "USER_INPUT",
+                    "content": f"<USER_REQUEST>Requirement batch #{idx:02d}: " + (f"detail_{idx} " * 24) + "</USER_REQUEST>",
+                }
+            )
+            step += 1
+            tl_rows.append({"step_index": step, "type": "PLANNER_RESPONSE", "content": f"Handled batch {idx}."})
+            step += 1
+        tl_rows.append(
+            {
+                "step_index": step,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n<summary>Many batches.</summary>\n</CONTEXT_SUMMARY>",
+            }
+        )
+        _write_jsonl(logs_tl / "transcript_full.jsonl", tl_rows)
+        cfg_tight_tl = mod.RehydrateConfig(
+            budget_all_user_chars=1400,
+            max_recent_entries=2,
+            explicit_keys=frozenset({"budgetAllUserChars", "maxRecentEntries"}),
+        )
+        res_tl = mod.build_rehydration(logs_tl / "transcript_full.jsonl", config=cfg_tight_tl, workspace_roots=[self.ws])
+        self.assertIsNotNone(res_tl)
+        assert res_tl is not None
+        msg_tl, st_tl = res_tl
+        sec1_hdr = next(ln for ln in msg_tl.splitlines() if ln.startswith("## 1. Earlier User Request Timeline"))
+        self.assertNotIn("verbatim", sec1_hdr)
+        self.assertIn("earlier prompts kept", sec1_hdr)
+        self.assertLess(st_tl["kept_earlier_user_msgs"], st_tl["earlier_user_msgs"])
+        self.assertIn("omitted for budget", msg_tl)
+
+        # Single long earlier prompt clipped directly by budget also must not claim "verbatim"
+        logs_clip = self.tmp_root / "brain" / "cid-tl-single-clip" / ".system_generated" / "logs"
+        single_rows = [
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>Single huge earlier prompt: " + ("alpha beta gamma " * 120) + "</USER_REQUEST>",
+            },
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Ack 0."},
+            {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>Recent follow-up</USER_REQUEST>"},
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Done follow-up."},
+            {
+                "step_index": 4,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n<summary>Single.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs_clip / "transcript_full.jsonl", single_rows)
+        cfg_clip = mod.RehydrateConfig(
+            budget_all_user_chars=240,
+            max_recent_entries=2,
+            explicit_keys=frozenset({"budgetAllUserChars", "maxRecentEntries"}),
+        )
+        res_clip = mod.build_rehydration(logs_clip / "transcript_full.jsonl", config=cfg_clip, workspace_roots=[self.ws])
+        self.assertIsNotNone(res_clip)
+        assert res_clip is not None
+        msg_clip, _ = res_clip
+        sec1_clip_hdr = next(ln for ln in msg_clip.splitlines() if ln.startswith("## 1. Earlier User Request Timeline"))
+        self.assertNotIn("verbatim", sec1_clip_hdr)
+
+        # 2. _enforce_total_cap stats reconciliation: partial clip drops 1 of 3 files AND full pop drops section to 0
+        skill_dir = self.ws / "skills" / "demo-skill"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("# Demo Skill\n" + ("Skill instruction line padding here.\n" * 60), encoding="utf-8")
+        mod_a = self.ws / "mod_a.py"
+        mod_b = self.ws / "mod_b.py"
+        mod_c = self.ws / "mod_c.py"
+        mod_a.write_text("".join(f'var_1_{j:03d} = "alpha_{j:03d}"\n' for j in range(10)), encoding="utf-8")
+        mod_b.write_text("".join(f'var_2_{j:03d} = "beta_padding_line_{j:03d}_abcdef123456"\n' for j in range(90)), encoding="utf-8")
+        mod_c.write_text("".join(f'var_3_{j:03d} = "gamma_{j:03d}"\n' for j in range(10)), encoding="utf-8")
+
+        att_files = [
+            f"attachment_historical_evidence_{k:02d}_extremely_long_filename_proof_xyz.png"
+            for k in range(1, 7)
+        ]
+        att_lines = "\n".join(f"- [Attachment: {fn} (file:///home/user/upload/{fn})]" for fn in att_files)
+        logs_cap = self.tmp_root / "brain" / "cid-cap-stats" / ".system_generated" / "logs"
+        cap_rows = [
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "media": [{"uri": f"file:///home/user/upload/{fn}"} for fn in att_files],
+                "content": "<USER_REQUEST>Earlier kickoff requirement alpha " + ("req " * 40) + "</USER_REQUEST>",
+            },
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Ack earlier kickoff."},
+            {
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>Second milestone requirement beta " + ("req " * 40) + "</USER_REQUEST>",
+            },
+            {
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "content": "Ack second milestone.\n" + ("Detailed older explanation line.\n" * 40),
+            },
+            {
+                "step_index": 4,
+                "type": "USER_INPUT",
+                "content": "<USER_REQUEST>Update mod_a.py, mod_b.py, mod_c.py per SKILL.md</USER_REQUEST>",
+            },
+            {
+                "step_index": 5,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "view_file", "args": {"AbsolutePath": str(skill_md)}},
+                    {"name": "edit_file", "args": {"Path": str(mod_a), "Replacement": "var_1_005"}},
+                    {"name": "edit_file", "args": {"Path": str(mod_c), "Replacement": "var_3_005"}},
+                    {"name": "edit_file", "args": {"Path": str(mod_b), "Replacement": "var_2_005"}},
+                ],
+            },
+            {"step_index": 6, "type": "GENERIC", "status": "DONE", "content": "Viewed SKILL.md"},
+            {"step_index": 7, "type": "GENERIC", "status": "DONE", "content": "Edited mod_a.py"},
+            {"step_index": 8, "type": "GENERIC", "status": "DONE", "content": "Edited mod_c.py"},
+            {"step_index": 9, "type": "GENERIC", "status": "DONE", "content": "Edited mod_b.py"},
+            {
+                "step_index": 10,
+                "type": "PLANNER_RESPONSE",
+                "content": "Completed updates across all three files.\n" + ("Summary sentence. " * 45),
+            },
+            {
+                "step_index": 11,
+                "type": "CHECKPOINT",
+                "content": (
+                    "<CONTEXT_SUMMARY>\n# User Requests\n"
+                    f"1. Update mod_a.py, mod_b.py, mod_c.py per SKILL.md\n{att_lines}\n"
+                    "<summary>Done.</summary>\n</CONTEXT_SUMMARY>"
+                ),
+            },
+        ]
+        _write_jsonl(logs_cap / "transcript_full.jsonl", cap_rows)
+        res_cap = mod.build_rehydration(logs_cap / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_cap)
+        assert res_cap is not None
+        msg_cap, st_cap = res_cap
+        self.assertLessEqual(len(msg_cap), st_cap["ratio_cap"])
+        self.assertEqual(st_cap["files"], len(st_cap["file_paths"]))
+        self.assertEqual(st_cap["skills"], len(st_cap["skill_paths"]))
+        # Cap genuinely clips out at least one of the 3 restored files and reconciles stats to surviving headings
+        self.assertLess(st_cap["files"], 3)
+        for fp_entry in st_cap["file_paths"]:
+            _, raw_p = fp_entry.split(":", 1)
+            self.assertIn(f"`{raw_p}`", msg_cap)
+        for sp_entry in st_cap["skill_paths"]:
+            self.assertIn(f"`{sp_entry}`", msg_cap)
+
+        # Case 2b: _enforce_total_cap pops the entire Files section -> files==0 and file_paths==[]
+        tiny_ref = self.ws / "tiny_ref.py"
+        tiny_ref.write_text("TINY_A = 1\nTINY_B = 2\n", encoding="utf-8")
+        logs_drop = self.tmp_root / "brain" / "cid-cap-drop" / ".system_generated" / "logs"
+        drop_rows = [
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "media": [{"uri": f"file:///home/user/upload/{fn}"} for fn in att_files],
+                "content": "<USER_REQUEST>Read tiny_ref.py and explain thoroughly</USER_REQUEST>",
+            },
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "read_file", "args": {"Path": str(tiny_ref)}}],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "TINY_A = 1"},
+            {
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "content": "Analysis:\n" + ("Reasonable detailed explanation line.\n" * 28),
+            },
+            {
+                "step_index": 4,
+                "type": "CHECKPOINT",
+                "content": (
+                    "<CONTEXT_SUMMARY>\n# User Requests\n"
+                    f"1. Read tiny_ref.py and explain thoroughly\n{att_lines}\n"
+                    "<summary>Done.</summary>\n</CONTEXT_SUMMARY>"
+                ),
+            },
+        ]
+        _write_jsonl(logs_drop / "transcript_full.jsonl", drop_rows)
+        cfg_drop = mod.RehydrateConfig(max_referenced_files=2, explicit_keys=frozenset({"maxReferencedFiles"}))
+        res_drop = mod.build_rehydration(logs_drop / "transcript_full.jsonl", config=cfg_drop, workspace_roots=[self.ws])
+        self.assertIsNotNone(res_drop)
+        assert res_drop is not None
+        msg_drop, st_drop = res_drop
+        self.assertLessEqual(len(msg_drop), st_drop["ratio_cap"])
+        self.assertNotIn(". Restored Active Workspace Files (Live Disk Read)", msg_drop)
+        self.assertEqual(st_drop["files"], 0)
+        self.assertEqual(st_drop["file_paths"], [])
+
+        # 3. skipped_referenced_files must count ONLY eligible workspace files (exclude .env, binary, missing, outside)
+        elig_files = []
+        for idx_e in range(1, 5):
+            ef = self.ws / f"elig_{idx_e}.py"
+            ef.write_text(f"ELIG_{idx_e} = True\n", encoding="utf-8")
+            elig_files.append(ef)
+        env_secret = self.ws / ".env"
+        env_secret.write_text("SECRET=1\n", encoding="utf-8")
+        bin_png = self.ws / "logo.png"
+        bin_png.write_bytes(b"\x89PNG\r\n\x1a\n")
+        missing_py = self.ws / "deleted_missing.py"
+        outside_py = self.tmp_root / "outside_ws.py"
+        outside_py.write_text("OUTSIDE = 1\n", encoding="utf-8")
+
+        # Mode A: completed_qa / active_coding with default max_referenced_files=0 -> 2 eligible reads skipped (not 6)
+        logs_skip_a = self.tmp_root / "brain" / "cid-skip-elig-a" / ".system_generated" / "logs"
+        skip_a_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Read eligible and ineligible files</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {"name": "read_file", "args": {"Path": str(elig_files[0])}},
+                    {"name": "read_file", "args": {"Path": str(elig_files[1])}},
+                    {"name": "read_file", "args": {"Path": str(env_secret)}},
+                    {"name": "read_file", "args": {"Path": str(bin_png)}},
+                    {"name": "read_file", "args": {"Path": str(missing_py)}},
+                    {"name": "read_file", "args": {"Path": str(outside_py)}},
+                ],
+            },
+            *[
+                {"step_index": 2 + i, "type": "GENERIC", "status": "DONE", "content": f"Read result {i}"}
+                for i in range(6)
+            ],
+            {"step_index": 8, "type": "PLANNER_RESPONSE", "content": "Finished reading all targets and analyzed them thoroughly."},
+            {
+                "step_index": 9,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Read eligible and ineligible files\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs_skip_a / "transcript_full.jsonl", skip_a_rows)
+        res_skip_a = mod.build_rehydration(logs_skip_a / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_skip_a)
+        assert res_skip_a is not None
+        _, st_skip_a = res_skip_a
+        self.assertEqual(st_skip_a["skipped_referenced_files"], 2)
+
+        # Mode B: mid_turn (in_progress_turn=True) restores 2 of 4 eligible reads -> skipped=2 (not 5)
+        logs_skip_b = self.tmp_root / "brain" / "cid-skip-elig-b" / ".system_generated" / "logs"
+        skip_b_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Mid-turn read 4 eligible + 3 ineligible</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "Inspecting files mid-turn.",
+                "tool_calls": [
+                    {"name": "read_file", "args": {"Path": str(elig_files[0])}},
+                    {"name": "read_file", "args": {"Path": str(elig_files[1])}},
+                    {"name": "read_file", "args": {"Path": str(elig_files[2])}},
+                    {"name": "read_file", "args": {"Path": str(elig_files[3])}},
+                    {"name": "read_file", "args": {"Path": str(env_secret)}},
+                    {"name": "read_file", "args": {"Path": str(missing_py)}},
+                    {"name": "read_file", "args": {"Path": str(outside_py)}},
+                ],
+            },
+            *[
+                {"step_index": 2 + i, "type": "GENERIC", "status": "DONE", "content": f"Read result {i}"}
+                for i in range(7)
+            ],
+            {
+                "step_index": 9,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Mid-turn read 4 eligible + 3 ineligible\n<summary>Mid-turn.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs_skip_b / "transcript_full.jsonl", skip_b_rows)
+        res_skip_b = mod.build_rehydration(logs_skip_b / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_skip_b)
+        assert res_skip_b is not None
+        _, st_skip_b = res_skip_b
+        self.assertTrue(st_skip_b["in_progress_turn"])
+        self.assertEqual(st_skip_b["files"], 2)
+        self.assertEqual(st_skip_b["skipped_referenced_files"], 2)
+
+    def test_split_into_inject_chunks_fence_safety_and_small_max_bytes(self) -> None:
+        md_with_internal_h3 = (
+            "### [Modified @ step 5] `docs/guide.md`\n"
+            "```\n"
+            "# Guide Header\n\n"
+            "### Internal Heading Inside Code Fence\n"
+            "Some markdown paragraph with 中文內容.\n\n"
+            "### Second Internal Heading\n"
+            "TAIL_MD_MARKER\n"
+            "```"
+        )
+        big_code_lines = [f"def fn_{i:03d}(): return '中文payload_{i:03d}_padding_text'" for i in range(160)]
+        very_long_code_line = "LONG_LINE_START_" + ("漢字A" * 240) + "_LONG_LINE_END"
+        big_code_block = (
+            "### [Modified @ step 6] `src/big.py`\n"
+            "```python\n"
+            + "\n".join(big_code_lines[:40])
+            + "\n\n"
+            + very_long_code_line
+            + "\n\n"
+            + "\n".join(big_code_lines[40:])
+            + "\n```"
+        )
+        small_atomic_code = "### [Modified @ step 7] `src/tiny.py`\n```python\nTINY_TOP = 1\nTINY_BOT = 2\n```"
+        sections = [
+            "[POST-COMPACT REHYDRATION v1 | checkpoint=42]",
+            "Preamble text explaining ground truth.",
+            f"## 1. Restored Active Workspace Files (Live Disk Read)\n{md_with_internal_h3}\n\n{big_code_block}\n\n{small_atomic_code}",
+        ]
+
+        for max_b in (500, 1200, 3000, 4096, 8000):
+            chunks = mod.split_into_inject_chunks(sections, max_bytes=max_b, checkpoint=42)
+            self.assertGreater(len(chunks), 1, f"Expected multiple chunks for max_bytes={max_b}")
+            for idx, ch in enumerate(chunks, 1):
+                utf8_len = len(ch.encode("utf-8"))
+                self.assertLessEqual(
+                    utf8_len,
+                    max_b,
+                    f"Chunk {idx}/{len(chunks)} exceeded max_bytes={max_b} ({utf8_len} bytes)",
+                )
+                fence_cnt = sum(1 for ln in ch.splitlines() if ln.lstrip().startswith("```"))
+                self.assertEqual(
+                    fence_cnt % 2,
+                    0,
+                    f"Unbalanced code fences in chunk {idx}/{len(chunks)} at max_bytes={max_b}:\n{ch}",
+                )
+                if idx > 1:
+                    self.assertTrue(ch.startswith(mod.CONT_MARKER_PREFIX))
+            joined_all = "\n".join(chunks)
+            self.assertIn("Internal Heading Inside Code Fence", joined_all)
+            self.assertIn("TAIL_MD_MARKER", joined_all)
+            self.assertIn("LONG_LINE_START_", joined_all)
+            self.assertIn("_LONG_LINE_END", joined_all)
+            self.assertIn("fn_159", joined_all)
+            # Small code block (<= limit) must remain intact within a single chunk
+            self.assertTrue(any(("TINY_TOP = 1" in c and "TINY_BOT = 2" in c) for c in chunks))
+
     def test_line_endings_and_no_pycache(self) -> None:
         self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])
         hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))

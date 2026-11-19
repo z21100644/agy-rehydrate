@@ -181,9 +181,9 @@ def run_cli(argv: list[str]) -> int:
             last_rehydrated = None
             if state_file.is_file():
                 try:
-                    last_rehydrated = json.loads(state_file.read_text(encoding="utf-8")).get(
-                        "last_rehydrated_checkpoint"
-                    )
+                    st_obj = json.loads(state_file.read_text(encoding="utf-8"))
+                    if isinstance(st_obj, dict):
+                        last_rehydrated = st_obj.get("last_rehydrated_checkpoint")
                 except (OSError, ValueError):
                     pass
             ts_str = dt_cls.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")

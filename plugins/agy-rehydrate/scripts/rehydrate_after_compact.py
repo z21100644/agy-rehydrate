@@ -132,10 +132,12 @@ def _scan_compact_tail_str(compact_path: str, prev_offset: int, prev_cp: int | N
             if b'"CHECKPOINT"' in raw_line:
                 try:
                     obj = json.loads(raw_line.decode("utf-8", "replace"))
-                    sidx = obj.get("step_index", -1)
-                    max_step = max(max_step, sidx)
-                    if obj.get("type") == "CHECKPOINT":
-                        latest_cp = sidx
+                    if isinstance(obj, dict):
+                        sidx = obj.get("step_index", -1)
+                        if isinstance(sidx, int) and not isinstance(sidx, bool):
+                            max_step = max(max_step, sidx)
+                            if obj.get("type") == "CHECKPOINT":
+                                latest_cp = sidx
                 except json.JSONDecodeError:
                     pass
             else:
@@ -183,12 +185,19 @@ def run_hook() -> int:
         if had_state:
             try:
                 with open(state_path_s, "r", encoding="utf-8") as sf:
-                    state = json.loads(sf.read())
+                    loaded_state = json.loads(sf.read())
+                if isinstance(loaded_state, dict):
+                    state = loaded_state
+                else:
+                    had_state = False
             except (OSError, json.JSONDecodeError):
                 had_state = False
 
         prev_cp = state.get("last_rehydrated_checkpoint")
-        prev_offset = int(state.get("checked_offset") or 0)
+        if not (isinstance(prev_cp, int) and not isinstance(prev_cp, bool)):
+            prev_cp = None
+        raw_offset = state.get("checked_offset")
+        prev_offset = raw_offset if isinstance(raw_offset, int) and not isinstance(raw_offset, bool) and raw_offset >= 0 else 0
         cached_ancestors = state.get("fork_ancestors")
         latest_cp, max_step, new_offset = _scan_compact_tail_str(compact_path_s, prev_offset, prev_cp)
 

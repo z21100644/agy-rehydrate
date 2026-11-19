@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 TYPE_CHECKING = False
 if TYPE_CHECKING:
@@ -16,6 +17,7 @@ if TYPE_CHECKING:
 sys.dont_write_bytecode = True
 
 from rehydrate_after_compact import (
+    _extract_step_index_bytes,
     _find_transcript_files_str,
     _save_state_str,
     _scan_compact_tail_str,
@@ -90,6 +92,10 @@ from rehydrate_helpers import (
     strip_nested_rehydration,
 )
 
+FORK_RESOLVE_DEADLINE_SECS = 3.0
+MAX_UNCONFIRMED_FORK_TIP_DELTA_SECS = 86400.0
+MAX_UNCONFIRMED_FORK_NONTIP_DELTA_SECS = 3600.0
+
 
 def parse_iso_epoch(ts_str: Any) -> float | None:
     if not isinstance(ts_str, str) or not ts_str:
@@ -124,13 +130,32 @@ def read_first_step_info(jsonl_path: Path) -> tuple[int, float | None] | None:
                     return None
                 if not raw.strip():
                     continue
-                obj = json.loads(raw.decode("utf-8", "replace"))
+                try:
+                    obj = json.loads(raw.decode("utf-8", "replace"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
                 sidx = obj.get("step_index")
-                if isinstance(sidx, int):
+                if isinstance(sidx, int) and not isinstance(sidx, bool):
                     return sidx, parse_iso_epoch(obj.get("created_at"))
-    except (OSError, json.JSONDecodeError):
+    except OSError:
         return None
     return None
+
+
+def _resolve_unknown_last_step(fb: Any, target_step: int) -> int:
+    """When tail scan could not establish `last_step`, verify whether any non-empty content follows `target_step`."""
+    while True:
+        nxt = fb.readline()
+        if not nxt:
+            return target_step
+        if not nxt.strip():
+            continue
+        nxt_sidx = _extract_step_index_bytes(nxt)
+        if nxt_sidx > target_step:
+            return nxt_sidx
+        return -1
 
 
 def find_step_epoch_in_transcript(jsonl_path: Path, target_step: int) -> tuple[int, float | None] | None:
@@ -138,45 +163,113 @@ def find_step_epoch_in_transcript(jsonl_path: Path, target_step: int) -> tuple[i
         st_size = jsonl_path.stat().st_size
         if st_size <= 0:
             return None
-        tail_window = 65536
-        with open(jsonl_path, "rb") as fb:
-            seek_pos = max(0, st_size - tail_window)
-            fb.seek(seek_pos)
-            chunk = fb.read()
-        raw_lines = chunk.splitlines()
-        if seek_pos > 0 and raw_lines:
-            raw_lines = raw_lines[1:]
 
         last_step: int | None = None
-        for raw in reversed(raw_lines):
-            if not raw.strip():
-                continue
-            try:
-                obj = json.loads(raw.decode("utf-8", "replace"))
-            except json.JSONDecodeError:
-                continue
-            sidx = obj.get("step_index")
-            if not isinstance(sidx, int):
-                continue
-            if last_step is None:
-                last_step = sidx
-                if last_step < target_step:
-                    return None
-            if sidx == target_step:
-                return last_step, parse_iso_epoch(obj.get("created_at"))
-            if sidx < target_step:
-                return None
-
-        step_pat = _re().compile(rb'"step_index"\s*:\s*' + str(target_step).encode("ascii") + rb"\b")
+        tail_seek_pos = st_size
         with open(jsonl_path, "rb") as fb:
-            for raw in fb:
-                if step_pat.search(raw[:160]):
+            for tail_window in (65536, 524288):
+                seek_pos = max(0, st_size - tail_window)
+                tail_seek_pos = seek_pos
+                fb.seek(seek_pos)
+                chunk = fb.read()
+                raw_lines = chunk.splitlines()
+                if seek_pos > 0 and raw_lines:
+                    raw_lines = raw_lines[1:]
+
+                for raw in reversed(raw_lines):
+                    if not raw.strip():
+                        continue
                     try:
                         obj = json.loads(raw.decode("utf-8", "replace"))
                     except json.JSONDecodeError:
                         continue
-                    if obj.get("step_index") == target_step:
-                        return (last_step or target_step), parse_iso_epoch(obj.get("created_at"))
+                    if not isinstance(obj, dict):
+                        continue
+                    sidx = obj.get("step_index")
+                    if not isinstance(sidx, int) or isinstance(sidx, bool):
+                        continue
+                    if last_step is None:
+                        last_step = sidx
+                        if last_step < target_step:
+                            return None
+                    if sidx == target_step:
+                        return last_step, parse_iso_epoch(obj.get("created_at"))
+                    if sidx < target_step:
+                        return None
+
+                if seek_pos == 0:
+                    return None
+                if last_step is not None:
+                    break
+
+            # Binary search monotonic `step_index` over `[0, hi]` to avoid multi-MB full scans
+            lo = 0
+            hi = tail_seek_pos if last_step is not None else st_size
+            while hi - lo > 65536:
+                mid = (lo + hi) // 2
+                fb.seek(mid - 1)
+                fb.readline()
+                probed = False
+                reached_bound = False
+                for _ in range(16):
+                    if fb.tell() > hi:
+                        reached_bound = True
+                        break
+                    raw = fb.readline()
+                    if not raw:
+                        reached_bound = True
+                        break
+                    if not raw.strip():
+                        continue
+                    try:
+                        obj = json.loads(raw.decode("utf-8", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sidx = obj.get("step_index")
+                    if not isinstance(sidx, int) or isinstance(sidx, bool):
+                        continue
+                    probed = True
+                    if sidx == target_step:
+                        eff_last = last_step if last_step is not None else _resolve_unknown_last_step(fb, target_step)
+                        return eff_last, parse_iso_epoch(obj.get("created_at"))
+                    if sidx < target_step:
+                        lo = fb.tell()
+                    else:
+                        hi = mid
+                    break
+                if not probed:
+                    if reached_bound:
+                        hi = mid
+                    else:
+                        break
+
+            step_pat = _re().compile(rb'"step_index"\s*:\s*' + str(target_step).encode("ascii") + rb"\b")
+            fb.seek(lo)
+            while fb.tell() <= hi:
+                raw = fb.readline()
+                if not raw:
+                    break
+                if not raw.strip():
+                    continue
+                head_slice = raw[:256]
+                matched = bool(
+                    step_pat.search(head_slice)
+                    or (len(raw) > 256 and step_pat.search(raw[-256:]))
+                    or (b'"step_index"' not in head_slice and step_pat.search(raw))
+                )
+                if matched:
+                    try:
+                        obj = json.loads(raw.decode("utf-8", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sidx = obj.get("step_index")
+                    if isinstance(sidx, int) and not isinstance(sidx, bool) and sidx == target_step:
+                        eff_last = last_step if last_step is not None else _resolve_unknown_last_step(fb, target_step)
+                        return eff_last, parse_iso_epoch(obj.get("created_at"))
         return None
     except OSError:
         return None
@@ -191,7 +284,7 @@ def load_history_fork_hints(brain_dir: Path) -> tuple[dict[str, set[str]], list[
     try:
         st_size = hist_path.stat().st_size
         with open(hist_path, "rb") as fb:
-            seek_pos = max(0, st_size - 524288)
+            seek_pos = max(0, st_size - 2097152)
             fb.seek(seek_pos)
             lines = fb.read().splitlines()
         if seek_pos > 0 and lines:
@@ -202,6 +295,8 @@ def load_history_fork_hints(brain_dir: Path) -> tuple[dict[str, set[str]], list[
             try:
                 obj = json.loads(raw.decode("utf-8", "replace"))
             except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
                 continue
             cid = obj.get("conversationId")
             ws = obj.get("workspace")
@@ -227,7 +322,9 @@ def validate_cached_ancestors(cached: Any, cur_first_step: int) -> list[dict[str
             not isinstance(p_str, str)
             or not isinstance(cid, str)
             or not isinstance(s_min, int)
+            or isinstance(s_min, bool)
             or not isinstance(s_max, int)
+            or isinstance(s_max, bool)
             or s_min > s_max
             or not os.path.isfile(p_str)
         ):
@@ -260,39 +357,105 @@ def resolve_fork_ancestors(
     if not brain_dir.is_dir():
         return []
 
+    deadline = time.monotonic() + FORK_RESOLVE_DEADLINE_SECS
     cid_workspaces, fork_events = load_history_fork_hints(brain_dir)
+    fork_event_by_cid: dict[str, list[float]] = {}
+    for fcid, fts in fork_events:
+        fork_event_by_cid.setdefault(fcid, []).append(fts)
+
     cur_cid = infer_cid_from_transcript_path(full_path)
     visited: set[str] = {cur_cid}
     ancestors_rev: list[dict[str, Any]] = []
     child_cid, child_first_step, child_first_epoch = cur_cid, cur_first_step, cur_first_epoch
 
+    try:
+        raw_cand_dirs = [d for d in brain_dir.iterdir() if d.is_dir()]
+    except OSError:
+        return []
+
+    # Cache per-candidate file paths and first-step info across all hops to avoid repeated disk scans
+    cand_meta_cache: dict[str, tuple[Path, Path, float, float, tuple[int, float | None]] | None] = {}
+
+    def _get_cand_meta(cand_dir: Path) -> tuple[Path, Path, float, float, tuple[int, float | None]] | None:
+        cid = cand_dir.name
+        if cid in cand_meta_cache:
+            return cand_meta_cache[cid]
+        cand_logs = cand_dir / ".system_generated" / "logs"
+        full_cand = cand_logs / "transcript_full.jsonl"
+        compact_cand = cand_logs / "transcript.jsonl"
+        has_full = full_cand.is_file()
+        has_compact = compact_cand.is_file()
+        if not has_full and not has_compact:
+            cand_meta_cache[cid] = None
+            return None
+        cand_full = full_cand if has_full else compact_cand
+        cand_scan = compact_cand if has_compact else full_cand
+        try:
+            full_mt = cand_full.stat().st_mtime
+            scan_mt = cand_scan.stat().st_mtime if cand_scan != cand_full else full_mt
+        except OSError:
+            cand_meta_cache[cid] = None
+            return None
+        c_first = read_first_step_info(cand_scan)
+        if c_first is None and cand_scan != cand_full:
+            c_first = read_first_step_info(cand_full)
+        if c_first is None or c_first[0] < 0:
+            cand_meta_cache[cid] = None
+            return None
+        meta = (cand_full, cand_scan, full_mt, scan_mt, c_first)
+        cand_meta_cache[cid] = meta
+        return meta
+
     for _ in range(MAX_FORK_DEPTH):
-        if child_first_step <= 0:
+        if child_first_step <= 0 or time.monotonic() >= deadline:
             break
         need_prev = child_first_step - 1
         child_ws = cid_workspaces.get(child_cid, set())
-        best_score: tuple[int, int, int, float] | None = None
+        best_score: tuple[int, int, int, int, float] | None = None
         best_seg: tuple[str, Path, int, float | None] | None = None
 
-        try:
-            cand_dirs = list(brain_dir.iterdir())
-        except OSError:
-            break
+        # Check explicit `/fork` event candidates first, then same-workspace, then remaining dirs
+        def _cand_priority(d: Path) -> tuple[int, int]:
+            cid = d.name
+            has_fe = 0 if cid in fork_event_by_cid else 1
+            cws = cid_workspaces.get(cid, set())
+            is_sw = 0 if (child_ws and cws and (child_ws & cws)) else 1
+            return (has_fe, is_sw)
 
-        for cand_dir in cand_dirs:
+        ordered_dirs = sorted(raw_cand_dirs, key=_cand_priority)
+        saw_non_fe = False
+
+        for cand_dir in ordered_dirs:
             cand_cid = cand_dir.name
-            if cand_cid in visited or not cand_dir.is_dir():
+            if cand_cid in visited:
                 continue
-            cand_logs = cand_dir / ".system_generated" / "logs"
-            cand_full = cand_logs / "transcript_full.jsonl"
-            if not cand_full.is_file():
-                cand_full = cand_logs / "transcript.jsonl"
-                if not cand_full.is_file():
-                    continue
-            cand_first = read_first_step_info(cand_full)
-            if cand_first is None or cand_first[0] < 0 or cand_first[0] > need_prev:
+            in_fe = cand_cid in fork_event_by_cid
+            if not in_fe:
+                if not saw_non_fe:
+                    saw_non_fe = True
+                    # A confirmed `fork_cmd_match == 1` cannot be beaten by any non-fork-event candidate
+                    if best_score is not None and best_score[0] == 1:
+                        break
+                if time.monotonic() >= deadline:
+                    break
+
+            cand_ws = cid_workspaces.get(cand_cid, set())
+            same_ws = int(bool(child_ws and cand_ws and (child_ws & cand_ws)))
+            if not in_fe and child_ws and cand_ws and not same_ws:
                 continue
-            hit = find_step_epoch_in_transcript(cand_full, need_prev)
+
+            meta = _get_cand_meta(cand_dir)
+            if meta is None:
+                continue
+            cand_full, cand_scan, full_mt, scan_mt, cand_first = meta
+            if cand_first[0] > need_prev:
+                continue
+            if child_first_epoch is not None and cand_first[1] is not None and cand_first[1] > child_first_epoch + 5.0:
+                continue
+
+            hit = find_step_epoch_in_transcript(cand_scan, need_prev)
+            if hit is None and cand_scan != cand_full and full_mt > scan_mt + 1.0:
+                hit = find_step_epoch_in_transcript(cand_full, need_prev)
             if hit is None:
                 continue
             cand_last_step, prev_epoch = hit
@@ -305,16 +468,33 @@ def resolve_fork_ancestors(
 
             fork_cmd_match = int(
                 any(
-                    fcid == cand_cid
-                    and (prev_epoch is None or fts >= prev_epoch - 5.0)
+                    (prev_epoch is None or fts >= prev_epoch - 5.0)
                     and (child_first_epoch is None or fts <= child_first_epoch + 5.0)
-                    for fcid, fts in fork_events
+                    for fts in fork_event_by_cid.get(cand_cid, ())
                 )
             )
-            cand_ws = cid_workspaces.get(cand_cid, set())
-            same_ws = int(bool(child_ws and cand_ws and (child_ws & cand_ws)))
             exact_tip = int(cand_last_step == need_prev)
-            score = (fork_cmd_match, same_ws, exact_tip, -time_delta)
+            if not fork_cmd_match:
+                if child_ws and cand_ws and not same_ws:
+                    continue
+                if child_first_epoch is not None and prev_epoch is not None:
+                    max_delta = (
+                        MAX_UNCONFIRMED_FORK_TIP_DELTA_SECS
+                        if exact_tip
+                        else MAX_UNCONFIRMED_FORK_NONTIP_DELTA_SECS
+                    )
+                    if time_delta > max_delta:
+                        continue
+
+            if time_delta <= 120.0:
+                time_tier = 3
+            elif time_delta <= 1800.0:
+                time_tier = 2
+            elif time_delta <= MAX_UNCONFIRMED_FORK_TIP_DELTA_SECS:
+                time_tier = 1
+            else:
+                time_tier = 0
+            score = (fork_cmd_match, same_ws, time_tier, exact_tip, -time_delta)
             if best_score is None or score > best_score:
                 best_score = score
                 best_seg = (cand_cid, cand_full, cand_first[0], cand_first[1])
@@ -346,15 +526,15 @@ def scan_compact_tail(compact_path: Path | str, prev_offset: int, prev_cp: int |
     return _scan_compact_tail_str(str(compact_path), prev_offset, prev_cp)
 
 
-def format_user_timeline(
+def _format_user_timeline_ex(
     user_messages: list[tuple[int, str, Path | None, int]],
     budget_chars: int = DEFAULT_BUDGET_ALL_USER_CHARS,
     truncated_prefixes: list[str] | None = None,
-) -> tuple[str, int, int, int, int]:
-    """Render earlier user request timeline with short-turn denoising and long-paste folding."""
+) -> tuple[str, int, int, int, int, bool]:
+    """Render earlier user request timeline, also reporting whether budget omission/clipping occurred."""
     total_real = sum(1 for _, txt, _, _ in user_messages if not txt.startswith("--- [/fork branch "))
     if total_real == 0:
-        return "", 0, 0, 0, 0
+        return "", 0, 0, 0, 0, False
 
     def render_pass(fold_before_recent: int) -> tuple[list[str], int, int, int]:
         lines: list[str] = []
@@ -387,6 +567,7 @@ def format_user_timeline(
 
     user_lines, kept_count, filtered_short_count, folded_paste_count = render_pass(RECENT_USER_VERBATIM_COUNT)
     all_user_block = "\n".join(user_lines)
+    budget_truncated = False
 
     if len(all_user_block) > budget_chars:
         user_lines, kept_count, filtered_short_count, folded_paste_count = render_pass(0)
@@ -404,16 +585,36 @@ def format_user_timeline(
                 tail_lines.append(ul)
                 used += len(ul) + 1
             tail_lines.reverse()
-            omitted_line = "- [... earlier middle prompts omitted for budget ...]"
-            all_user_block = (
-                f"{head_part}\n{omitted_line}\n" + "\n".join(tail_lines)
-                if tail_lines
-                else f"{head_part}\n{omitted_line}"
-            )
+            if len(tail_lines) < len(user_lines) - head_cnt:
+                kept_lines = [*user_lines[:head_cnt], *tail_lines]
+                kept_count = sum(1 for ln in kept_lines if not ln.startswith("- --- [/fork branch "))
+                omitted_line = "- [... earlier middle prompts omitted for budget ...]"
+                all_user_block = (
+                    f"{head_part}\n{omitted_line}\n" + "\n".join(tail_lines)
+                    if tail_lines
+                    else f"{head_part}\n{omitted_line}"
+                )
+                budget_truncated = True
 
     if len(all_user_block) > budget_chars:
-        all_user_block = _clip_text_middle(all_user_block, max(160, budget_chars))
+        all_user_block = _clip_markdown_to_budget(all_user_block, max(160, budget_chars))
+        kept_count = min(kept_count, sum(1 for ln in all_user_block.splitlines() if ln.startswith("- [#")))
+        budget_truncated = True
 
+    return all_user_block, total_real, kept_count, filtered_short_count, folded_paste_count, budget_truncated
+
+
+def format_user_timeline(
+    user_messages: list[tuple[int, str, Path | None, int]],
+    budget_chars: int = DEFAULT_BUDGET_ALL_USER_CHARS,
+    truncated_prefixes: list[str] | None = None,
+) -> tuple[str, int, int, int, int]:
+    """Render earlier user request timeline with short-turn denoising and long-paste folding."""
+    all_user_block, total_real, kept_count, filtered_short_count, folded_paste_count, _ = _format_user_timeline_ex(
+        user_messages,
+        budget_chars=budget_chars,
+        truncated_prefixes=truncated_prefixes,
+    )
     return all_user_block, total_real, kept_count, filtered_short_count, folded_paste_count
 
 
@@ -451,7 +652,7 @@ def _record_read_touch(
         starts = [x for x in (p_range[0], line_range[0]) if x is not None]
         ends = [x for x in (p_range[1], line_range[1]) if x is not None]
         merged = (
-            min(starts) if starts else None,
+            min(starts) if len(starts) == 2 else None,
             max(ends) if len(ends) == 2 else None,
         )
     store[key] = (path_str, step_idx, merged)
@@ -660,7 +861,8 @@ def build_rehydration(
                         break
                     if s_cand > max_seen_step:
                         max_seen_step = s_cand
-            last_nonempty_line = line
+            if line.lstrip().startswith("{"):
+                last_nonempty_line = line
             has_cp = '"CHECKPOINT"' in line
             has_sys_marker = last_cp is not None and MARKER_PREFIX in line and '"SYSTEM_MESSAGE"' in line
             if not has_cp and not has_sys_marker:
@@ -669,14 +871,16 @@ def build_rehydration(
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(obj, dict):
+                continue
             step_idx = obj.get("step_index", -1)
-            if isinstance(step_idx, int):
+            if isinstance(step_idx, int) and not isinstance(step_idx, bool):
                 if up_to_checkpoint_step is not None and step_idx > up_to_checkpoint_step:
                     break
                 if step_idx > max_seen_step:
                     max_seen_step = step_idx
             stype = obj.get("type")
-            if stype == "CHECKPOINT" and isinstance(step_idx, int):
+            if stype == "CHECKPOINT" and isinstance(step_idx, int) and not isinstance(step_idx, bool):
                 checkpoints.append(step_idx)
                 checkpoint_contents[step_idx] = str(obj.get("content") or "")
                 last_cp = step_idx
@@ -689,9 +893,11 @@ def build_rehydration(
                 max_seen_step = max(max_seen_step, int(m_last.group(1)))
             else:
                 try:
-                    s_last = json.loads(last_nonempty_line).get("step_index", -1)
-                    if isinstance(s_last, int):
-                        max_seen_step = max(max_seen_step, s_last)
+                    last_obj = json.loads(last_nonempty_line)
+                    if isinstance(last_obj, dict):
+                        s_last = last_obj.get("step_index", -1)
+                        if isinstance(s_last, int) and not isinstance(s_last, bool):
+                            max_seen_step = max(max_seen_step, s_last)
                 except json.JSONDecodeError:
                     pass
 
@@ -834,8 +1040,10 @@ def build_rehydration(
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(obj, dict):
+                    continue
                 step_idx = obj.get("step_index", -1)
-                if not isinstance(step_idx, int) or step_idx < seg_min:
+                if not isinstance(step_idx, int) or isinstance(step_idx, bool) or step_idx < seg_min:
                     continue
                 if step_idx > seg_max:
                     break
@@ -845,11 +1053,6 @@ def build_rehydration(
                     if obj.get("tool_calls"):
                         window_raw_chars += len(json.dumps(obj.get("tool_calls"), ensure_ascii=False))
                 if stype == "USER_INPUT":
-                    pending_call_queue.clear()
-                    turn_running_task_ids.clear()
-                    _flush_step_batch(cur_batch_summaries, pending_tools)
-                    _flush_uncompleted_assistants()
-                    pending_tools.clear()
                     raw_media = obj.get("media")
                     if isinstance(raw_media, list):
                         for m_item in raw_media:
@@ -859,6 +1062,30 @@ def build_rehydration(
                                     media_step_by_name[_fast_basename(m_uri).lower()] = step_idx
                     utext = extract_user_text(str(obj.get("content") or ""))
                     if utext and not is_compact_slash_cmd(utext):
+                        pending_call_queue.clear()
+                        turn_running_task_ids.clear()
+                        _flush_step_batch(cur_batch_summaries, pending_tools)
+                        _flush_uncompleted_assistants()
+                        if pending_tools:
+                            if (
+                                dialogue_entries
+                                and dialogue_entries[-1][1] == "assistant"
+                                and dialogue_entries[-1][0] > last_user_step
+                            ):
+                                p_step, p_role, p_batches, p_body = dialogue_entries[-1]
+                                dialogue_entries[-1] = (p_step, p_role, list(p_batches) + list(pending_tools), p_body)
+                            else:
+                                interrupted_labels = _format_batch_labels(pending_tools)
+                                if interrupted_labels:
+                                    dialogue_entries.append(
+                                        (
+                                            max(0, step_idx - 1),
+                                            "in_progress",
+                                            [],
+                                            f"[Interrupted Turn Tools]: {_summarize_tool_chain(interrupted_labels, max_items=6)}",
+                                        )
+                                    )
+                            pending_tools.clear()
                         last_user_step = step_idx
                         user_turn_steps.append(step_idx)
                         in_progress_turn = True
@@ -888,8 +1115,10 @@ def build_rehydration(
                             and dialogue_entries[-1][1] == "assistant"
                             and dialogue_entries[-1][0] > last_user_step
                         ):
-                            merged_batches = list(dialogue_entries[-1][2]) + merged_batches
-                            dialogue_entries.pop()
+                            _, _, prev_batches, prev_body = dialogue_entries.pop()
+                            merged_batches = list(prev_batches) + merged_batches
+                            if prev_body and prev_body not in mcontent:
+                                mcontent = f"{prev_body}\n\n[Follow-up @ step {step_idx}]:\n{mcontent}"
                         dialogue_entries.append((step_idx, "assistant", merged_batches, mcontent))
                 elif stype == "SYSTEM_MESSAGE" and running_by_task_id:
                     _resolve_running_task_from_system_msg(
@@ -1165,16 +1394,13 @@ def build_rehydration(
                 ref_candidates.append((key, p, st, lr, []))
                 if len(ref_candidates) >= cfg.max_referenced_files:
                     break
-        total_eligible_reads = sum(1 for _, p, _, _ in raw_read_items if _cached_eligible(p, 0))
     elif in_progress_turn and last_user_step >= 0:
         for key, p, st, lr in raw_read_items:
             if st >= last_user_step and _cached_eligible(p, 0):
                 ref_candidates.append((key, p, st, lr, []))
                 if len(ref_candidates) >= DEFAULT_MAX_IN_PROGRESS_READ_FILES:
                     break
-        total_eligible_reads = len(raw_read_items)
-    else:
-        total_eligible_reads = len(raw_read_items)
+    total_eligible_reads = sum(1 for _, p, _, _ in raw_read_items if _cached_eligible(p, 0))
     skipped_referenced_count = max(0, total_eligible_reads - len(ref_candidates))
 
     if content_pool is None:
@@ -1199,6 +1425,7 @@ def build_rehydration(
         )
 
     total_real_users = sum(1 for _, txt, _, _ in user_messages if not txt.startswith("--- [/fork branch "))
+    earlier_budget_truncated = False
     if eff_user_budget >= 200:
         (
             earlier_user_block,
@@ -1206,7 +1433,8 @@ def build_rehydration(
             kept_earlier_count,
             filtered_short_count,
             folded_paste_count,
-        ) = format_user_timeline(
+            earlier_budget_truncated,
+        ) = _format_user_timeline_ex(
             earlier_user_messages,
             budget_chars=eff_user_budget,
             truncated_prefixes=truncated_summary_prefixes,
@@ -1231,7 +1459,7 @@ def build_rehydration(
             )
 
     skill_blocks: list[str] = []
-    restored_skill_paths: list[str] = []
+    skill_block_entries: list[tuple[str, str]] = []
     used_skills = 0
     if eff_skills_budget >= 800:
         for spath, sstep, _ in eligible_skills:
@@ -1241,9 +1469,10 @@ def build_rehydration(
             header_overhead = len(spath) + 48
             content = read_text_clipped(spath, min(eff_single_file_budget, max(200, rem - header_overhead)))
             if content:
-                block = f"### `{spath}` (touched @ step {sstep})\n```\n{content}\n```"
+                block_hdr = f"### `{spath}` (touched @ step {sstep})"
+                block = f"{block_hdr}\n```\n{content}\n```"
                 skill_blocks.append(block)
-                restored_skill_paths.append(spath)
+                skill_block_entries.append((block_hdr, spath))
                 used_skills += len(block) + 2
 
     if rem_pool is not None and "budgetSkillsSpecsChars" not in cfg.explicit_keys and skill_blocks:
@@ -1256,7 +1485,7 @@ def build_rehydration(
             eff_files_budget = min(cfg.budget_files_total_chars, rem_pool)
 
     file_blocks: list[str] = []
-    restored_file_paths: list[str] = []
+    file_block_entries: list[tuple[str, str]] = []
     used_files = 0
     if eff_files_budget >= 800:
         for role_label, items in (("Modified", mod_candidates), ("Referenced", ref_candidates)):
@@ -1274,9 +1503,10 @@ def build_rehydration(
                 else:
                     content, range_note = read_text_clipped(fpath, max_slice), ""
                 if content:
-                    block = f"### [{role_label} @ step {fstep}{range_note}] `{fpath}`\n```\n{content}\n```"
+                    block_hdr = f"### [{role_label} @ step {fstep}{range_note}] `{fpath}`"
+                    block = f"{block_hdr}\n```\n{content}\n```"
                     file_blocks.append(block)
-                    restored_file_paths.append(f"{role_label}:{fpath}")
+                    file_block_entries.append((block_hdr, f"{role_label}:{fpath}"))
                     used_files += len(block) + 2
 
     cp_attachment_refs = extract_checkpoint_attachment_refs(target_cp_content, media_step_by_name)
@@ -1309,7 +1539,12 @@ def build_rehydration(
     numbered_sections: list[tuple[str, str]] = []
     if earlier_real_count > 0 and earlier_user_block:
         delta_note = ", delta beyond <CONTEXT_SUMMARY>" if deduped_summary_prompts > 0 else ""
-        if filtered_short_count > 0 or folded_paste_count > 0:
+        if (
+            filtered_short_count > 0
+            or folded_paste_count > 0
+            or earlier_budget_truncated
+            or kept_earlier_count < earlier_real_count
+        ):
             sec1_title = (
                 f"Earlier User Request Timeline (steps < {verbatim_start_step}; "
                 f"{kept_earlier_count}/{earlier_real_count} earlier prompts kept{delta_note})"
@@ -1402,6 +1637,20 @@ def build_rehydration(
     if cfg.adaptive and ratio_cap is not None and not (cfg.explicit_keys & explicit_budget_keys):
         sections = _enforce_total_cap(sections, ratio_cap)
 
+    # Reconcile skill/file stats with surviving sections after `_enforce_total_cap`
+    surviving_skill_sec = next(
+        (s for s in sections[2:] if s.partition("\n")[0].endswith(". Restored Active Skills & Spec Docs")),
+        None,
+    )
+    surviving_file_sec = next(
+        (s for s in sections[2:] if s.partition("\n")[0].endswith(". Restored Active Workspace Files (Live Disk Read)")),
+        None,
+    )
+    surviving_skill_lines = set(surviving_skill_sec.splitlines()) if surviving_skill_sec is not None else set()
+    surviving_file_lines = set(surviving_file_sec.splitlines()) if surviving_file_sec is not None else set()
+    restored_skill_paths = [sp for hdr, sp in skill_block_entries if hdr in surviving_skill_lines]
+    restored_file_paths = [fp for hdr, fp in file_block_entries if hdr in surviving_file_lines]
+
     full_msg = "\n\n".join(sections)
     chunks = split_into_inject_chunks(sections, max_bytes=MAX_INJECT_STEP_BYTES, checkpoint=target_cp)
     return full_msg, {
@@ -1423,9 +1672,9 @@ def build_rehydration(
         "folded_assistant_turns": folded_assistant_count,
         "folded_user_turns": folded_user_count,
         "verbatim_start_step": verbatim_start_step,
-        "skills": len(skill_blocks),
+        "skills": len(restored_skill_paths),
         "skill_paths": restored_skill_paths,
-        "files": len(file_blocks),
+        "files": len(restored_file_paths),
         "file_paths": restored_file_paths,
         "skipped_referenced_files": skipped_referenced_count,
         "sections": max(0, len(sections) - 2),
@@ -1473,38 +1722,170 @@ def _enforce_total_cap(sections: list[str], cap: int) -> list[str]:
     return out
 
 
+_SECTION_SUBITEM_PREFIXES = (
+    "### ",
+    "[Step ",
+    "[Pre-Compaction ",
+    "[Interrupted Turn ",
+    "--- [/fork ",
+)
+
+
+def _split_section_fence_aware(sec: str) -> list[str]:
+    """Split a section on blank-line sub-item boundaries only when outside fenced code blocks."""
+    lines = sec.split("\n")
+    items: list[str] = []
+    cur: list[str] = []
+    in_fence = False
+    i = 0
+    n = len(lines)
+    while i < n:
+        ln = lines[i]
+        if (
+            not in_fence
+            and ln == ""
+            and cur
+            and i + 1 < n
+            and lines[i + 1].startswith(_SECTION_SUBITEM_PREFIXES)
+        ):
+            items.append("\n".join(cur))
+            cur = []
+            i += 1
+            continue
+        cur.append(ln)
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+        i += 1
+    if cur:
+        items.append("\n".join(cur))
+    return items
+
+
+def _split_paragraphs_fence_aware(item: str) -> list[str]:
+    """Split on blank lines only outside fenced code blocks so code blocks stay atomic unless oversized."""
+    lines = item.split("\n")
+    paras: list[str] = []
+    cur: list[str] = []
+    in_fence = False
+    for ln in lines:
+        if not in_fence and ln == "":
+            if cur:
+                paras.append("\n".join(cur))
+                cur = []
+            continue
+        cur.append(ln)
+        if ln.lstrip().startswith("```"):
+            in_fence = not in_fence
+    if cur:
+        paras.append("\n".join(cur))
+    return paras
+
+
+def _fence_opener_label(line: str, max_bytes: int) -> str:
+    stripped = line.lstrip()
+    cap = max(3, min(40, max_bytes // 4))
+    if len(stripped.encode("utf-8")) <= cap:
+        return stripped
+    return "```"
+
+
 def _split_oversized_block(text: str, max_bytes: int) -> list[str]:
+    """Split an oversized text/code block into `<= max_bytes` UTF-8 pieces with balanced triple-backtick fences."""
     if len(text.encode("utf-8")) <= max_bytes:
         return [text]
     pieces: list[str] = []
     cur_lines: list[str] = []
     cur_bytes = 0
-    for line in text.split("\n"):
-        lb = len(line.encode("utf-8")) + 1
-        if lb > max_bytes:
-            if cur_lines:
-                pieces.append("\n".join(cur_lines))
-                cur_lines, cur_bytes = [], 0
-            buf: list[str] = []
-            bb = 0
-            for ch in line:
-                cb = len(ch.encode("utf-8"))
-                if bb + cb > max_bytes - 64 and buf:
-                    pieces.append("".join(buf))
-                    buf, bb = [], 0
-                buf.append(ch)
-                bb += cb
-            if buf:
-                pieces.append("".join(buf))
-            continue
-        if cur_lines and cur_bytes + lb > max_bytes:
-            pieces.append("\n".join(cur_lines))
-            cur_lines, cur_bytes = [line], lb
-        else:
-            cur_lines.append(line)
-            cur_bytes += lb
-    if cur_lines:
+    open_fence: str | None = None
+
+    def _flush_piece(reopen_next: bool) -> None:
+        nonlocal cur_lines, cur_bytes
+        if not cur_lines:
+            return
+        if open_fence is not None and len(cur_lines) == 1 and cur_lines[0] == open_fence:
+            if not reopen_next:
+                cur_lines = []
+                cur_bytes = 0
+            return
+        if open_fence is not None:
+            if reopen_next and len(cur_lines) >= 2 and cur_lines[-1] == open_fence:
+                cur_lines.pop()
+            else:
+                cur_lines.append("```")
         pieces.append("\n".join(cur_lines))
+        if reopen_next and open_fence is not None:
+            cur_lines = [open_fence]
+            cur_bytes = len(open_fence.encode("utf-8"))
+        else:
+            cur_lines = []
+            cur_bytes = 0
+
+    for line in text.split("\n"):
+        is_fence = line.lstrip().startswith("```")
+        lb = len(line.encode("utf-8"))
+
+        if open_fence is not None and is_fence:
+            add_b = (1 + lb) if cur_lines else lb
+            if cur_lines and cur_bytes + add_b <= max_bytes:
+                cur_lines.append(line)
+                cur_bytes += add_b
+            else:
+                cur_lines.append("```")
+                cur_bytes += 4 if len(cur_lines) > 1 else 3
+            open_fence = None
+            continue
+
+        next_fence = _fence_opener_label(line, max_bytes) if (open_fence is None and is_fence) else open_fence
+        need_close = 4 if next_fence is not None else 0
+        add_b = (1 + lb) if cur_lines else lb
+
+        if open_fence is None and is_fence and cur_lines and (cur_bytes + add_b + need_close + 24 > max_bytes):
+            _flush_piece(reopen_next=False)
+            add_b = lb
+
+        if cur_bytes + add_b + need_close <= max_bytes:
+            cur_lines.append(line)
+            cur_bytes += add_b
+            open_fence = next_fence
+            continue
+
+        if cur_lines and not (open_fence is not None and len(cur_lines) == 1 and cur_lines[0] == open_fence):
+            _flush_piece(reopen_next=(open_fence is not None))
+
+        add_b = (1 + lb) if cur_lines else lb
+        if cur_bytes + add_b + need_close <= max_bytes:
+            cur_lines.append(line)
+            cur_bytes += add_b
+            open_fence = next_fence
+            continue
+
+        if open_fence is None and is_fence:
+            norm_fence = _fence_opener_label(line, max_bytes)
+            cur_lines = [norm_fence]
+            cur_bytes = len(norm_fence.encode("utf-8"))
+            open_fence = norm_fence
+            continue
+
+        buf: list[str] = []
+        bb = 0
+        overhead = cur_bytes + (1 if cur_lines else 0) + (4 if open_fence is not None else 0)
+        part_limit = max(4, max_bytes - overhead)
+        for ch in line:
+            cb = len(ch.encode("utf-8"))
+            if bb + cb > part_limit and buf:
+                cur_lines.append("".join(buf))
+                cur_bytes += (1 if len(cur_lines) > 1 else 0) + bb
+                _flush_piece(reopen_next=(open_fence is not None))
+                buf, bb = [], 0
+                overhead = cur_bytes + (1 if cur_lines else 0) + (4 if open_fence is not None else 0)
+                part_limit = max(4, max_bytes - overhead)
+            buf.append(ch)
+            bb += cb
+        if buf:
+            cur_lines.append("".join(buf))
+            cur_bytes += (1 if len(cur_lines) > 1 else 0) + bb
+
+    _flush_piece(reopen_next=False)
     return pieces
 
 
@@ -1513,21 +1894,20 @@ def split_into_inject_chunks(
     max_bytes: int = MAX_INJECT_STEP_BYTES,
     checkpoint: int | None = None,
 ) -> list[str]:
-    """Pack sections into <=max_bytes UTF-8 chunks so no single SystemMessageStep hits AGY's 48 KiB cap."""
-    header_reserve = 96
-    limit = max(4096, max_bytes - header_reserve)
+    """Pack sections into <=max_bytes UTF-8 chunks with balanced code fences across chunk boundaries."""
+    cp_note = f" | checkpoint={checkpoint}" if checkpoint is not None else ""
+    header_reserve = len(f"{CONT_MARKER_PREFIX} 9999/9999{cp_note}]\n\n".encode("utf-8"))
+    limit = max(32, max_bytes - header_reserve)
     atomic_blocks: list[str] = []
-    re_mod = _re()
     for sec in sections:
         if len(sec.encode("utf-8")) <= limit:
             atomic_blocks.append(sec)
         else:
-            sub_items = re_mod.split(r"\n\n(?=### |\[Step |\[Pre-Compaction |--- \[/fork )", sec)
-            for item in sub_items:
+            for item in _split_section_fence_aware(sec):
                 if len(item.encode("utf-8")) <= limit:
                     atomic_blocks.append(item)
                 else:
-                    for para in item.split("\n\n"):
+                    for para in _split_paragraphs_fence_aware(item):
                         atomic_blocks.extend(_split_oversized_block(para, limit))
 
     raw_chunks: list[str] = []
@@ -1549,7 +1929,6 @@ def split_into_inject_chunks(
     if len(raw_chunks) <= 1:
         return raw_chunks
 
-    cp_note = f" | checkpoint={checkpoint}" if checkpoint is not None else ""
     total = len(raw_chunks)
     tagged: list[str] = []
     for idx, ch in enumerate(raw_chunks, 1):
