@@ -1677,13 +1677,43 @@ class RehydrateRegressionTests(unittest.TestCase):
         self.assertLessEqual(len(msg_cap), st_cap["ratio_cap"])
         self.assertEqual(st_cap["files"], len(st_cap["file_paths"]))
         self.assertEqual(st_cap["skills"], len(st_cap["skill_paths"]))
-        # Cap genuinely clips out at least one of the 3 restored files and reconciles stats to surviving headings
-        self.assertLess(st_cap["files"], 3)
+        # Dynamic frame_reserve budgets the long attachment preamble upfront so all 3 files stay inside cap cleanly
+        self.assertEqual(st_cap["files"], 3)
         for fp_entry in st_cap["file_paths"]:
             _, raw_p = fp_entry.split(":", 1)
             self.assertIn(f"`{raw_p}`", msg_cap)
         for sp_entry in st_cap["skill_paths"]:
             self.assertIn(f"`{sp_entry}`", msg_cap)
+
+        # Case 2a-overflow: when stale-path notice + 3 files genuinely push past ratio_cap,
+        # _enforce_total_cap drops trailing whole file blocks cleanly and reconciles stats to surviving headings
+        stale_dir_ref = self.ws / "vanished_legacy_module" / "old_file.py"
+        cap_rows_ov = list(cap_rows[:-1]) + [
+            {
+                "step_index": 11,
+                "type": "CHECKPOINT",
+                "content": (
+                    "<CONTEXT_SUMMARY>\n# User Requests\n"
+                    f"1. Update mod_a.py, mod_b.py, mod_c.py per SKILL.md\n{att_lines}\n"
+                    f"<summary>Done. Primary ref: `{stale_dir_ref}`.</summary>\n</CONTEXT_SUMMARY>"
+                ),
+            }
+        ]
+        # Make mod_a and mod_c slightly larger so workspace_notice + 3 files exceed ratio_cap
+        mod_a.write_text("".join(f'var_1_{j:03d} = "alpha_detail_{j:03d}_padding"\n' for j in range(18)), encoding="utf-8")
+        mod_c.write_text("".join(f'var_3_{j:03d} = "gamma_detail_{j:03d}_padding"\n' for j in range(18)), encoding="utf-8")
+        logs_cap_ov = self.tmp_root / "brain" / "cid-cap-stats-ov" / ".system_generated" / "logs"
+        _write_jsonl(logs_cap_ov / "transcript_full.jsonl", cap_rows_ov)
+        res_ov = mod.build_rehydration(logs_cap_ov / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_ov)
+        assert res_ov is not None
+        msg_ov, st_ov = res_ov
+        self.assertLessEqual(len(msg_ov), st_ov["ratio_cap"])
+        self.assertEqual(st_ov["files"], len(st_ov["file_paths"]))
+        self.assertLess(st_ov["files"], 3)
+        for fp_entry in st_ov["file_paths"]:
+            _, raw_p = fp_entry.split(":", 1)
+            self.assertIn(f"`{raw_p}`", msg_ov)
 
         # Case 2b: _enforce_total_cap pops the entire Files section -> files==0 and file_paths==[]
         tiny_ref = self.ws / "tiny_ref.py"
@@ -1871,6 +1901,866 @@ class RehydrateRegressionTests(unittest.TestCase):
             self.assertIn("fn_159", joined_all)
             # Small code block (<= limit) must remain intact within a single chunk
             self.assertTrue(any(("TINY_TOP = 1" in c and "TINY_BOT = 2" in c) for c in chunks))
+
+    def test_eligible_first_mode_and_budget_driven_assistant_folding(self) -> None:
+        # 1. Editing only an out-of-workspace scratch script or deleted file must NOT trigger false active_coding
+        brain_cid = self.tmp_root / "brain" / "cid-scratch-qa"
+        logs = brain_cid / ".system_generated" / "logs"
+        scratch_script = brain_cid / "scratch" / "repro_check.mjs"
+        scratch_script.parent.mkdir(parents=True, exist_ok=True)
+        scratch_script.write_text("console.log('ntfs repro');\n", encoding="utf-8")
+
+        penultimate_reply = (
+            "已實測復現 3 項相容性問題：\n"
+            "1. sqlite_cache.mjs: wal size=12392, mtimeNs=1795011363933579200, "
+            "ctimeNs=1795011363976603700 -> 1795011364017939600 (reads=1..4)。\n"
+            + ("DOM 320x36 與 sqlite-cache.test.mjs#L22-L24 詳細對照證據。\n" * 40)
+            + "4. errors.mjs 屬功能強化，非 Bug 復現。"
+        )
+        self.assertGreater(len(penultimate_reply), 2100)
+        final_reply = "純文字簡體中文版本：\n" + ("問題描述段落。\n" * 60)
+
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>早期初始化設定</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "ok " + ("x" * 160000)},
+            {"step_index": 10, "type": "USER_INPUT", "content": "<USER_REQUEST>確認問題是否能復現</USER_REQUEST>"},
+            {
+                "step_index": 11,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "edit_file", "args": {"Path": str(scratch_script), "Replacement": "console.log('ntfs repro');"}}],
+            },
+            {"step_index": 12, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 13, "type": "PLANNER_RESPONSE", "content": penultimate_reply},
+            {"step_index": 14, "type": "USER_INPUT", "content": "<USER_REQUEST>再給我一次純文字版</USER_REQUEST>"},
+            {"step_index": 15, "type": "PLANNER_RESPONSE", "content": final_reply},
+            {
+                "step_index": 16,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 確認問題是否能復現\n2. 再給我一次純文字版\n<summary>QA done.</summary>\n</CONTEXT_SUMMARY>",
+            },
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws], artifact_dir=brain_cid)
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        self.assertEqual(st["session_mode"], "completed_qa")
+        self.assertEqual(st["files"], 0)
+        # Generous eff_recent_budget keeps penultimate empirical reply 100% verbatim instead of blindly folding
+        self.assertEqual(st["folded_assistant_turns"], 0)
+        self.assertIn("1795011363976603700 -> 1795011364017939600", msg)
+        self.assertIn("DOM 320x36", msg)
+
+        # 2. When remaining budget is tight, dynamic folding preserves proportionally more than static 420+220
+        tight_cfg = mod.RehydrateConfig(
+            budget_recent_turns_chars=2400,
+            explicit_keys=frozenset({"budgetRecentTurnsChars"}),
+        )
+        res_tight = mod.build_rehydration(
+            logs / "transcript_full.jsonl", config=tight_cfg, workspace_roots=[self.ws], artifact_dir=brain_cid
+        )
+        self.assertIsNotNone(res_tight)
+        assert res_tight is not None
+        msg_tight, st_tight = res_tight
+        self.assertEqual(st_tight["folded_assistant_turns"], 1)
+        self.assertIn("...[assistant details summarized in <CONTEXT_SUMMARY>;", msg_tight)
+        step13_blk = msg_tight.split("[Step 13 | Assistant]:", 1)[1].split("[Step 14 | User]:", 1)[0]
+        self.assertGreater(len(step13_blk), 1100)
+
+    def test_workspace_reality_stale_paths_external_edits_and_manifest(self) -> None:
+        live_keep = self.ws / "agy-rehydrate-main"
+        live_keep.mkdir(parents=True, exist_ok=True)
+        existing_mod = live_keep / "engine.py"
+        existing_mod.write_text("ENGINE_VER = 2\n", encoding="utf-8")
+        # Set mtime clearly in the future relative to the transcript step created_at
+        future_ts = time.time() + 300.0
+        os.utime(existing_mod, (future_ts, future_ts))
+
+        vanished_a = self.ws / "agy-capsule-merged" / "sidecars" / "server.mjs"
+        vanished_b = self.ws / "agy-capsule-merged" / "sidecars" / "sqlite_cache.mjs"
+        vanished_ref = self.ws / "agy-capsule-1.1.0" / "sidecars" / "server.mjs"
+        outside_missing = self.tmp_root / "outside_deleted_secret.txt"
+        secret_env = self.ws / ".env"
+        denied_missing = self.ws / "denied_never_written.py"
+
+        logs = self.tmp_root / "brain" / "cid-stale-ws" / ".system_generated" / "logs"
+        rows: list[dict] = [
+            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T10:00:00Z", "content": "<USER_REQUEST>編輯舊目錄與 engine.py</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-18T10:00:02Z",
+                "content": "",
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": str(vanished_a), "Replacement": "a"}},
+                    {"name": "edit_file", "args": {"Path": str(vanished_b), "Replacement": "b"}},
+                    {"name": "edit_file", "args": {"Path": str(existing_mod), "Replacement": "ENGINE_VER = 2"}},
+                    {"name": "read_file", "args": {"Path": str(outside_missing)}},
+                    {"name": "read_file", "args": {"Path": str(secret_env)}},
+                    {"name": "edit_file", "args": {"Path": str(denied_missing), "Replacement": "x"}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
+            {"step_index": 4, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
+            {"step_index": 5, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
+            {"step_index": 6, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
+            {"step_index": 7, "type": "GENERIC", "status": "ERROR", "created_at": "2026-11-18T10:00:03Z", "content": "Permission denied"},
+            {"step_index": 8, "type": "PLANNER_RESPONSE", "content": "編輯完成。"},
+        ]
+        # Advance > 60 steps and > 4 user turns of pure Q&A so existing_mod falls outside active coding window
+        step = 20
+        for q_no in range(1, 7):
+            rows.append({"step_index": step, "type": "USER_INPUT", "content": f"<USER_REQUEST>討論第 {q_no} 題文案</USER_REQUEST>"})
+            rows.append({"step_index": step + 1, "type": "PLANNER_RESPONSE", "content": f"已完成第 {q_no} 題回覆。" * 12})
+            step += 15
+        rows.append(
+            {
+                "step_index": step,
+                "type": "CHECKPOINT",
+                "content": (
+                    "<CONTEXT_SUMMARY>\n# User Requests\n1. 討論第 6 題文案\n"
+                    f"<summary>Primary: `{self.ws / 'agy-capsule-merged'}`; ref: `{vanished_ref}#L18-L25`.</summary>\n"
+                    "</CONTEXT_SUMMARY>"
+                ),
+            }
+        )
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        self.assertEqual(st["session_mode"], "completed_qa")
+        self.assertEqual(st["files"], 0)
+        self.assertGreaterEqual(st["stale_paths"], 2)
+        self.assertGreaterEqual(st["externally_modified_files"], 1)
+        self.assertEqual(st["uninjected_modified_files"], 1)
+        self.assertIn("Workspace Reality & File Status Notice", msg)
+        # Collapsed missing root dirs + live workspace directory listing
+        self.assertIn("agy-capsule-merged", msg)
+        self.assertIn("agy-capsule-1.1.0", msg)
+        self.assertIn("`agy-rehydrate-main/`", msg)
+        # Externally modified & uninjected modified manifest advisory
+        self.assertIn("engine.py", msg)
+        self.assertIn("Modified on disk since last read/edit", msg)
+        self.assertIn("Modified files not injected in this payload", msg)
+        # Security gates strictly upheld: outside, .env, and ERROR-status paths NEVER leaked
+        self.assertNotIn("outside_deleted_secret.txt", msg)
+        self.assertNotIn(".env", msg)
+        self.assertNotIn("denied_never_written.py", msg)
+
+    def test_multi_checkpoint_anti_decay_milestones_and_pre_window_paste_folding(self) -> None:
+        core_src = self.ws / "core_worker.mjs"
+        core_src.write_text("export const WORKER_READY = true;\n", encoding="utf-8")
+
+        cp1 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. UI 融合\n<summary>\n"
+            "### 2. Done\n"
+            "- **Built frosted/native skin switcher (`ui_skins.mjs`, `ui.mjs`)**: Added dual CSS tokens.\n"
+            "- **Added `requestPosition` top/bottom option (`settings.mjs`)**: Synced Popover and Sidebar.\n"
+            "### 7. Commitments & Constraints\n"
+            "- Never touch upstream read-only reference directories.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp2 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. 修正快取\n<summary>\n"
+            "### 2. Done\n"
+            "- **Upgraded `settings.mjs` bigint `ino:mtimeNs:size` cache key (`settings.mjs`)**: Prevented same-ms stale cache.\n"
+            "- **Fixed multi-window ~5s restart loop (`startDeckCoordinator`)**: Added lease coordination.\n"
+            "### 7. Commitments & Constraints\n"
+            "- Never touch upstream read-only reference directories.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp3 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. 最後驗證\n<summary>\n"
+            "### 2. Done\n"
+            "- **Isolated CDP coordinator in `core_worker.mjs`**: Verified 62/62 tests.\n"
+            "### 7. Commitments & Constraints\n"
+            "- Never touch upstream read-only reference directories.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+
+        old_raw_dump = "raw_terminal_output_line_with_no_markdown_headings " * 55
+        current_win_prompt = "本次壓縮視窗內的新需求細節：" + ("保留完整規格說明文字。" * 55)
+        self.assertGreater(len(old_raw_dump), 2200)
+        self.assertGreater(len(current_win_prompt), 600)
+
+        logs = self.tmp_root / "brain" / "cid-multicp" / ".system_generated" / "logs"
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{old_raw_dump}</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到舊 log。"},
+            {"step_index": 10, "type": "CHECKPOINT", "content": cp1},
+            {"step_index": 20, "type": "USER_INPUT", "content": "<USER_REQUEST>修正 settings.mjs 快取</USER_REQUEST>"},
+            {"step_index": 21, "type": "PLANNER_RESPONSE", "content": "已修正。"},
+            {"step_index": 30, "type": "CHECKPOINT", "content": cp2},
+            # Edit core_worker.mjs inside current compaction window (> prev_cp_step=30), 75 steps before cp3 (step 110)
+            {"step_index": 34, "type": "USER_INPUT", "content": f"<USER_REQUEST>{current_win_prompt}</USER_REQUEST>"},
+            {
+                "step_index": 35,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "edit_file", "args": {"Path": str(core_src), "Replacement": "export const WORKER_READY = true;"}}],
+            },
+            {"step_index": 36, "type": "GENERIC", "status": "DONE", "content": "ok " + ("z" * 60000)},
+            {"step_index": 37, "type": "PLANNER_RESPONSE", "content": "已更新 core_worker.mjs。"},
+            # Two more diagnostic turns burning steps up to 110 (within 4 user turns of step 34!)
+            {"step_index": 70, "type": "USER_INPUT", "content": "<USER_REQUEST>跑第一次驗證</USER_REQUEST>"},
+            {"step_index": 75, "type": "PLANNER_RESPONSE", "content": "第一次驗證通過。"},
+            {"step_index": 105, "type": "USER_INPUT", "content": "<USER_REQUEST>跑最後驗證</USER_REQUEST>"},
+            {"step_index": 108, "type": "PLANNER_RESPONSE", "content": "最後驗證 62/62 通過。"},
+            {"step_index": 110, "type": "CHECKPOINT", "content": cp3},
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        # 1. Same-window turn-aware recency keeps core_worker.mjs active even at 75 steps (> 60)
+        self.assertEqual(st["session_mode"], "active_coding")
+        self.assertTrue(any(p.endswith("core_worker.mjs") for p in st["file_paths"]))
+        self.assertIn("WORKER_READY = true", msg)
+        # 2. Anti-decay milestone index recovers vanished cp1 & cp2 milestones with exact line pointers
+        self.assertGreaterEqual(st["decayed_milestones"], 3)
+        self.assertIn("Earlier Checkpoints Milestone Index", msg)
+        self.assertIn("[cp @ step 10, line 3]:", msg)
+        self.assertIn("[cp @ step 30, line 6]:", msg)
+        self.assertIn("ui_skins.mjs", msg)
+        self.assertIn("startDeckCoordinator", msg)
+        # Constraint still present in cp3 must NOT be duplicated in the anti-decay index
+        ms_sec = msg.split("Earlier Checkpoints Milestone Index", 1)[1].split("## ", 1)[0]
+        self.assertNotIn("Never touch upstream read-only", ms_sec)
+        # 3. Pre-window raw dump folded while current-window prompt stays verbatim
+        self.assertGreaterEqual(st["folded_paste_msgs"], 1)
+        self.assertIn("folded", msg.split("Earlier User Request Timeline", 1)[1].split("## ", 1)[0])
+        self.assertIn(current_win_prompt, msg)
+
+    def test_delayed_post_auto_compaction_and_file_block_cap_trimming(self) -> None:
+        # 1. Mid-turn auto-compaction followed by > FRESH_CHECKPOINT_MAX_GAP live steps must suppress stale Section 2
+        logs = self.tmp_root / "brain" / "cid-delayed-cp" / ".system_generated" / "logs"
+        cp1 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. 初始設計\n<summary>\n"
+            "### 2. Done\n- **Implemented `theme_tokens.mjs` dark/light palette**: Verified.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp2 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. 中途任務\n<summary>\n"
+            "### 2. Done\n- **Finished worker migration**: Verified.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>早期重要架構需求</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到。"},
+            {"step_index": 5, "type": "CHECKPOINT", "content": cp1},
+            {"step_index": 10, "type": "USER_INPUT", "content": "<USER_REQUEST>中途任務</USER_REQUEST>"},
+            {
+                "step_index": 11,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "mid_turn_check"}}],
+            },
+            {"step_index": 12, "type": "GENERIC", "status": "DONE", "content": "ok"},
+            {"step_index": 13, "type": "CHECKPOINT", "content": cp2},
+            # Post-checkpoint live steps continue 25 steps beyond checkpoint 13 before next user turn
+            {"step_index": 38, "type": "PLANNER_RESPONSE", "content": "Live post-checkpoint final reply."},
+        ]
+        _write_jsonl(logs / "transcript_full.jsonl", rows)
+        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res)
+        assert res is not None
+        msg, st = res
+        self.assertTrue(st["delayed_post_cp"])
+        self.assertEqual(st["delayed_gap"], 25)
+        self.assertFalse(st["in_progress_turn"])
+        self.assertEqual(st["kept_turns"], 0)
+        self.assertIn("delayed_gap=25", msg)
+        self.assertNotIn("[Pre-Compaction In-Progress Tools]", msg)
+        self.assertNotIn("Recent Pre-Compaction", msg)
+        # Earlier user history & decayed cp1 milestone are still preserved!
+        self.assertIn("早期重要架構需求", msg)
+        self.assertIn("theme_tokens.mjs", msg)
+
+        # Verify `--hook` end-to-end when `rehydrate_state.json` already exists from cp 5
+        _write_jsonl(logs / "transcript.jsonl", rows)
+        (logs / "rehydrate_state.json").write_text(
+            json.dumps({"last_rehydrated_checkpoint": 5, "checked_offset": 0}),
+            encoding="utf-8",
+        )
+        hook_payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
+        p_hook = subprocess.run(
+            [sys.executable, "-S", "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
+            input=hook_payload,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            check=True,
+        )
+        hook_res = json.loads(p_hook.stdout.strip())
+        self.assertIn("injectSteps", hook_res)
+        injected_txt = "\n".join(st_item["systemMessage"]["systemMessage"] for st_item in hook_res["injectSteps"])
+        self.assertIn("delayed_gap=25", injected_txt)
+        self.assertIn("theme_tokens.mjs", injected_txt)
+        self.assertNotIn("Recent Pre-Compaction", injected_txt)
+
+        # 2. _enforce_total_cap drops trailing whole file blocks cleanly instead of shredding middle files
+        f1 = "### [Modified @ step 1] `a.py`\n```python\n" + "".join(f"a_{i:02d} = {i}\n" for i in range(25)) + "```"
+        f2 = "### [Modified @ step 2] `b.py`\n```python\n" + "".join(f"b_{i:02d} = {i}\n" for i in range(25)) + "```"
+        f3 = "### [Modified @ step 3] `c.py`\n```python\n" + "".join(f"c_{i:02d} = {i}\n" for i in range(25)) + "```"
+        secs = [
+            "[POST-COMPACT REHYDRATION v1 | checkpoint=10]",
+            "Preamble.",
+            f"## 1. Restored Active Workspace Files (Live Disk Read)\n{f1}\n\n{f2}\n\n{f3}",
+        ]
+        # Cap tightly enough to force dropping f3 while comfortably keeping f1 + f2 whole
+        cap_keep_two = len("\n\n".join(secs[:2])) + 2 + len("## 1. Restored Active Workspace Files (Live Disk Read)\n") + len(f1) + 2 + len(f2) + 20
+        trimmed = mod._enforce_total_cap(secs, cap_keep_two)
+        joined = "\n\n".join(trimmed)
+        self.assertLessEqual(len(joined), cap_keep_two)
+        self.assertIn("`a.py`", joined)
+        self.assertIn("`b.py`", joined)
+        self.assertNotIn("`c.py`", joined)
+        self.assertNotIn("truncated ~", joined)
+        self.assertEqual(sum(1 for ln in joined.splitlines() if ln.lstrip().startswith("```")) % 2, 0)
+
+    def test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget(self) -> None:
+        # 1. `Completed At:` in GENERIC tool output (both normal JSON and >2048B fast-path) prevents false external-edit alerts
+        self_edited = self.ws / "README_self.md"
+        fast_edited = self.ws / "README_fast.md"
+        ext_edited = self.ws / "README_ext.md"
+        for fp in (self_edited, fast_edited, ext_edited):
+            fp.write_text("# Doc\ncontent\n", encoding="utf-8")
+
+        completed_ep = mod.parse_iso_epoch("2026-11-19T18:44:12+08:00")
+        self.assertIsNotNone(completed_ep)
+        assert completed_ep is not None
+        os.utime(self_edited, (completed_ep + 0.7, completed_ep + 0.7))
+        os.utime(fast_edited, (completed_ep + 1.2, completed_ep + 1.2))
+        os.utime(ext_edited, (completed_ep + 25.0, completed_ep + 25.0))
+
+        logs_ts = self.tmp_root / "brain" / "cid-completed-at" / ".system_generated" / "logs"
+        rows_ts: list[dict] = [
+            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-19T10:43:30Z", "content": "<USER_REQUEST>更新文件</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-19T10:43:34Z",
+                "content": "",
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": str(self_edited), "Replacement": "# Doc"}},
+                    {"name": "edit_file", "args": {"Path": str(fast_edited), "Replacement": "# Doc"}},
+                    {"name": "edit_file", "args": {"Path": str(ext_edited), "Replacement": "# Doc"}},
+                ],
+            },
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-19T10:43:43Z",
+                "content": (
+                    "Created At: 2026-11-19T18:43:43+08:00\n"
+                    "Completed At: 2026-11-19T18:44:12+08:00\n"
+                    "Made 1 replacement."
+                ),
+            },
+            {
+                "step_index": 3,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-19T10:43:45Z",
+                "content": (
+                    "Created At: 2026-11-19T18:43:45+08:00\n"
+                    "Completed At: 2026-11-19T18:44:12+08:00\n"
+                    "Made 1 replacement. " + ("x" * 2400)
+                ),
+            },
+            {
+                "step_index": 4,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-19T10:43:46Z",
+                "content": (
+                    "Created At: 2026-11-19T18:43:46+08:00\n"
+                    "Completed At: 2026-11-19T18:44:12+08:00\n"
+                    "Made 1 replacement."
+                ),
+            },
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "已更新三份文件。"},
+        ]
+        # Advance beyond active coding window so files are uninjected and checked for external edits
+        st_cur = 20
+        for q_i in range(1, 7):
+            rows_ts.append({"step_index": st_cur, "type": "USER_INPUT", "content": f"<USER_REQUEST>後續討論 {q_i}</USER_REQUEST>"})
+            rows_ts.append({"step_index": st_cur + 1, "type": "PLANNER_RESPONSE", "content": f"回覆 {q_i}。" * 10})
+            st_cur += 15
+        rows_ts.append(
+            {
+                "step_index": st_cur,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 後續討論 6\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
+            }
+        )
+        _write_jsonl(logs_ts / "transcript_full.jsonl", rows_ts)
+        res_ts = mod.build_rehydration(logs_ts / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_ts)
+        assert res_ts is not None
+        msg_ts, st_ts = res_ts
+        self.assertEqual(st_ts["externally_modified_files"], 1)
+        ext_line = next(
+            (ln for ln in msg_ts.splitlines() if "Modified on disk since last read/edit" in ln),
+            "",
+        )
+        self.assertIn("README_ext.md", ext_line)
+        self.assertNotIn("README_self.md", ext_line)
+        self.assertNotIn("README_fast.md", ext_line)
+
+        # 2. Structured item-level shrinking in `build_workspace_reality_notice` never mid-clips with `read_file`
+        for idx_dir in range(8):
+            (self.ws / f"live_project_{idx_dir:02d}").mkdir(exist_ok=True)
+        missing_summary = " ".join(str(self.ws / f"vanished_repo_{i:02d}" / "src" / "main.py") for i in range(7))
+        for cap_c in (190, 260, 360, 600):
+            notice_txt, notice_cnts = mod.build_workspace_reality_notice(
+                modified_touch={},
+                read_touch={},
+                path_touch_epoch={},
+                target_cp_content=missing_summary,
+                workspace_roots=[self.ws],
+                injected_file_keys=set(),
+                max_chars=cap_c,
+            )
+            self.assertEqual(notice_cnts["stale_paths"], 7)
+            self.assertLessEqual(len(notice_txt), cap_c)
+            self.assertNotIn("read_file for full content", notice_txt)
+            self.assertNotIn("truncated ~", notice_txt)
+            for ln in notice_txt.splitlines():
+                self.assertTrue(ln.startswith("- **"), f"Expected clean bullet line, got: {ln!r}")
+                self.assertEqual(ln.count("`") % 2, 0, f"Unbalanced backticks in bullet: {ln!r}")
+
+        # 3. Active coding pre-reserves Workspace Reality budget before `eff_files_budget` so Section 2 stays intact
+        mod_a = self.ws / "core_a.py"
+        mod_b = self.ws / "core_b.py"
+        mod_c = self.ws / "core_c.py"
+        for idx_f, fp in enumerate((mod_a, mod_b, mod_c)):
+            fp.write_text("".join(f"val_{idx_f}_{ln:03d} = '{'x' * 55}'\n" for ln in range(180)), encoding="utf-8")
+        logs_ws = self.tmp_root / "brain" / "cid-ws-pre-reserve" / ".system_generated" / "logs"
+        rows_ws = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>修改 core_a.py, core_b.py, core_c.py</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "created_at": "2026-11-19T10:44:10Z",
+                "content": "",
+                "tool_calls": [
+                    {"name": "edit_file", "args": {"Path": str(mod_a), "Replacement": "val_0_010 ="}},
+                    {"name": "edit_file", "args": {"Path": str(mod_b), "Replacement": "val_1_010 ="}},
+                    {"name": "edit_file", "args": {"Path": str(mod_c), "Replacement": "val_2_010 ="}},
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T10:44:12Z", "content": "ok " + ("p" * 45000)},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T10:44:12Z", "content": "ok " + ("q" * 45000)},
+            {"step_index": 4, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T10:44:12Z", "content": "ok " + ("r" * 45000)},
+            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "三個檔案皆已修改並驗證完成。"},
+            {
+                "step_index": 6,
+                "type": "CHECKPOINT",
+                "content": (
+                    "<CONTEXT_SUMMARY>\n# User Requests\n1. 修改 core_a.py, core_b.py, core_c.py\n"
+                    f"<summary>Old paths: `{self.ws / 'gone_old_1'}`, `{self.ws / 'gone_old_2'}`.</summary>\n"
+                    "</CONTEXT_SUMMARY>"
+                ),
+            },
+        ]
+        _write_jsonl(logs_ws / "transcript_full.jsonl", rows_ws)
+        res_ws = mod.build_rehydration(logs_ws / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_ws)
+        assert res_ws is not None
+        msg_ws, st_ws = res_ws
+        self.assertEqual(st_ws["session_mode"], "active_coding")
+        self.assertLessEqual(st_ws["chars"], st_ws["ratio_cap"])
+        self.assertIn("Workspace Reality & File Status Notice", msg_ws)
+        ws_sec = msg_ws.split("Workspace Reality & File Status Notice", 1)[1].split("## ", 1)[0]
+        self.assertIn("Stale / missing paths", ws_sec)
+        self.assertIn("Current live entries in", ws_sec)
+        self.assertNotIn("read_file for full content", ws_sec)
+        self.assertNotIn("truncated ~", ws_sec)
+        self.assertEqual(st_ws["files"], 3)
+
+    def test_progress_template_milestones_and_multi_hunk_radius_shrinking(self) -> None:
+        import rehydrate_helpers as helpers
+
+        # 1. Antigravity numbered `/compact` template (`### 2. Progress`, `### 3. Key Findings`, `### 4. Errors & Fixes`)
+        cp1_progress = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Round 1 refactor\n<summary>\n"
+            "### 1. Task Overview\n"
+            "- Should be ignored as overview.\n"
+            "### 2. Progress\n"
+            "- **Modified `D:\\workspace\\long-repo-name\\plugins\\core\\scripts\\cache_engine.py`**:\n"
+            "  - Added `build_wal_cache_key(stat)` (`L120`) using `ino:mtimeNs:size`.\n"
+            "  - Added `delayed_post_cp = True` guard for stale auto-compactions.\n"
+            "- **Verification Results**:\n"
+            "  - Ran 27 tests in 1.2s, OK.\n"
+            "- **Scratch Files Created**:\n"
+            "  - `scratch/tmp_probe.py`\n"
+            "#### In Progress\n"
+            "- Pending UI polish not finished yet.\n"
+            "### 3. Key Findings\n"
+            "- **Timestamp Semantics**:\n"
+            "  - `Completed At:` inside `GENERIC` output reflects real disk write completion.\n"
+            "### 4. Errors & Fixes\n"
+            "- **Error 1 (stale `wal_index` lock contention)**:\n"
+            "  - Initial naive polling retried for 20s and dropped requests.\n"
+            "  - **Fix**: Switched `wal_index` to atomic rename with exponential backoff.\n"
+            "### 6. Next Steps\n"
+            "- Should be ignored as transient next step.\n"
+            "### 7. Commitments & Constraints\n"
+            "- Keep zero third-party dependencies in runtime scripts.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp2_progress = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Round 2 fixes\n<summary>\n"
+            "### 2. Progress\n"
+            "- **Round 2 Fixes**:\n"
+            "  - `D:\\workspace\\long-repo-name\\plugins\\core\\scripts\\ui_renderer.py`:\n"
+            "    - Added `render_frosted_toolbar()` and synced sidebar alignment.\n"
+            "    - Added `popover_anchor_sync` telemetry counter.\n"
+            "### 7. Commitments & Constraints\n"
+            "- Keep zero third-party dependencies in runtime scripts.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp3_latest = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Release v2\n<summary>\n"
+            "### 2. Progress\n"
+            "- **Released v2.0**: Tagged release and kept `delayed_post_cp` guard in `cache_engine.py`.\n"
+            "### 7. Commitments & Constraints\n"
+            "- Keep zero third-party dependencies in runtime scripts.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+
+        done1, cons1 = helpers.extract_checkpoint_milestones(cp1_progress)
+        self.assertGreaterEqual(len(done1), 4)
+        self.assertEqual(len(cons1), 1)
+        joined1 = "\n".join(done1)
+        # Path shortened to basename, nested sub-bullets captured, Error symptom upgraded to Fix
+        self.assertIn("`cache_engine.py`", joined1)
+        self.assertNotIn("long-repo-name", joined1)
+        self.assertIn("build_wal_cache_key", joined1)
+        self.assertIn("atomic rename with exponential backoff", joined1)
+        self.assertNotIn("naive polling retried", joined1)
+        # Transient sections & noise containers strictly excluded
+        self.assertNotIn("Ran 27 tests", joined1)
+        self.assertNotIn("tmp_probe.py", joined1)
+        self.assertNotIn("Pending UI polish", joined1)
+        self.assertNotIn("transient next step", joined1)
+        for item in done1 + cons1:
+            self.assertEqual(item.count("`") % 2, 0, f"Unbalanced backticks in milestone: {item!r}")
+
+        # 3-level nested bullet in cp2 (`Round 2 Fixes` -> `ui_renderer.py` -> leaf)
+        done2, _ = helpers.extract_checkpoint_milestones(cp2_progress)
+        self.assertTrue(any("`ui_renderer.py`" in d and "render_frosted_toolbar" in d for d in done2))
+
+        # Anti-decay digest across cp1 + cp2 vs cp3: recovers both checkpoints, dedups `delayed_post_cp` & constraint
+        digest, cnt = helpers.build_anti_decay_milestone_digest(
+            [(10, 11, cp1_progress), (20, 21, cp2_progress)],
+            cp3_latest,
+            self.ws / "transcript_full.jsonl",
+            budget_chars=1200,
+        )
+        self.assertGreaterEqual(cnt, 4)
+        self.assertIn("[cp @ step 10, line 11]:", digest)
+        self.assertIn("[cp @ step 20, line 21]:", digest)
+        self.assertIn("build_wal_cache_key", digest)
+        self.assertIn("render_frosted_toolbar", digest)
+        self.assertNotIn("delayed_post_cp", digest)
+        self.assertNotIn("zero third-party dependencies", digest)
+
+        # 2. Multi-hunk `read_modified_hunk_window` shrinks context radius (`ctx=4/2/0`) and water-fills before mid-clip
+        big_file = self.ws / "multi_hunk_mod.py"
+        file_lines = [f"PAD_LINE_{i:04d} = '{'z' * 42}'" for i in range(1, 501)]
+        anchors = [40, 130, 230, 330, 440]
+        snips: list[str] = []
+        for idx_a, ln_no in enumerate(anchors, 1):
+            block_lns = [f"def edit_hunk_{idx_a}_part_{j}(): return 'ANCHOR_{idx_a}_{j}_TOKEN'" for j in range(1, 11)]
+            file_lines[ln_no - 1 : ln_no - 1 + len(block_lns)] = block_lns
+            snips.append("\n".join(block_lns))
+        big_file.write_text("\n".join(file_lines) + "\n", encoding="utf-8")
+
+        # Case A: Medium budget where ctx=8 would overflow, but smaller radii (ctx=4/2/0) fit all 5 hunks cleanly
+        out_med, note_med = helpers.read_modified_hunk_window(str(big_file), snips, max_chars=4200, context_lines=45)
+        self.assertIsNotNone(out_med)
+        assert out_med is not None
+        self.assertLessEqual(len(out_med), 4200)
+        self.assertNotIn("truncated ~", out_med)
+        for idx_a in range(1, 6):
+            self.assertIn(f"ANCHOR_{idx_a}_1_TOKEN", out_med)
+        self.assertIn("hunk lines", note_med)
+
+        # Case B: Tight budget where even ctx=0 exceeds cap -> water-filling keeps all 5 hunk starts visible
+        out_tight, _ = helpers.read_modified_hunk_window(str(big_file), snips, max_chars=2400, context_lines=45)
+        self.assertIsNotNone(out_tight)
+        assert out_tight is not None
+        self.assertLessEqual(len(out_tight), 2400)
+        self.assertNotIn("truncated ~", out_tight)
+        self.assertIn("trimmed from", out_tight)
+        for idx_a in range(1, 6):
+            self.assertIn(f"ANCHOR_{idx_a}_1_TOKEN", out_tight)
+
+        # 3. Long backtick identifier closure, clean parent labels (no `...:` or half-UUID), & self-anchored child elision
+        long_bt = "Updated `test_rehydrate.py`: Added `test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget`"
+        clipped_bt = helpers._clip_milestone_text(long_bt, 90)
+        self.assertLessEqual(len(clipped_bt), 90)
+        self.assertEqual(clipped_bt.count("`") % 2, 0)
+        self.assertIn("`test_completed_at_timestamp_tolerance", clipped_bt)
+        self.assertTrue(clipped_bt.endswith("...`"))
+
+        cp_polish = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Polish test\n<summary>\n"
+            "### 2. Progress\n"
+            "- **Round 2 Live `/compact` (`checkpoint=148`) Bug Fixes**:\n"
+            "  - `D:\\workspace\\repo\\tests\\test_rehydrate.py`: Added `test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget`.\n"
+            "### 3. Key Findings\n"
+            "- **Forensic findings from `9f280ce9-3eeb-4a21-b4b6-4417ba3993c3`**:\n"
+            "  - `step 1981` had been misclassified because `step 1971` touched a scratch file.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        done_pol, _ = helpers.extract_checkpoint_milestones(cp_polish)
+        joined_pol = "\n".join(done_pol)
+        self.assertIn("`test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget`", joined_pol)
+        self.assertIn("Forensic findings: `step 1981`", joined_pol)
+        self.assertNotIn("...:", joined_pol)
+        self.assertNotIn("9f280ce9-3eeb-4a21`", joined_pol)
+        for it in done_pol:
+            self.assertEqual(it.count("`") % 2, 0, f"Unbalanced backticks: {it!r}")
+
+        # 4. Cross-checkpoint edit anchor scoping: re-edited files drop pre-prev_cp anchors; untouched files keep theirs
+        re_edited = self.ws / "window_scoped.py"
+        untouched = self.ws / "prev_only.py"
+        scoped_lines = [f"FILL_{i:03d} = '{'p' * 24}_{i:03d}'" for i in range(1, 321)]
+        scoped_lines[89] = "def old_round1_anchor(): return 'OLD_CP1_ANCHOR'"
+        scoped_lines[259] = "def new_round2_anchor(): return 'NEW_CP2_ANCHOR'"
+        re_edited.write_text("\n".join(scoped_lines) + "\n", encoding="utf-8")
+        untouched_lines = [f"KEEP_{i:03d} = '{'q' * 24}_{i:03d}'" for i in range(1, 201)]
+        untouched_lines[119] = "def prev_window_anchor(): return 'PREV_ONLY_ANCHOR'"
+        untouched.write_text("\n".join(untouched_lines) + "\n", encoding="utf-8")
+
+        logs_sc = self.tmp_root / "brain" / "cid-cp-anchor-scope" / ".system_generated" / "logs"
+        sc_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Round 1 edit</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "Path": str(re_edited),
+                            "Target": "FILL_090 = 'pppppppppppppppppppppppp_090'",
+                            "Replacement": "def old_round1_anchor(): return 'OLD_CP1_ANCHOR'",
+                        },
+                    },
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "Path": str(untouched),
+                            "Target": "KEEP_120 = 'qqqqqqqqqqqqqqqqqqqqqqqq_120'",
+                            "Replacement": "def prev_window_anchor(): return 'PREV_ONLY_ANCHOR'",
+                        },
+                    },
+                ],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement"},
+            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement"},
+            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "Round 1 done."},
+            {"step_index": 5, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY><summary>### 2. Progress\n- Round 1 edited both files.</summary></CONTEXT_SUMMARY>"},
+            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>Round 2 edit only window_scoped.py</USER_REQUEST>"},
+            {
+                "step_index": 7,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "name": "edit_file",
+                        "args": {
+                            "Path": str(re_edited),
+                            "Target": "FILL_260 = 'pppppppppppppppppppppppp_260'",
+                            "Replacement": "def new_round2_anchor(): return 'NEW_CP2_ANCHOR'",
+                        },
+                    }
+                ],
+            },
+            {"step_index": 8, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement. " + ("x" * 160000)},
+            {"step_index": 9, "type": "PLANNER_RESPONSE", "content": "Round 2 done."},
+            {"step_index": 10, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY><summary>### 2. Progress\n- Round 2 updated window_scoped.py.</summary></CONTEXT_SUMMARY>"},
+        ]
+        _write_jsonl(logs_sc / "transcript_full.jsonl", sc_rows)
+        res_sc = mod.build_rehydration(logs_sc / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_sc)
+        assert res_sc is not None
+        msg_sc, st_sc = res_sc
+        self.assertEqual(st_sc["files"], 2)
+        self.assertIn("NEW_CP2_ANCHOR", msg_sc)
+        self.assertNotIn("OLD_CP1_ANCHOR", msg_sc)
+        self.assertIn("PREV_ONLY_ANCHOR", msg_sc)
+
+    def test_balanced_multi_file_budget_code_span_scanner_and_fast_tail_scan(self) -> None:
+        import rehydrate_helpers as helpers
+
+        # 1. Backtick state machine: tolerate quoted literal backtick inside single-backtick span & handle double-backtick spans
+        quoted_bt = (
+            'Milestone Clipping Pitfalls Uncovered on Real Data: Using `close_tok = "`"` when '
+            '`add_ellipsis=False` on parent headers fabricated half-UUIDs (`` `9f280ce9-3eeb-4a21` ``); '
+            'restricting closure fixed it.'
+        )
+        clipped_q = helpers._clip_milestone_text(quoted_bt, 138)
+        self.assertEqual(helpers._find_unclosed_code_span(clipped_q)[0], -1)
+        self.assertFalse(clipped_q.endswith("...`"))
+        self.assertTrue(clipped_q.endswith("..."))
+
+        dbl_bt = "Observed malformed token `` `9f280ce9-3eeb-4a21-b4b6-4417ba3993c3` `` during replay verification"
+        clipped_d = helpers._clip_milestone_text(dbl_bt, 46)
+        self.assertEqual(helpers._find_unclosed_code_span(clipped_d)[0], -1)
+        self.assertNotIn("``", clipped_d)
+
+        self.assertEqual(
+            helpers._compact_parent_milestone_label("Milestone Clipping Pitfalls Uncovered on Real Data"),
+            "Milestone Clipping Pitfalls Uncovered on Real Data",
+        )
+        self.assertEqual(
+            helpers._compact_parent_milestone_label(
+                "Round 5 Live `/compact` (`checkpoint=407`) Audit & 4-Axis Optimization (this window)"
+            ),
+            "Round 5 Live `/compact` (`checkpoint=407`) Audit",
+        )
+        self.assertEqual(
+            helpers._clip_milestone_text("Pipeline phase transition -> deferred cleanup stage", 29, add_ellipsis=False),
+            "Pipeline phase transition",
+        )
+        self.assertEqual(
+            helpers._clip_milestone_text("Modern compiler backend for C++ template instantiation", 32, add_ellipsis=False),
+            "Modern compiler backend for C++",
+        )
+
+        # 2. Balanced weighted multi-file Section 5 sharing + compact subsequent gap markers
+        def _make_big_py(path: Path, tag: str) -> list[tuple[str, str]]:
+            lines = [f"# {tag} header line {i}" for i in range(1, 25)]
+            for i in range(25, 420):
+                lines.append(f"VAR_{tag}_{i:03d} = '{tag}_payload_value_padding_content_{i:03d}'")
+            edits = [
+                (f"VAR_{tag}_060 = '{tag}_payload_value_padding_content_060'", f"def {tag}_fn_a(): return '{tag}_EDIT_A'"),
+                (f"VAR_{tag}_170 = '{tag}_payload_value_padding_content_170'", f"def {tag}_fn_b(): return '{tag}_EDIT_B'"),
+                (f"VAR_{tag}_280 = '{tag}_payload_value_padding_content_280'", f"def {tag}_fn_c(): return '{tag}_EDIT_C'"),
+                (f"VAR_{tag}_380 = '{tag}_payload_value_padding_content_380'", f"def {tag}_fn_d(): return '{tag}_EDIT_D'"),
+            ]
+            text = "\n".join(lines) + "\n"
+            for old, new in edits:
+                text = text.replace(old, new, 1)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            return edits
+
+        core_a = self.ws / "core_alpha.py"
+        core_b = self.ws / "core_beta.py"
+        test_f = self.ws / "tests" / "test_balanced_suite.py"
+        ed_a = _make_big_py(core_a, "ALPHA")
+        ed_b = _make_big_py(core_b, "BETA")
+        ed_t = _make_big_py(test_f, "TEST")
+
+        logs_bal = self.tmp_root / "brain" / "cid-balanced-files" / ".system_generated" / "logs"
+        tcalls = []
+        for fpath, edits in ((core_a, ed_a), (core_b, ed_b), (test_f, ed_t)):
+            for old, new in edits:
+                tcalls.append({"name": "edit_file", "args": {"Path": str(fpath), "Target": old, "Replacement": new}})
+        bal_rows = [
+            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Update alpha, beta, and tests</USER_REQUEST>"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": tcalls},
+        ]
+        for idx_r in range(len(tcalls)):
+            pad = ("x" * 160000) if idx_r == 0 else ""
+            bal_rows.append({"step_index": 2 + idx_r, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement. " + pad})
+        fin_step = 2 + len(tcalls)
+        bal_rows.append({"step_index": fin_step, "type": "PLANNER_RESPONSE", "content": "Updated all three files."})
+        bal_rows.append(
+            {
+                "step_index": fin_step + 1,
+                "type": "CHECKPOINT",
+                "content": "<CONTEXT_SUMMARY><summary>### 2. Progress\n- Updated core_alpha.py, core_beta.py, and test_balanced_suite.py.</summary></CONTEXT_SUMMARY>",
+            }
+        )
+        _write_jsonl(logs_bal / "transcript_full.jsonl", bal_rows)
+        res_bal = mod.build_rehydration(logs_bal / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_bal)
+        assert res_bal is not None
+        msg_bal, st_bal = res_bal
+        self.assertEqual(st_bal["files"], 3)
+        sec_blocks = msg_bal.split("\n### [Modified @")
+        self.assertEqual(len(sec_blocks), 4)
+        test_block = next(b for b in sec_blocks[1:] if "test_balanced_suite.py" in b)
+        self.assertGreaterEqual(len(test_block), 2200)
+        for tag in ("TEST_EDIT_A", "TEST_EDIT_B", "TEST_EDIT_C", "TEST_EDIT_D"):
+            self.assertIn(tag, test_block)
+        # First internal gap keeps full read_file hint; subsequent internal gaps use compact omitted marker
+        self.assertEqual(test_block.count("omitted; read_file for full context"), 1)
+
+        # 3. Single-open incremental fast tail scan (`need_max_step=False`) with & without CHECKPOINT
+        tail_log = self.tmp_root / "fast_tail_scan.jsonl"
+        _write_jsonl(
+            tail_log,
+            [
+                {"step_index": 0, "type": "USER_INPUT", "content": "hi"},
+                {"step_index": 1, "type": "CHECKPOINT", "content": "cp1"},
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "ok"},
+            ],
+        )
+        cp0, max0, off0 = mod._scan_compact_tail_str(str(tail_log), 0, None, need_max_step=True)
+        self.assertEqual((cp0, max0), (1, 2))
+        with tail_log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"step_index": 3, "type": "USER_INPUT", "content": "next turn"}) + "\n")
+            fh.write(json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "content": "reply"}) + "\n")
+        cp1, max1, off1 = mod._scan_compact_tail_str(str(tail_log), off0, cp0, need_max_step=False)
+        self.assertEqual((cp1, max1), (1, -1))
+        self.assertGreater(off1, off0)
+        with tail_log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"step_index": 5, "type": "CHECKPOINT", "content": "cp2"}) + "\n")
+        cp2, _, off2 = mod._scan_compact_tail_str(str(tail_log), off1, cp1, need_max_step=False)
+        self.assertEqual(cp2, 5)
+        self.assertGreater(off2, off1)
+
+        # 4. Pre-resolve fast deny + cached resolve preserves all security boundaries
+        rcache: dict[str, Path | None] = {}
+        ws_pfx = helpers._prepare_root_prefixes([self.ws], rcache)
+        excl_dir = self.ws / "scratch_excl"
+        excl_dir.mkdir(exist_ok=True)
+        excl_file = excl_dir / "temp.py"
+        excl_file.write_text("x = 1\n", encoding="utf-8")
+        excl_pfx = helpers._prepare_root_prefixes([excl_dir], rcache)
+        env_file = self.ws / ".env"
+        env_file.write_text("SECRET=1\n", encoding="utf-8")
+        self.assertFalse(
+            helpers.is_eligible_text_file(
+                str(env_file),
+                workspace_roots=[self.ws],
+                resolve_cache=rcache,
+                _allowed_prefixes=ws_pfx,
+                _excluded_prefixes=excl_pfx,
+            )
+        )
+        self.assertFalse(
+            helpers.is_eligible_text_file(
+                str(excl_file),
+                workspace_roots=[self.ws],
+                resolve_cache=rcache,
+                _allowed_prefixes=ws_pfx,
+                _excluded_prefixes=excl_pfx,
+            )
+        )
+        self.assertTrue(
+            helpers.is_eligible_text_file(
+                str(core_a),
+                workspace_roots=[self.ws],
+                resolve_cache=rcache,
+                _allowed_prefixes=ws_pfx,
+                _excluded_prefixes=excl_pfx,
+            )
+        )
 
     def test_line_endings_and_no_pycache(self) -> None:
         self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])

@@ -70,7 +70,11 @@ def _extract_step_index_bytes(raw_line: bytes) -> int:
     return int(raw_line[start:i])
 
 
-def _find_transcript_files_str(payload: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+def _find_transcript_files_str(
+    payload: dict[str, Any],
+    *,
+    resolve_full: bool = True,
+) -> tuple[str | None, str | None, str | None]:
     """Locate `(transcript.jsonl, transcript_full.jsonl, rehydrate_state.json)` using only `os.path`."""
     tp = payload.get("transcriptPath") or ""
     ad = payload.get("artifactDirectoryPath") or ""
@@ -95,39 +99,82 @@ def _find_transcript_files_str(payload: dict[str, Any]) -> tuple[str | None, str
             for prod in AGY_PRODUCT_DIRS:
                 cand = os.path.join(gemini_root, prod, "brain", cid_s, ".system_generated", "logs", "transcript.jsonl")
                 try:
-                    if os.path.isfile(cand):
-                        mt = os.path.getmtime(cand)
-                        if mt > best_mtime:
-                            best_mtime = mt
-                            compact_path = cand
+                    st = os.stat(cand)
+                    if (st.st_mode & 0o170000) == 0o100000 and st.st_mtime > best_mtime:
+                        best_mtime = st.st_mtime
+                        compact_path = cand
                 except OSError:
                     continue
 
     if compact_path is None:
         return None, None, None
     logs_dir = os.path.dirname(compact_path)
-    full_cand = os.path.join(logs_dir, "transcript_full.jsonl")
-    full_path = full_cand if os.path.isfile(full_cand) else compact_path
+    if resolve_full:
+        full_cand = os.path.join(logs_dir, "transcript_full.jsonl")
+        full_path = full_cand if os.path.isfile(full_cand) else compact_path
+    else:
+        full_path = compact_path
     return compact_path, full_path, os.path.join(logs_dir, "rehydrate_state.json")
 
 
-def _scan_compact_tail_str(compact_path: str, prev_offset: int, prev_cp: int | None) -> tuple[int | None, int, int]:
-    """Incrementally scan newly appended JSONL bytes for `CHECKPOINT` records without `re` or `Path`."""
-    st_size = os.path.getsize(compact_path)
-    if st_size == prev_offset and prev_offset > 0:
-        return prev_cp, -1, st_size
-    use_incremental = False
-    if 0 < prev_offset < st_size:
-        with open(compact_path, "rb") as fb_chk:
-            fb_chk.seek(prev_offset - 1)
-            use_incremental = fb_chk.read(1) == b"\n"
-    latest_cp = prev_cp if use_incremental else None
-    max_step = -1
+def _scan_compact_tail_str(
+    compact_path: str,
+    prev_offset: int,
+    prev_cp: int | None,
+    *,
+    need_max_step: bool = True,
+) -> tuple[int | None, int, int]:
+    """Incrementally scan newly appended JSONL bytes for `CHECKPOINT` records in a single file open."""
     with open(compact_path, "rb") as fb:
-        if use_incremental:
+        fb.seek(0, os.SEEK_END)
+        st_size = fb.tell()
+        if st_size == prev_offset and prev_offset > 0:
+            return prev_cp, -1, st_size
+
+        use_incremental = False
+        if 0 < prev_offset < st_size:
+            fb.seek(prev_offset - 1)
+            use_incremental = fb.read(1) == b"\n"
+        if not use_incremental:
+            fb.seek(0)
+
+        latest_cp = prev_cp if use_incremental else None
+        max_step = -1
+
+        # Normal-turn fast path when state already exists: avoid per-line scanning unless `"CHECKPOINT"` appears
+        if not need_max_step and use_incremental:
+            delta = st_size - prev_offset
+            has_cp_marker = False
+            if delta <= 1_048_576:
+                tail = fb.read(delta)
+                if b'"CHECKPOINT"' not in tail:
+                    return latest_cp, -1, st_size
+                for raw_line in tail.splitlines():
+                    if b'"CHECKPOINT"' in raw_line:
+                        try:
+                            obj = json.loads(raw_line.decode("utf-8", "replace"))
+                            if isinstance(obj, dict) and obj.get("type") == "CHECKPOINT":
+                                sidx = obj.get("step_index", -1)
+                                if isinstance(sidx, int) and not isinstance(sidx, bool):
+                                    latest_cp = sidx
+                        except json.JSONDecodeError:
+                            pass
+                return latest_cp, -1, st_size
+            overlap = b""
+            while True:
+                chunk = fb.read(262_144)
+                if not chunk:
+                    break
+                if b'"CHECKPOINT"' in (overlap + chunk):
+                    has_cp_marker = True
+                    break
+                overlap = chunk[-16:]
+            if not has_cp_marker:
+                return latest_cp, -1, st_size
             fb.seek(prev_offset)
+
         for raw_line in fb:
-            if not raw_line.strip():
+            if not raw_line or raw_line.isspace():
                 continue
             if b'"CHECKPOINT"' in raw_line:
                 try:
@@ -135,15 +182,16 @@ def _scan_compact_tail_str(compact_path: str, prev_offset: int, prev_cp: int | N
                     if isinstance(obj, dict):
                         sidx = obj.get("step_index", -1)
                         if isinstance(sidx, int) and not isinstance(sidx, bool):
-                            max_step = max(max_step, sidx)
+                            if need_max_step and sidx > max_step:
+                                max_step = sidx
                             if obj.get("type") == "CHECKPOINT":
                                 latest_cp = sidx
                 except json.JSONDecodeError:
                     pass
-            else:
+            elif need_max_step:
                 sidx = _extract_step_index_bytes(raw_line)
-                if sidx >= 0:
-                    max_step = max(max_step, sidx)
+                if sidx > max_step:
+                    max_step = sidx
     return latest_cp, max_step, st_size
 
 
@@ -175,23 +223,21 @@ def run_hook() -> int:
             sys.stdout.write("{}\n")
             return 0
 
-        compact_path_s, full_path_s, state_path_s = _find_transcript_files_str(payload)
-        if compact_path_s is None or full_path_s is None or state_path_s is None:
+        compact_path_s, _, state_path_s = _find_transcript_files_str(payload, resolve_full=False)
+        if compact_path_s is None or state_path_s is None:
             sys.stdout.write("{}\n")
             return 0
 
-        had_state = os.path.isfile(state_path_s)
+        had_state = False
         state: dict[str, Any] = {}
-        if had_state:
-            try:
-                with open(state_path_s, "r", encoding="utf-8") as sf:
-                    loaded_state = json.loads(sf.read())
-                if isinstance(loaded_state, dict):
-                    state = loaded_state
-                else:
-                    had_state = False
-            except (OSError, json.JSONDecodeError):
-                had_state = False
+        try:
+            with open(state_path_s, "r", encoding="utf-8") as sf:
+                loaded_state = json.loads(sf.read())
+            if isinstance(loaded_state, dict):
+                state = loaded_state
+                had_state = True
+        except (OSError, json.JSONDecodeError):
+            had_state = False
 
         prev_cp = state.get("last_rehydrated_checkpoint")
         if not (isinstance(prev_cp, int) and not isinstance(prev_cp, bool)):
@@ -199,13 +245,18 @@ def run_hook() -> int:
         raw_offset = state.get("checked_offset")
         prev_offset = raw_offset if isinstance(raw_offset, int) and not isinstance(raw_offset, bool) and raw_offset >= 0 else 0
         cached_ancestors = state.get("fork_ancestors")
-        latest_cp, max_step, new_offset = _scan_compact_tail_str(compact_path_s, prev_offset, prev_cp)
+        latest_cp, max_step, new_offset = _scan_compact_tail_str(
+            compact_path_s, prev_offset, prev_cp, need_max_step=not had_state
+        )
 
         if latest_cp is None or latest_cp == prev_cp:
             if not had_state or latest_cp != prev_cp or new_offset != prev_offset:
                 _save_state_str(state_path_s, latest_cp, new_offset, cached_ancestors)
             sys.stdout.write("{}\n")
             return 0
+
+        full_cand = os.path.join(os.path.dirname(compact_path_s), "transcript_full.jsonl")
+        full_path_s = full_cand if os.path.isfile(full_cand) else compact_path_s
 
         _ensure_scripts_dir()
         import rehydrate_engine

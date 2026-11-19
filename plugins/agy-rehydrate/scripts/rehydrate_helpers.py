@@ -203,21 +203,34 @@ _REGEX_SPECS: dict[str, tuple[str, int]] = {
         r"^(?:##\s*)?\d+\.\s+(?:"
         r"Complete User Request Timeline|"
         r"Earlier User Request Timeline|"
+        r"Earlier Checkpoints Milestone Index|"
         r"Recent Pre-Compaction (?:Verbatim )?Dialogue|"
         r"Final Pre-Compaction Exchange|"
+        r"Workspace Reality & File Status Notice|"
         r"Restored Active Skills & Spec Docs|"
         r"Restored Active Workspace Files"
         r")\b.*$",
         0,
     ),
     "REHYDRATE_TIMELINE_ITEM": (
-        r"^-\s+(?:\[#\d+\s+@\s+step\s+\d+\]:|---\s+\[/fork branch ).*$",
+        r"^-\s+(?:\[#\d+\s+@\s+step\s+\d+\]:|\[cp\s+@\s+step\s+\d+,|---\s+\[/fork branch ).*$",
         0,
     ),
     "CHECKPOINT_USER_REQS": (
         r"#\s*User Requests\s*\n(?:The following were .*?\n)?(.*?)(?=\n<summary>|\n#\s+[A-Za-z]|\Z)",
         _RE_DOTALL,
     ),
+    "SUMMARY_BLOCK": (r"<summary>(.*?)</summary>", _RE_DOTALL),
+    "MILESTONE_TOKEN": (
+        r"`([^`\n]{2,64})`|([A-Za-z_][A-Za-z0-9_.\-/]{2,48})|([\u4e00-\u9fff]{2,6})",
+        0,
+    ),
+    "ABS_PATH_REF": (
+        r"(?:file:///)?(?:[A-Za-z]:[/\\][^\s`\"'<>|()\[\]{},;，。、；：（）「」『』【】《》]+|"
+        r"/(?:Users|home|workspace|workspaces|srv|opt|var|mnt|Volumes|app|repo|src|root|private)/[^\s`\"'<>|()\[\]{},;，。、；：（）「」『』【】《》]+)",
+        0,
+    ),
+    "STRUCTURED_MD_HEADING": (r"^\s{0,3}(?:#{1,4}\s+\S|\d+\.\s+\S|\|[^\n]+\|)", _RE_MULTILINE),
     "STEP_INDEX_STR": (r'"step_index"\s*:\s*(\d+)', 0),
     "TYPE_STR": (r'"type"\s*:\s*"([^"]+)"', 0),
     "UI_BADGE_LINE": (
@@ -252,6 +265,7 @@ REHYDRATE_BOILERPLATE_PREFIXES = (
     "*(Note: Exact pre-compaction turns kept verbatim",
     "(Note: User prompts, tool trajectories, and the final assistant reply",
     "*(Note: User prompts, tool trajectories, and the final assistant reply",
+    "*(Earlier milestones from prior checkpoints no longer detailed in ",
     "- [... earlier middle prompts omitted for budget ...]",
 )
 
@@ -460,16 +474,27 @@ def canonical_path_key(path_str: str) -> str:
     return res
 
 
-def _is_subpath(child: Path, parent: Path) -> bool:
-    try:
-        child.relative_to(parent)
+_CACHE_MISS = object()
+
+
+def _norm_path_for_prefix(p: Path | str) -> str:
+    """Return platform-normalized path string suitable for exact/prefix boundary checks."""
+    s = os.path.normcase(os.path.normpath(str(p)))
+    if len(s) > 1 and not (os.name == "nt" and len(s) == 3 and s[1] == ":" and s[2] == os.sep):
+        s = s.rstrip("\\/")
+    return s
+
+
+def _is_subpath_norm(c_norm: str, p_norm: str) -> bool:
+    if c_norm == p_norm:
         return True
-    except ValueError:
-        if os.name == "nt":
-            c_norm = os.path.normcase(str(child))
-            p_norm = os.path.normcase(str(parent)).rstrip("\\/")
-            return c_norm == p_norm or c_norm.startswith(p_norm + os.sep)
-        return False
+    if p_norm.endswith(os.sep):
+        return c_norm.startswith(p_norm)
+    return c_norm.startswith(p_norm + os.sep)
+
+
+def _is_subpath(child: Path, parent: Path) -> bool:
+    return _is_subpath_norm(_norm_path_for_prefix(child), _norm_path_for_prefix(parent))
 
 
 def strip_nested_rehydration(txt: str) -> str:
@@ -905,49 +930,145 @@ def is_tool_step_successful(step_obj: dict[str, Any]) -> bool:
     return classify_tool_step(step_obj)[0] == "ok"
 
 
+def _is_sensitive_name_str(name_lower: str) -> bool:
+    if name_lower in SENSITIVE_BASENAMES:
+        return True
+    return name_lower == ".env" or (name_lower.startswith(".env.") and name_lower not in SAFE_ENV_TEMPLATES)
+
+
 def is_sensitive_filename(p: Path) -> bool:
     """Check whether `p` is a `.env*` secret file or private credential file."""
-    lower_name = p.name.lower()
-    if lower_name in SENSITIVE_BASENAMES:
-        return True
-    if lower_name == ".env" or (lower_name.startswith(".env.") and lower_name not in SAFE_ENV_TEMPLATES):
-        return True
-    return False
+    return _is_sensitive_name_str(p.name.lower())
+
+
+def _resolve_path_cached(
+    norm: str,
+    resolve_cache: dict[str, Path | None] | None = None,
+) -> Path | None:
+    if resolve_cache is not None:
+        cached = resolve_cache.get(norm, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached  # type: ignore[return-value]
+    try:
+        resolved = _path_cls()(norm).resolve()
+    except OSError:
+        resolved = None
+    if resolve_cache is not None:
+        resolve_cache[norm] = resolved
+    return resolved
+
+
+def _prepare_root_prefixes(
+    roots: Sequence[Path] | None,
+    resolve_cache: dict[str, Path | None] | None = None,
+) -> tuple[str, ...]:
+    if not roots:
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in roots:
+        r_str = str(r)
+        res = _resolve_path_cached(r_str, resolve_cache)
+        pref = _norm_path_for_prefix(res if res is not None else r)
+        if pref not in seen:
+            seen.add(pref)
+            out.append(pref)
+    return tuple(out)
+
+
+def is_trackable_workspace_path(
+    path_str: str,
+    workspace_roots: list[Path] | None = None,
+    allow_skill_or_artifact_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
+    *,
+    resolve_cache: dict[str, Path | None] | None = None,
+    _allowed_prefixes: tuple[str, ...] | None = None,
+    _excluded_prefixes: tuple[str, ...] | None = None,
+) -> tuple[bool, Path | None]:
+    """Validate path safety & workspace scope without requiring the target to currently exist on disk."""
+    norm = normalize_local_path(path_str)
+    if not norm:
+        return False, None
+
+    # Pre-resolve fast deny on obvious blacklisted paths/extensions/excluded roots (never bypasses post-resolve checks)
+    norm_slash = norm.replace("\\", "/").lower()
+    norm_slash_dir = norm_slash if norm_slash.endswith("/") else norm_slash + "/"
+    for sub in SKIP_PATH_SUBSTRINGS:
+        if sub in norm_slash or sub in norm_slash_dir:
+            return False, None
+    base_low = _fast_basename(norm).lower()
+    if _is_sensitive_name_str(base_low):
+        return False, None
+    dot_i = base_low.rfind(".")
+    if dot_i > 0 and base_low[dot_i:] in SKIP_EXTS:
+        return False, None
+    excl_prefixes = (
+        _excluded_prefixes
+        if _excluded_prefixes is not None
+        else _prepare_root_prefixes(excluded_roots, resolve_cache)
+    )
+    if excl_prefixes and any(_is_subpath_norm(_norm_path_for_prefix(norm), ep) for ep in excl_prefixes):
+        return False, None
+
+    resolved = _resolve_path_cached(norm, resolve_cache)
+    if resolved is None:
+        return False, None
+
+    res_str = str(resolved)
+    slash_lower = res_str.replace("\\", "/").lower()
+    slash_dir = slash_lower if slash_lower.endswith("/") else slash_lower + "/"
+    for sub in SKIP_PATH_SUBSTRINGS:
+        if sub in slash_lower or sub in slash_dir:
+            return False, None
+    if is_sensitive_filename(resolved) or resolved.suffix.lower() in SKIP_EXTS:
+        return False, None
+
+    res_norm = _norm_path_for_prefix(res_str)
+    if excl_prefixes and any(_is_subpath_norm(res_norm, ep) for ep in excl_prefixes):
+        return False, None
+
+    if _allowed_prefixes is not None:
+        if _allowed_prefixes and not any(_is_subpath_norm(res_norm, ap) for ap in _allowed_prefixes):
+            return False, None
+    elif workspace_roots:
+        allowed_roots = list(workspace_roots)
+        if allow_skill_or_artifact_roots:
+            allowed_roots.extend(allow_skill_or_artifact_roots)
+        allowed_prefixes = _prepare_root_prefixes(allowed_roots, resolve_cache)
+        if not any(_is_subpath_norm(res_norm, ap) for ap in allowed_prefixes):
+            return False, None
+
+    return True, resolved
 
 
 def is_eligible_text_file(
     path_str: str,
     workspace_roots: list[Path] | None = None,
     allow_skill_or_artifact_roots: list[Path] | None = None,
+    excluded_roots: list[Path] | None = None,
+    *,
+    resolve_cache: dict[str, Path | None] | None = None,
+    _allowed_prefixes: tuple[str, ...] | None = None,
+    _excluded_prefixes: tuple[str, ...] | None = None,
 ) -> bool:
     """Verify `path_str` is an existing, non-sensitive text file within allowed scope and <= 2 MiB."""
-    norm = normalize_local_path(path_str)
-    if not norm:
+    ok, resolved = is_trackable_workspace_path(
+        path_str,
+        workspace_roots=workspace_roots,
+        allow_skill_or_artifact_roots=allow_skill_or_artifact_roots,
+        excluded_roots=excluded_roots,
+        resolve_cache=resolve_cache,
+        _allowed_prefixes=_allowed_prefixes,
+        _excluded_prefixes=_excluded_prefixes,
+    )
+    if not ok or resolved is None:
         return False
-    p = _path_cls()(norm)
-    try:
-        resolved = p.resolve()
-    except OSError:
-        return False
-
-    slash_lower = str(resolved).replace("\\", "/").lower()
-    for sub in SKIP_PATH_SUBSTRINGS:
-        if sub in slash_lower:
-            return False
-    if resolved.suffix.lower() in SKIP_EXTS or is_sensitive_filename(resolved):
-        return False
-
-    if workspace_roots:
-        allowed_roots = list(workspace_roots)
-        if allow_skill_or_artifact_roots:
-            allowed_roots.extend(allow_skill_or_artifact_roots)
-        if not any(_is_subpath(resolved, root) for root in allowed_roots):
-            return False
 
     try:
-        if not resolved.is_file():
+        st = os.stat(resolved)
+        if (st.st_mode & 0o170000) != 0o100000:
             return False
-        st = resolved.stat()
         return 0 < st.st_size <= 2 * 1024 * 1024
     except OSError:
         return False
@@ -1227,6 +1348,20 @@ def read_modified_hunk_window(
 
     lines = full_text.splitlines()
     total_lines = len(lines)
+    line_cum = [0] * (total_lines + 1)
+    acc = 0
+    for idx_l, ln_txt in enumerate(lines, 1):
+        acc += len(ln_txt) + 1
+        line_cum[idx_l] = acc
+
+    def _span_chars(s_ln: int, e_ln: int) -> int:
+        return max(0, (line_cum[e_ln] - line_cum[s_ln - 1]) - 1) if e_ln >= s_ln else 0
+
+    def _gap_line(a: int, b: int, first_internal: bool) -> str:
+        if first_internal:
+            return f"... [lines {a}-{b} omitted; read_file for full context] ..."
+        return f"... [lines {a}-{b} omitted] ..."
+
     anchor_spans: list[tuple[int, int]] = []
     for raw_snip in snippets[-6:]:
         snip = raw_snip
@@ -1253,46 +1388,199 @@ def read_modified_hunk_window(
 
     cap = max_chars
     scaled_ctx = max(context_lines, min(120, cap // 110)) if context_lines >= 30 else context_lines
-    assembled = ""
-    range_labels: list[str] = []
-    base_radii = {scaled_ctx, context_lines, 28, 15, 8} if context_lines >= 30 else {context_lines, 8}
+    base_radii = (
+        {scaled_ctx, context_lines, 28, 20, 15, 11, 8, 5, 3, 1, 0}
+        if context_lines >= 30
+        else {context_lines, 8, 5, 3, 1, 0}
+    )
     radius_steps = sorted(base_radii, reverse=True)
+    chosen_merged: list[list[int]] = []
+    chosen_hdr_lines = 8
+    chosen_fits = False
+    last_merged: list[list[int]] = []
+
     for ctx in radius_steps:
         raw_spans = [(max(1, s - ctx), min(total_lines, e + ctx)) for s, e in anchor_spans]
         raw_spans.sort()
+        merge_gap = 6 if ctx >= 8 else 2
         merged: list[list[int]] = []
         for s_ln, e_ln in raw_spans:
-            if merged and s_ln <= merged[-1][1] + 6:
-                merged[-1][1] = max(merged[-1][1], e_ln)
-            else:
-                merged.append([s_ln, e_ln])
+            if merged:
+                prev_e = merged[-1][1]
+                gap_lines = s_ln - prev_e - 1
+                if s_ln <= prev_e + merge_gap or (
+                    0 < gap_lines <= 4 and _span_chars(prev_e + 1, s_ln - 1) <= 115
+                ):
+                    merged[-1][1] = max(prev_e, e_ln)
+                    continue
+            merged.append([s_ln, e_ln])
+        last_merged = merged
 
-        hdr_lines = 35 if cap >= 5000 and ctx >= 28 else 20
+        if cap >= 5000 and ctx >= 28:
+            hdr_lines = 35
+        elif ctx >= 8:
+            hdr_lines = 20
+        elif ctx >= 2:
+            hdr_lines = 12
+        else:
+            hdr_lines = 8
         header_end = min(total_lines, hdr_lines)
+        has_sep_hdr = merged[0][0] > header_end + 6
+        first_s = merged[0][0] if has_sep_hdr else 1
+
+        # Exact O(H) length calculation before allocating any joined strings
+        est_len = 0
+        block_count = 0
+        if has_sep_hdr:
+            est_len += len(f"# [Lines 1-{header_end}: file header]\n") + _span_chars(1, header_end)
+            block_count += 1
+        prev_end = header_end if has_sep_hdr else 0
+        saw_gap = False
+        for idx_m, (raw_s, e_ln) in enumerate(merged):
+            s_ln = first_s if idx_m == 0 else raw_s
+            if prev_end and s_ln > prev_end + 1:
+                est_len += len(_gap_line(prev_end + 1, s_ln - 1, not saw_gap))
+                saw_gap = True
+                block_count += 1
+            est_len += len(f"# [Lines {s_ln}-{e_ln}: active edit region]\n") + _span_chars(s_ln, e_ln)
+            block_count += 1
+            prev_end = e_ln
+        if prev_end < total_lines:
+            est_len += len(f"... [lines {prev_end + 1}-{total_lines} omitted] ...")
+            block_count += 1
+        est_len += max(0, block_count - 1)
+
+        chosen_merged = merged
+        chosen_hdr_lines = hdr_lines
+        if est_len <= cap:
+            chosen_fits = True
+            break
+
+    assembled = ""
+    range_labels: list[str] = []
+    if chosen_merged and (chosen_fits or not last_merged):
+        header_end = min(total_lines, chosen_hdr_lines)
         blocks: list[str] = []
-        range_labels = []
-        if merged[0][0] > header_end + 6:
+        if chosen_merged[0][0] > header_end + 6:
             hdr_body = "\n".join(lines[:header_end])
             blocks.append(f"# [Lines 1-{header_end}: file header]\n{hdr_body}")
             range_labels.append(f"1-{header_end}")
-        elif merged[0][0] <= header_end + 6:
-            merged[0][0] = 1
-
+        else:
+            chosen_merged[0][0] = 1
         prev_end = header_end if range_labels else 0
-        for s_ln, e_ln in merged:
+        saw_gap = False
+        for s_ln, e_ln in chosen_merged:
             if prev_end and s_ln > prev_end + 1:
-                blocks.append(f"... [lines {prev_end + 1}-{s_ln - 1} omitted; read_file for full context] ...")
+                blocks.append(_gap_line(prev_end + 1, s_ln - 1, not saw_gap))
+                saw_gap = True
             chunk_body = "\n".join(lines[s_ln - 1 : e_ln])
             blocks.append(f"# [Lines {s_ln}-{e_ln}: active edit region]\n{chunk_body}")
             range_labels.append(f"{s_ln}-{e_ln}")
             prev_end = e_ln
-
         if prev_end < total_lines:
             blocks.append(f"... [lines {prev_end + 1}-{total_lines} omitted] ...")
-
         assembled = "\n".join(blocks)
-        if len(assembled) <= cap:
-            break
+
+    # If even ctx=0 exceeds cap across multiple hunks, water-fill per-hunk line budgets so every hunk stays visible
+    if (not chosen_fits or len(assembled) > cap) and last_merged:
+        hdr_lines = 8 if cap >= 900 else 0
+        header_end = min(total_lines, hdr_lines)
+        wf_merged = [[s_ln, e_ln] for s_ln, e_ln in last_merged]
+        has_sep_hdr = hdr_lines > 0 and wf_merged[0][0] > header_end + 4
+        if hdr_lines > 0 and not has_sep_hdr:
+            wf_merged[0][0] = 1
+        hdr_block = f"# [Lines 1-{header_end}: file header]\n" + "\n".join(lines[:header_end]) if has_sep_hdr else ""
+
+        # Compute exact fixed decorator overhead so every remaining char goes to code lines
+        overhead = (len(hdr_block) + 1) if hdr_block else 0
+        prev_e_est = header_end if has_sep_hdr else 0
+        saw_gap_est = False
+        for s_ln, e_ln in wf_merged:
+            if prev_e_est and s_ln > prev_e_est + 1:
+                overhead += len(_gap_line(prev_e_est + 1, s_ln - 1, not saw_gap_est)) + 1
+                saw_gap_est = True
+            overhead += len(f"# [Lines {s_ln}-{e_ln}: active edit region (trimmed from {e_ln})]\n") + 1
+            prev_e_est = e_ln
+        if prev_e_est < total_lines:
+            overhead += len(f"... [lines {prev_e_est + 1}-{total_lines} omitted] ...") + 1
+
+        avail_hunks = max(0, cap - overhead)
+        if avail_hunks >= len(wf_merged) * 60:
+            raw_lens = [_span_chars(s_ln, e_ln) for s_ln, e_ln in wf_merged]
+            hunk_budgets = [0] * len(wf_merged)
+            remaining_idx = list(range(len(wf_merged)))
+            rem_budget = avail_hunks
+            # Water-filling: keep short hunks intact and distribute surplus to longer hunks
+            while remaining_idx:
+                share = rem_budget // len(remaining_idx)
+                fitted = [i for i in remaining_idx if raw_lens[i] <= share]
+                if not fitted:
+                    for i in remaining_idx:
+                        hunk_budgets[i] = max(50, share)
+                    break
+                for i in fitted:
+                    hunk_budgets[i] = raw_lens[i]
+                    rem_budget -= raw_lens[i]
+                remaining_idx = [i for i in remaining_idx if i not in fitted]
+
+            wf_blocks: list[str] = []
+            wf_labels: list[str] = []
+            if has_sep_hdr:
+                wf_blocks.append(hdr_block)
+                wf_labels.append(f"1-{header_end}")
+            prev_end = header_end if has_sep_hdr else 0
+            saw_gap = False
+            for idx_h, (s_ln, e_ln) in enumerate(wf_merged):
+                if prev_end and s_ln > prev_end + 1:
+                    wf_blocks.append(_gap_line(prev_end + 1, s_ln - 1, not saw_gap))
+                    saw_gap = True
+                h_cap = hunk_budgets[idx_h]
+                h_lines = lines[s_ln - 1 : e_ln]
+                kept_h: list[str] = []
+                used_h = 0
+                for ln in h_lines:
+                    add_len = len(ln) + (1 if kept_h else 0)
+                    if kept_h and used_h + add_len > h_cap:
+                        break
+                    kept_h.append(ln)
+                    used_h += add_len
+                if not kept_h and h_lines:
+                    kept_h.append(h_lines[0][: max(40, h_cap)])
+                shown_e = s_ln + len(kept_h) - 1
+                chunk_body = "\n".join(kept_h)
+                if shown_e < e_ln:
+                    wf_blocks.append(
+                        f"# [Lines {s_ln}-{shown_e}: active edit region (trimmed from {e_ln})]\n{chunk_body}"
+                    )
+                else:
+                    wf_blocks.append(f"# [Lines {s_ln}-{shown_e}: active edit region]\n{chunk_body}")
+                wf_labels.append(f"{s_ln}-{shown_e}")
+                prev_end = shown_e
+            if prev_end < total_lines:
+                wf_blocks.append(f"... [lines {prev_end + 1}-{total_lines} omitted] ...")
+            wf_assembled = "\n".join(wf_blocks)
+            if len(wf_assembled) <= cap:
+                assembled = wf_assembled
+                range_labels = wf_labels
+        if not assembled:
+            # Fallback if cap is too tiny even for water-filling: assemble ctx=0 once for middle clip
+            header_end = min(total_lines, 8)
+            fb_blocks: list[str] = []
+            fb_labels: list[str] = []
+            if last_merged[0][0] > header_end + 6:
+                fb_blocks.append(f"# [Lines 1-{header_end}: file header]\n" + "\n".join(lines[:header_end]))
+                fb_labels.append(f"1-{header_end}")
+            prev_end = header_end if fb_labels else 0
+            for s_ln, e_ln in last_merged:
+                if prev_end and s_ln > prev_end + 1:
+                    fb_blocks.append(_gap_line(prev_end + 1, s_ln - 1, False))
+                fb_blocks.append(f"# [Lines {s_ln}-{e_ln}: active edit region]\n" + "\n".join(lines[s_ln - 1 : e_ln]))
+                fb_labels.append(f"{s_ln}-{e_ln}")
+                prev_end = e_ln
+            if prev_end < total_lines:
+                fb_blocks.append(f"... [lines {prev_end + 1}-{total_lines} omitted] ...")
+            assembled = "\n".join(fb_blocks)
+            range_labels = fb_labels
 
     return _clip_text_middle(assembled, cap), f", hunk lines {'/'.join(range_labels)}"
 
@@ -1428,3 +1716,858 @@ def extract_checkpoint_attachment_refs(cp_content: str, media_step_by_name: dict
             else:
                 refs.append(f"#{req_no} `{bname}`")
     return refs
+
+
+_MILESTONE_STOPWORDS = frozenset(
+    {
+        "the", "and", "for", "with", "from", "that", "this", "into", "onto", "over", "under",
+        "when", "only", "also", "fixed", "fix", "updated", "update", "added", "add", "removed",
+        "remove", "cleaned", "clean", "verified", "verify", "pass", "fail", "passed", "failed",
+        "tests", "test", "file", "files", "code", "line", "lines", "step", "steps", "summary",
+        "done", "all", "new", "old", "user", "not", "are", "was", "were", "has", "have", "had",
+        "can", "may", "will", "must", "should", "never", "always", "keep", "kept", "using",
+        "use", "used", "after", "before", "during", "based", "check", "checks", "checked",
+        "run", "running", "current", "existing", "other", "more", "most", "both", "each",
+    }
+)
+
+_WORKSPACE_LIST_IGNORE = frozenset(
+    {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache"}
+)
+
+
+def is_likely_raw_log_paste(txt: str) -> bool:
+    """Return True if a long pre-window user paste looks like an unstructured raw log/UI dump rather than a structured handoff."""
+    if len(txt) < 1600:
+        return False
+    if _strip_leading_ui_tool_badges(txt) != txt:
+        return True
+    if len(txt) >= 2200 and not _rx("STRUCTURED_MD_HEADING").search(txt):
+        return True
+    return False
+
+
+_GENERIC_MILESTONE_BASENAMES = frozenset(
+    {"readme.md", "skill.md", "__init__.py", "index.js", "index.ts", "index.mjs", "main.py", "config.json"}
+)
+
+_SKIP_MILESTONE_CONTAINER_PREFIXES = (
+    "in progress",
+    "pending",
+    "remaining",
+    "todo",
+    "blocked",
+    "verification result",
+    "scratch file",
+    "minor cli",
+    "minor diagnostic",
+)
+
+
+def _shorten_milestone_paths(text: str) -> str:
+    """Shorten long absolute file paths inside backticks to compact basenames so milestone budgets retain details."""
+    if "`" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        q1 = text.find("`", pos)
+        if q1 < 0:
+            out.append(text[pos:])
+            break
+        q2 = text.find("`", q1 + 1)
+        if q2 < 0:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : q1 + 1])
+        inner = text[q1 + 1 : q2]
+        if (
+            len(inner) > 28
+            and " " not in inner
+            and ("\\" in inner or "/" in inner)
+            and not inner.startswith(("http://", "https://"))
+        ):
+            norm = inner.replace("\\", "/").rstrip("/")
+            parts = [p for p in norm.split("/") if p]
+            if len(parts) >= 2:
+                base = parts[-1]
+                short = f"{parts[-2]}/{base}" if base.lower() in _GENERIC_MILESTONE_BASENAMES else base
+                out.append(short)
+            else:
+                out.append(inner)
+        else:
+            out.append(inner)
+        out.append("`")
+        pos = q2 + 1
+    return "".join(out)
+
+
+_MILESTONE_DANGLING_TAILS = (
+    " and",
+    " or",
+    " with",
+    " from",
+    " for",
+    " to",
+    " of",
+    " in",
+    " on",
+    " at",
+    " via",
+    " by",
+    " &",
+    " /",
+    " +",
+    " ->",
+    " =>",
+    " |",
+)
+
+_MILESTONE_TAIL_PUNCT = " ,;:-(&/[—–"
+
+
+def _find_unclosed_code_span(s: str) -> tuple[int, int]:
+    """Scan inline backtick code spans (single or multi-backtick) and return `(open_pos, fence_len)` if unclosed."""
+    if "`" not in s:
+        return -1, 0
+    n = len(s)
+    i = 0
+    open_pos = -1
+    open_len = 0
+    while i < n:
+        ch = s[i]
+        if ch != "`":
+            i += 1
+            continue
+        j = i + 1
+        while j < n and s[j] == "`":
+            j += 1
+        run = j - i
+        if open_pos < 0:
+            open_pos = i
+            open_len = run
+        elif run == open_len:
+            # Tolerate a literal backtick wrapped in quotes inside a single-backtick span (e.g. `` `close_tok = "`"` ``)
+            if (
+                open_len == 1
+                and i > open_pos + 1
+                and j < n
+                and s[i - 1] in ('"', "'")
+                and s[j] == s[i - 1]
+                and s.find("`", j + 1) >= 0
+            ):
+                i = j
+                continue
+            open_pos = -1
+            open_len = 0
+        i = j
+    return open_pos, open_len
+
+
+def _clip_milestone_text(text: str, max_chars: int, *, add_ellipsis: bool = True) -> str:
+    """Clip a milestone item to `max_chars` on a clean boundary with balanced inline backticks."""
+    if len(text) <= max_chars:
+        return text
+    suffix = "..." if add_ellipsis else ""
+    limit = max(1, max_chars - len(suffix))
+    raw_cut = text[:limit]
+
+    # If cutting inside a backtick code span, close long single-backtick identifiers cleanly or roll back before span
+    unclosed_pos, unclosed_len = _find_unclosed_code_span(raw_cut)
+    if unclosed_pos >= 0:
+        inside = raw_cut[unclosed_pos + unclosed_len :]
+        if add_ellipsis and unclosed_len == 1 and len(inside) >= 18:
+            close_tok = "...`"
+            inner_end = max(unclosed_pos + 1, max_chars - len(close_tok))
+            inner = text[unclosed_pos + 1 : inner_end]
+            sep_pos = max(inner.rfind(sep) for sep in ("_", "/", ".", "-", " "))
+            if sep_pos >= int(len(inner) * 0.65):
+                inner = inner[:sep_pos]
+            inner = inner.rstrip(" ,;:-_/.(")
+            if len(inner) >= 12:
+                return text[: unclosed_pos + 1] + inner + close_tok
+        cut = (
+            raw_cut[:unclosed_pos].rstrip(_MILESTONE_TAIL_PUNCT)
+            if unclosed_pos > 0
+            else raw_cut.rstrip(_MILESTONE_TAIL_PUNCT)
+        )
+    else:
+        cut = raw_cut
+        if limit < len(text) and not text[limit].isspace() and text[limit] not in ",.;:)]" and " " in cut:
+            sp = cut.rfind(" ")
+            min_sp = 12 if not add_ellipsis else int(limit * 0.65)
+            last_bt = cut.rfind("`")
+            while sp >= min_sp and sp <= last_bt and _find_unclosed_code_span(cut[:sp])[0] >= 0:
+                sp = cut.rfind(" ", 0, sp)
+            if sp >= min_sp:
+                cut = cut[:sp]
+        cut = cut.rstrip()
+
+    rem_open, _ = _find_unclosed_code_span(cut)
+    if rem_open > 0:
+        cut = cut[:rem_open].rstrip(_MILESTONE_TAIL_PUNCT)
+    while True:
+        prev_cut = cut
+        cut = cut.rstrip(_MILESTONE_TAIL_PUNCT)
+        low_cut = cut.lower()
+        for trail in _MILESTONE_DANGLING_TAILS:
+            if low_cut.endswith(trail) and len(cut) > len(trail) + 10:
+                cut = cut[: -len(trail)].rstrip(_MILESTONE_TAIL_PUNCT)
+                break
+        if cut == prev_cut:
+            break
+    cleaned_cut = cut
+    return (cleaned_cut + suffix) if cleaned_cut else text[:limit].rstrip() + suffix
+
+
+def _clean_milestone_bullet(raw: str, max_chars: int = 135) -> str:
+    s = " ".join(raw.strip().split())
+    if s.startswith("**"):
+        close = s.find("**", 2)
+        if close > 2:
+            head = s[2:close].strip().rstrip(":.")
+            rest = s[close + 2 :].strip().lstrip(":").strip()
+            s = f"{head}: {rest}" if rest else head
+    s = _shorten_milestone_paths(s).rstrip(":.").strip()
+    return _clip_milestone_text(s, max_chars)
+
+
+def _is_line_ref_token(tok: str) -> bool:
+    """Return True for transient line-number references such as `l1533` or `l1533-l1567`."""
+    if len(tok) < 2 or tok[0] != "l":
+        return False
+    body = tok[1:]
+    if "-" in body:
+        a, _, b = body.partition("-")
+        if b.startswith("l"):
+            b = b[1:]
+        return a.isdigit() and b.isdigit()
+    return body.isdigit()
+
+
+def _milestone_signature_tokens(text: str) -> tuple[set[str], set[str]]:
+    """Return `(all_tokens, code_tokens)` for deduplicating milestones against newer checkpoints."""
+    all_toks: set[str] = set()
+    code_toks: set[str] = set()
+    stopwords = _MILESTONE_STOPWORDS
+    for m in _rx("MILESTONE_TOKEN").finditer(text):
+        g_code, g_ascii, g_cjk = m.group(1), m.group(2), m.group(3)
+        if g_code:
+            raw_c = g_code.strip()
+            # Normalize `var = val` assignments and `func(arg)` call signatures to the core symbol
+            if "=" in raw_c:
+                lhs = raw_c.split("=", 1)[0].strip()
+                if lhs and " " not in lhs:
+                    raw_c = lhs
+            p_idx = raw_c.find("(")
+            if p_idx >= 3:
+                raw_c = raw_c[:p_idx].strip()
+            if "\\" in raw_c or "/" in raw_c:
+                raw_c = _fast_basename(raw_c)
+            tok = raw_c.lower().rstrip(":.,;)")
+            if (
+                len(tok) >= 3
+                and tok not in stopwords
+                and not _is_line_ref_token(tok)
+                and any(ch.isalpha() for ch in tok)
+            ):
+                all_toks.add(tok)
+                code_toks.add(tok)
+        elif g_ascii:
+            raw_a = _fast_basename(g_ascii) if ("/" in g_ascii or "\\" in g_ascii) else g_ascii
+            tok = raw_a.lower()
+            if len(tok) >= 4 and tok not in stopwords and not _is_line_ref_token(tok):
+                all_toks.add(tok)
+        elif g_cjk:
+            all_toks.add(g_cjk)
+    return all_toks, code_toks
+
+
+def _compact_parent_milestone_label(cleaned: str) -> str:
+    """Compress a container bullet header (e.g. `Modified `rehydrate_helpers.py``) for prefixing child milestones."""
+    if "`" in cleaned:
+        q1 = cleaned.find("`")
+        q2 = cleaned.find("`", q1 + 1)
+        if q1 >= 0 and q2 > q1 + 1:
+            low = cleaned[:q1].strip().lower()
+            if low in ("", "modified", "updated", "added", "created", "fixed", "in"):
+                return cleaned[q1 : q2 + 1]
+    label = cleaned.rstrip(".").strip()
+    if len(label) > 54 and label.endswith(")"):
+        p_open = label.rfind(" (")
+        if p_open >= 10 and "`" not in label[p_open:] and _find_unclosed_code_span(label[:p_open])[0] < 0:
+            label = label[:p_open].strip()
+    return _clip_milestone_text(label, 54, add_ellipsis=False)
+
+
+def extract_checkpoint_milestones(cp_content: str) -> tuple[list[str], list[str]]:
+    """Extract concise completed milestones, key fixes/findings, and `Commitments/Constraints` from a `CHECKPOINT` summary."""
+    if not cp_content:
+        return [], []
+    m_sum = _rx("SUMMARY_BLOCK").search(cp_content)
+    body = m_sum.group(1) if m_sum else cp_content
+    primary_done: list[str] = []
+    secondary_findings: list[str] = []
+    constraint_items: list[str] = []
+    sec_kind = ""
+    parent_stack: list[tuple[int, str, int]] = []
+    next_container_id = 1
+    container_emitted: dict[int, int] = {}
+    findings_last_idx_by_cid: dict[int, int] = {}
+    skip_below_indent: int | None = None
+
+    for line in body.splitlines():
+        s_ln = line.strip()
+        if not s_ln:
+            continue
+        if s_ln.startswith("#"):
+            parent_stack.clear()
+            skip_below_indent = None
+            low = s_ln.lstrip("#").strip().lower()
+            i = 0
+            while i < len(low) and low[i].isdigit():
+                i += 1
+            if i > 0 and i < len(low) and low[i] in (".", ")", ":"):
+                low = low[i + 1 :].strip()
+            if any(
+                k in low
+                for k in (
+                    "in progress",
+                    "pending",
+                    "remaining",
+                    "todo",
+                    "next step",
+                    "not started",
+                    "blocked",
+                    "active context",
+                    "task overview",
+                )
+            ):
+                sec_kind = ""
+            elif any(k in low for k in ("done", "completed", "resolved design decision", "key decision", "progress")):
+                sec_kind = "done"
+            elif any(
+                k in low
+                for k in ("errors & fixes", "errors and fixes", "bugs & fixes", "bugs and fixes", "key findings")
+            ):
+                sec_kind = "findings"
+            elif "commitment" in low or "constraint" in low:
+                sec_kind = "constraints"
+            else:
+                sec_kind = ""
+            continue
+        if not sec_kind:
+            continue
+
+        expanded = line.replace("\t", "  ")
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        if not (s_ln.startswith("- ") or s_ln.startswith("* ")):
+            continue
+
+        if skip_below_indent is not None:
+            if indent > skip_below_indent:
+                continue
+            skip_below_indent = None
+
+        while parent_stack and parent_stack[-1][0] >= indent:
+            parent_stack.pop()
+
+        b_raw = s_ln[2:].strip()
+        if not b_raw:
+            continue
+
+        if sec_kind == "constraints":
+            if indent == 0:
+                cleaned_c = _clean_milestone_bullet(b_raw, max_chars=120)
+                if len(cleaned_c) >= 12 and len(constraint_items) < 4:
+                    constraint_items.append(cleaned_c)
+            continue
+
+        cleaned_raw = _clean_milestone_bullet(b_raw, max_chars=140)
+        low_clean = cleaned_raw.lower()
+        if any(low_clean.startswith(pref) for pref in _SKIP_MILESTONE_CONTAINER_PREFIXES):
+            skip_below_indent = indent
+            continue
+
+        is_container = b_raw.endswith(":") and (b_raw.endswith(("**:", "`:")) or len(b_raw) <= 95)
+        if is_container:
+            if len(cleaned_raw) >= 4:
+                parent_stack.append((indent, _compact_parent_milestone_label(cleaned_raw), next_container_id))
+                next_container_id += 1
+            continue
+
+        # Leaf bullet: combine with innermost parent container label when indented
+        if indent > 0 and not parent_stack:
+            continue
+        if len(cleaned_raw) < 12:
+            continue
+
+        parent_label = parent_stack[-1][1] if parent_stack else ""
+        parent_cid = parent_stack[-1][2] if parent_stack else 0
+        per_container_max = 3 if sec_kind == "done" else 2
+
+        if parent_label:
+            p_check = parent_label.strip("`").lower()
+            child_self_anchored = (
+                sec_kind == "done"
+                and not parent_label.startswith("`")
+                and cleaned_raw.startswith("`")
+                and ": " in cleaned_raw[:64]
+                and len(parent_label) + 2 + len(cleaned_raw) > 140
+            )
+            if (p_check and p_check in cleaned_raw.lower()) or child_self_anchored:
+                item = _clip_milestone_text(cleaned_raw, 140)
+            elif sec_kind == "findings" and cleaned_raw.lower().startswith(("fix:", "resolved:", "root cause:")):
+                item = _clip_milestone_text(f"{parent_label} -> {cleaned_raw}", 145)
+            else:
+                item = _clip_milestone_text(f"{parent_label}: {cleaned_raw}", 140)
+        else:
+            item = _clip_milestone_text(cleaned_raw, 135)
+
+        if sec_kind == "done":
+            if parent_cid:
+                if container_emitted.get(parent_cid, 0) >= per_container_max:
+                    continue
+                container_emitted[parent_cid] = container_emitted.get(parent_cid, 0) + 1
+            if len(primary_done) < 8:
+                primary_done.append(item)
+        elif sec_kind == "findings":
+            # In Errors & Fixes, upgrade a prior symptom leaf under the same Error container with its `Fix:` leaf
+            if (
+                parent_cid
+                and cleaned_raw.lower().startswith(("fix:", "resolved:"))
+                and parent_cid in findings_last_idx_by_cid
+            ):
+                secondary_findings[findings_last_idx_by_cid[parent_cid]] = item
+                continue
+            if parent_cid:
+                if container_emitted.get(parent_cid, 0) >= per_container_max:
+                    continue
+                container_emitted[parent_cid] = container_emitted.get(parent_cid, 0) + 1
+            if len(secondary_findings) < 4:
+                if parent_cid and not cleaned_raw.lower().startswith(("fix:", "resolved:")):
+                    findings_last_idx_by_cid[parent_cid] = len(secondary_findings)
+                secondary_findings.append(item)
+
+    done_items = (primary_done[:8] + secondary_findings[:4])[:10]
+    return done_items, constraint_items
+
+
+def build_anti_decay_milestone_digest(
+    prev_checkpoints: list[tuple[int, int, str]],
+    latest_cp_content: str,
+    transcript_path: Path | None,
+    budget_chars: int = 1200,
+) -> tuple[str, int]:
+    """Summarize earlier checkpoint milestones no longer covered by the latest `<CONTEXT_SUMMARY>`, with line pointers."""
+    if not prev_checkpoints or budget_chars < 220:
+        return "", 0
+
+    latest_low = latest_cp_content.lower()
+    latest_toks, _ = _milestone_signature_tokens(latest_cp_content)
+
+    # Scan newest earlier checkpoint -> oldest so the richest surviving wording wins on dedup
+    kept_token_sets: list[set[str]] = []
+    by_cp: dict[tuple[int, int], list[str]] = {}
+    for cp_step, cp_line, cp_txt in reversed(prev_checkpoints):
+        done_items, constraint_items = extract_checkpoint_milestones(cp_txt)
+        candidates = [(item, False) for item in done_items] + [(item, True) for item in constraint_items]
+        for item, is_constraint in candidates:
+            all_toks, code_toks = _milestone_signature_tokens(item)
+            if not all_toks:
+                continue
+            if item.lower() in latest_low:
+                continue
+            direct_hits = all_toks & latest_toks
+            overlap_latest = len(direct_hits)
+            if overlap_latest < len(all_toks):
+                overlap_latest += sum(1 for t in (all_toks - direct_hits) if t in latest_low)
+            code_missing = [t for t in code_toks if t not in latest_low]
+            # Still well-covered in latest summary -> skip to avoid duplication
+            if code_toks and not code_missing:
+                if len(code_toks) >= 2 or overlap_latest / len(all_toks) >= 0.45:
+                    continue
+            if overlap_latest / len(all_toks) >= 0.60 and not (code_toks and len(code_missing) == len(code_toks)):
+                continue
+            # Deduplicate against a newer earlier-checkpoint milestone already kept
+            if any(
+                len(all_toks & prev_ts) / max(1, min(len(all_toks), len(prev_ts))) >= 0.60
+                for prev_ts in kept_token_sets
+            ):
+                continue
+            kept_token_sets.append(all_toks)
+            label = f"[Constraint] {item}" if is_constraint else item
+            by_cp.setdefault((cp_step, cp_line), []).append(label)
+
+    if not by_cp:
+        return "", 0
+
+    path_hint = f"`{transcript_path}`" if transcript_path else "`transcript_full.jsonl`"
+    note = (
+        f"*(Earlier milestones from prior checkpoints no longer detailed in `<CONTEXT_SUMMARY>`; "
+        f"`read_file` {path_hint} at the cited line for full archived summary)*"
+    )
+    avail = budget_chars - len(note) - 2
+    if avail < 100:
+        return "", 0
+
+    # Prefer keeping the most recent dropped checkpoints first, then display chronologically.
+    # Cap per-checkpoint items when multiple checkpoints have decayed items so older checkpoints aren't starved.
+    selected_rows: list[tuple[int, int, str, int]] = []
+    used = 0
+    per_cp_limit = 4 if len(by_cp) >= 2 else 8
+    for cp_step, cp_line in sorted(by_cp.keys(), reverse=True):
+        items = by_cp[(cp_step, cp_line)][:per_cp_limit]
+        prefix = f"- [cp @ step {cp_step}, line {cp_line}]: " if cp_line > 0 else f"- [cp @ step {cp_step}]: "
+        row_items: list[str] = []
+        row_len = len(prefix)
+        for it in items:
+            sep_len = 2 if row_items else 0
+            if used + row_len + sep_len + len(it) + (1 if selected_rows else 0) > avail:
+                break
+            row_items.append(it)
+            row_len += sep_len + len(it)
+        if row_items:
+            row_str = prefix + "; ".join(row_items)
+            selected_rows.append((cp_step, cp_line, row_str, len(row_items)))
+            used += len(row_str) + 1
+
+    if not selected_rows:
+        return "", 0
+    selected_rows.sort(key=lambda x: x[0])
+    total_count = sum(cnt for _, _, _, cnt in selected_rows)
+    return note + "\n" + "\n".join(row for _, _, row, _ in selected_rows), total_count
+
+
+def _format_rel_or_abs(p: Path, workspace_roots: list[Path]) -> str:
+    for root in workspace_roots:
+        if _is_subpath(p, root):
+            try:
+                rel = p.relative_to(root)
+                rel_s = str(rel)
+                if rel_s and rel_s != ".":
+                    return f"{root.name}/{rel_s}" if len(workspace_roots) > 1 else rel_s
+            except ValueError:
+                pass
+    return str(p)
+
+
+def build_workspace_reality_notice(
+    modified_touch: dict[str, tuple[str, int, list[str], int]],
+    read_touch: dict[str, tuple[str, int, tuple[int | None, int | None]]],
+    path_touch_epoch: dict[str, tuple[int, float]],
+    target_cp_content: str,
+    workspace_roots: list[Path] | None,
+    injected_file_keys: set[str],
+    excluded_roots: list[Path] | None = None,
+    max_chars: int = 1200,
+    resolve_cache: dict[str, Path | None] | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Detect missing/stale workspace paths, external disk edits, and uninjected modified files with zero leakage."""
+    empty_counts = {
+        "stale_paths": 0,
+        "externally_modified_files": 0,
+        "uninjected_modified_files": 0,
+    }
+    if not workspace_roots or max_chars < 180:
+        return "", empty_counts
+
+    rcache = resolve_cache if resolve_cache is not None else {}
+    roots = list(workspace_roots)
+    root_prefixes = _prepare_root_prefixes(roots, rcache)
+    excl_prefixes = _prepare_root_prefixes(excluded_roots, rcache)
+    root_entries: list[tuple[Path, str]] = []
+    for r in roots:
+        rr = _resolve_path_cached(str(r), rcache)
+        root_entries.append((r, _norm_path_for_prefix(rr if rr is not None else r)))
+    root_keys = {rk for _, rk in root_entries}
+
+    stat_cache: dict[str, os.stat_result | None] = {}
+
+    def _cached_stat(p: Path) -> os.stat_result | None:
+        sk = _norm_path_for_prefix(p)
+        hit = stat_cache.get(sk, _CACHE_MISS)
+        if hit is not _CACHE_MISS:
+            return hit  # type: ignore[return-value]
+        try:
+            st = os.stat(p)
+        except OSError:
+            st = None
+        stat_cache[sk] = st
+        return st
+
+    # 1. Missing workspace paths (from successful tool touches + explicit paths in <CONTEXT_SUMMARY>)
+    missing_raw: dict[str, Path] = {}
+    tracked_resolved: dict[str, Path | None] = {}
+    for store in (modified_touch, read_touch):
+        for key, item in store.items():
+            if key in tracked_resolved:
+                continue
+            p_str = item[0]
+            ok, resolved = is_trackable_workspace_path(
+                p_str,
+                workspace_roots=roots,
+                excluded_roots=excluded_roots,
+                resolve_cache=rcache,
+                _allowed_prefixes=root_prefixes,
+                _excluded_prefixes=excl_prefixes,
+            )
+            tracked_resolved[key] = resolved if ok else None
+            if ok and resolved is not None:
+                res_norm = _norm_path_for_prefix(resolved)
+                if res_norm not in root_keys and _cached_stat(resolved) is None:
+                    missing_raw[res_norm] = resolved
+
+    if target_cp_content:
+        seen_raw_cands: set[str] = set()
+        for m in _rx("ABS_PATH_REF").finditer(target_cp_content):
+            raw_cand = m.group(0).partition("#")[0].rstrip(".,:;`'\"*)")
+            if not raw_cand or "*" in raw_cand or "?" in raw_cand:
+                continue
+            # Strip trailing :line or :line:col suffix while preserving Windows drive colon (index 1)
+            while len(raw_cand) > 3:
+                cpos = raw_cand.rfind(":")
+                if cpos > 2 and raw_cand[cpos + 1 :].isdigit():
+                    raw_cand = raw_cand[:cpos]
+                else:
+                    break
+            # Ignore truncated prefix right before brace-expansion `{a,b}`
+            end_pos = m.end()
+            if end_pos < len(target_cp_content) and target_cp_content[end_pos] == "{":
+                continue
+            cand_key = raw_cand.lower() if os.name == "nt" else raw_cand
+            if cand_key in seen_raw_cands:
+                continue
+            seen_raw_cands.add(cand_key)
+            ok, resolved = is_trackable_workspace_path(
+                raw_cand,
+                workspace_roots=roots,
+                excluded_roots=excluded_roots,
+                resolve_cache=rcache,
+                _allowed_prefixes=root_prefixes,
+                _excluded_prefixes=excl_prefixes,
+            )
+            if ok and resolved is not None:
+                res_norm = _norm_path_for_prefix(resolved)
+                if res_norm not in root_keys and _cached_stat(resolved) is None:
+                    missing_raw[res_norm] = resolved
+
+    # Collapse missing children into their highest missing ancestor under a workspace root
+    collapsed_missing: dict[str, tuple[Path, int, Path]] = {}
+    affected_roots: list[Path] = []
+    seen_affected_roots: set[str] = set()
+    for mp_norm, mp in missing_raw.items():
+        containing = next(((r, r_norm) for r, r_norm in root_entries if _is_subpath_norm(mp_norm, r_norm)), None)
+        if containing is None:
+            continue
+        containing_root, root_norm = containing
+        cur = mp
+        while cur.parent != cur:
+            par = cur.parent
+            par_norm = _norm_path_for_prefix(par)
+            if par_norm == root_norm or not _is_subpath_norm(par_norm, root_norm):
+                break
+            if _cached_stat(par) is not None:
+                break
+            cur = par
+        ck = _norm_path_for_prefix(cur)
+        prev = collapsed_missing.get(ck)
+        if prev is None:
+            collapsed_missing[ck] = (cur, 1, containing_root)
+        else:
+            collapsed_missing[ck] = (prev[0], prev[1] + 1, prev[2])
+        if root_norm not in seen_affected_roots:
+            seen_affected_roots.add(root_norm)
+            affected_roots.append(containing_root)
+
+    # 2. Externally modified existing files (not already live-read into Section 4)
+    ext_modified: list[tuple[int, Path]] = []
+    seen_ext_keys: set[str] = set()
+    for store in (modified_touch, read_touch):
+        for key in store:
+            if key in injected_file_keys or key in seen_ext_keys or key not in path_touch_epoch:
+                continue
+            resolved = tracked_resolved.get(key)
+            if resolved is None:
+                continue
+            st = _cached_stat(resolved)
+            if st is None or (st.st_mode & 0o170000) != 0o100000:
+                continue
+            t_step, t_epoch = path_touch_epoch[key]
+            if st.st_mtime > t_epoch + 5.0:
+                seen_ext_keys.add(key)
+                ext_modified.append((t_step, resolved))
+    ext_modified.sort(key=lambda x: x[0], reverse=True)
+
+    # 3. Existing modified files omitted from Section 4 (only when ZERO modified files were injected)
+    any_mod_injected = any(k in injected_file_keys for k in modified_touch)
+    uninjected_mods: list[tuple[int, Path, bool]] = []
+    if not any_mod_injected and modified_touch:
+        for key, (_, st_idx, _, _) in sorted(modified_touch.items(), key=lambda x: x[1][1], reverse=True):
+            resolved = tracked_resolved.get(key)
+            if resolved is None:
+                continue
+            st = _cached_stat(resolved)
+            if st is None or (st.st_mode & 0o170000) != 0o100000:
+                continue
+            uninjected_mods.append((st_idx, resolved, key in seen_ext_keys))
+
+    if not collapsed_missing and not ext_modified and not uninjected_mods:
+        return "", empty_counts
+
+    sorted_missing = (
+        sorted(collapsed_missing.values(), key=lambda x: (-x[1], str(x[0]).lower())) if collapsed_missing else []
+    )
+    live_entries_by_root: list[tuple[Path, list[str]]] = []
+    if collapsed_missing:
+        for ws_root in affected_roots[:2]:
+            try:
+                entries: list[str] = []
+                with os.scandir(ws_root) as it:
+                    for ent in it:
+                        name = ent.name
+                        if name in _WORKSPACE_LIST_IGNORE or name.startswith(".tmp_"):
+                            continue
+                        try:
+                            is_d = ent.is_dir(follow_symlinks=False)
+                        except OSError:
+                            is_d = False
+                        entries.append(f"`{name}/`" if is_d else f"`{name}`")
+                entries.sort(key=str.lower)
+                if entries:
+                    live_entries_by_root.append((ws_root, entries))
+            except OSError:
+                pass
+
+    def _render_notice_lines(
+        max_missing: int,
+        max_roots: int,
+        max_entries: int,
+        max_ext: int,
+        max_uninj: int,
+        compact: bool,
+    ) -> list[str]:
+        out: list[str] = []
+        if sorted_missing:
+            shown_m: list[str] = []
+            for mp, cnt, _ in sorted_missing[:max_missing]:
+                if cnt > 1:
+                    shown_m.append(f"`{mp}` ({cnt} refs missing)")
+                else:
+                    shown_m.append(f"`{mp}`")
+            extra_m = f", +{len(sorted_missing) - max_missing} more" if len(sorted_missing) > max_missing else ""
+            if compact:
+                out.append(f"- **Stale / missing paths** (NOT on disk): {', '.join(shown_m)}{extra_m}")
+            else:
+                out.append(
+                    f"- **Stale / missing paths** (referenced in `<CONTEXT_SUMMARY>` or earlier steps, "
+                    f"NOT currently on disk): {', '.join(shown_m)}{extra_m}"
+                )
+            for ws_root, entries in live_entries_by_root[:max_roots]:
+                shown_e = ", ".join(entries[:max_entries])
+                more_e = f", +{len(entries) - max_entries} more" if len(entries) > max_entries else ""
+                out.append(f"- **Current live entries in `{ws_root}`**: {shown_e}{more_e}")
+
+        if ext_modified:
+            shown_ext = [
+                f"`{_format_rel_or_abs(rp, roots)}` (changed after step {st})"
+                for st, rp in ext_modified[:max_ext]
+            ]
+            more_ext = f", +{len(ext_modified) - max_ext} more" if len(ext_modified) > max_ext else ""
+            out.append(f"- **Modified on disk since last read/edit**: {', '.join(shown_ext)}{more_ext}")
+
+        if uninjected_mods:
+            shown_um = [
+                f"`{_format_rel_or_abs(rp, roots)}` (@ step {st}{', modified externally' if is_ext else ''})"
+                for st, rp, is_ext in uninjected_mods[:max_uninj]
+            ]
+            more_um = f", +{len(uninjected_mods) - max_uninj} more" if len(uninjected_mods) > max_uninj else ""
+            if compact:
+                out.append(
+                    "- **Modified files not injected in this payload** "
+                    f"(run `read_file` before editing): {', '.join(shown_um)}{more_um}"
+                )
+            else:
+                out.append(
+                    "- **Modified files not injected in this payload** "
+                    "(run `read_file` before editing or citing line numbers — do NOT rely on stale line numbers "
+                    f"in `<CONTEXT_SUMMARY>`): {', '.join(shown_um)}{more_um}"
+                )
+        return out
+
+    def _fit_bullet_line(line: str, limit: int) -> str:
+        if len(line) <= limit:
+            return line
+        pfx, sep, body = line.partition(": ")
+        if not sep or len(pfx) + 8 >= limit:
+            return line[: max(1, limit - 3)].rstrip() + "..."
+        avail = limit - len(pfx) - 2
+        if avail <= 6:
+            return f"{pfx}: ..."
+        parts = body.split(", ")
+        kept_parts: list[str] = []
+        for idx_p, part in enumerate(parts):
+            rem_count = len(parts) - idx_p - 1
+            suffix = f", +{rem_count} more" if rem_count > 0 else ""
+            cand = ", ".join(kept_parts + [part]) + suffix
+            if len(cand) <= avail:
+                kept_parts.append(part)
+            else:
+                break
+        if kept_parts:
+            rem_count = len(parts) - len(kept_parts)
+            suffix = f", +{rem_count} more" if rem_count > 0 else ""
+            return f"{pfx}: {', '.join(kept_parts)}{suffix}"
+        # Single item exceeds avail: clip cleanly inside backticks if present
+        first = parts[0]
+        if first.startswith("`"):
+            close_bt = first.find("`", 1)
+            if close_bt > 1:
+                inner = first[1:close_bt]
+                tail_note = first[close_bt + 1 :]
+                keep_inner = avail - len(tail_note) - 5
+                if keep_inner >= 8:
+                    return f"{pfx}: `...{inner[-keep_inner:]}`{tail_note}"
+        clipped = first[: max(1, avail - 3)].rstrip()
+        if clipped.count("`") % 2 == 1:
+            clipped = clipped[: max(1, len(clipped) - 1)] + "`"
+        return f"{pfx}: {clipped}..."
+
+    # Structured item-level shrinking preserves complete Markdown bullets (never mid-clips prose with `read_file`)
+    profiles = (
+        (6, 2, 15, 5, 5, False),
+        (4, 2, 10, 4, 4, False),
+        (3, 1, 8, 3, 3, True),
+        (2, 1, 6, 2, 2, True),
+        (1, 1, 4, 1, 1, True),
+    )
+    block = ""
+    tight_lines: list[str] = []
+    for prof in profiles:
+        cand_lines = _render_notice_lines(*prof)
+        tight_lines = cand_lines
+        cand_block = "\n".join(cand_lines)
+        if len(cand_block) <= max_chars:
+            block = cand_block
+            break
+
+    if not block and tight_lines:
+        kept_lines: list[str] = []
+        used_c = 0
+        for ln in tight_lines:
+            sep_len = 1 if kept_lines else 0
+            if used_c + sep_len + len(ln) <= max_chars:
+                kept_lines.append(ln)
+                used_c += sep_len + len(ln)
+            elif not kept_lines:
+                kept_lines.append(_fit_bullet_line(ln, max_chars))
+                used_c = len(kept_lines[0])
+                break
+        block = "\n".join(kept_lines)
+
+    return block, {
+        "stale_paths": len(collapsed_missing),
+        "externally_modified_files": len(ext_modified),
+        "uninjected_modified_files": len(uninjected_mods),
+    }
