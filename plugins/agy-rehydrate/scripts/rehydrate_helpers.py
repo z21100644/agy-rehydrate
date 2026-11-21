@@ -222,9 +222,33 @@ _REGEX_SPECS: dict[str, tuple[str, int]] = {
     ),
     "SUMMARY_BLOCK": (r"<summary>(.*?)</summary>", _RE_DOTALL),
     "MILESTONE_TOKEN": (
-        r"`([^`\n]{2,64})`|([A-Za-z_][A-Za-z0-9_.\-/]{2,48})|([\u4e00-\u9fff]{2,6})",
+        r"`([^`\n]+)`|([A-Za-z_][A-Za-z0-9_.\-/]{2,48})|([\u4e00-\u9fff]{2,6})",
         0,
     ),
+    "MILESTONE_INNER_TOKEN": (
+        r"([A-Za-z_][A-Za-z0-9_.\-/]{2,48})|([\u4e00-\u9fff]{2,6})",
+        0,
+    ),
+    "STATE_REMOVAL_CUE": (
+        r"(?i)(?<!not\s)(?<!never\s)(?<!don't\s)(?<!do not\s)(?<!without\s)"
+        r"(?:\b(?:was|were|has been|have been|already)\s+(?:removed|deleted|dropped|purged|cleaned up|decommissioned)\b"
+        r"|\b(?:removed|deleted)\s+by\s+(?:the\s+)?user\b"
+        r"|\bno longer exists?\b"
+        r"|\bnot (?:currently )?on disk\b)"
+        r"|(?:已被刪除|已被移除|已被删除|已刪除|已移除|已删除|不再存在)",
+        0,
+    ),
+    "EPHEMERAL_SCRATCH_REF": (
+        r"(?i)(?:^|[\s`(/\\])(?:scratch|tmp|temp)[/\\][^\s`)]+|\bprobe_[\w.-]+\.(?:m?js|cjs|py|sh)\b",
+        0,
+    ),
+    "ARCHIVED_FOCUS_CUE": (
+        r"(?i)(?:\(\s*archived\s*\)|\barchived\s*:|\b(?:completed|previous|previously)\s+earlier\s+focus\b"
+        r"|\bearlier\s+completed\s+focus\b|\bsuperseded\s+focus\b|已歸檔|已归档|前期已完成)",
+        0,
+    ),
+    "PARENTHETICAL_CLAUSE": (r"[(\uff08]([^()\uff08\uff09]+)[)\uff09]", 0),
+    "CLAUSE_SPLIT": (r"[;；]|(?:\.\s+)", 0),
     "ABS_PATH_REF": (
         r"(?:file:///)?(?:[A-Za-z]:[/\\][^\s`\"'<>|()\[\]{},;，。、；：（）「」『』【】《》]+|"
         r"/(?:Users|home|workspace|workspaces|srv|opt|var|mnt|Volumes|app|repo|src|root|private)/[^\s`\"'<>|()\[\]{},;，。、；：（）「」『』【】《》]+)",
@@ -1759,8 +1783,79 @@ _SKIP_MILESTONE_CONTAINER_PREFIXES = (
     "blocked",
     "verification result",
     "scratch file",
+    "scratch probe",
+    "scratch clone",
     "minor cli",
     "minor diagnostic",
+)
+
+_SKIP_STATE_PREFIXES = (
+    "scratch ",
+    "no running",
+    "background task",
+    "running task",
+    "active task",
+    "subagent",
+    "currently ",
+    "open file",
+    "open tab",
+    "in progress",
+    "pending",
+    "next step",
+    "todo",
+    "temporary ",
+    "temp ",
+)
+
+_STATE_DURABLE_CUES = (
+    "workspace",
+    "repo",
+    "repository",
+    "branch",
+    "commit",
+    "unmodified",
+    "modified",
+    "dirty",
+    "behind",
+    "ahead",
+    "minus",
+    "missing",
+    "without",
+    "unsynced",
+    "out of sync",
+    "not yet",
+    "diverged",
+    "checked out",
+    "checkout",
+    "worktree",
+    "extracted",
+    "environment",
+    "symlink",
+    "sandbox",
+    "工作區",
+    "工作区",
+    "分支",
+    "同步",
+    "落後",
+    "落后",
+    "未同步",
+    "未提交",
+    "未合併",
+    "未合并",
+    "目錄",
+    "目录",
+    "環境",
+    "环境",
+)
+
+_TRIVIAL_CODE_TOKENS = frozenset(
+    {
+        "none", "null", "true", "false", "ok", "yes", "no", "error", "errors",
+        "fix", "fixed", "status", "state", "output", "input", "result", "results",
+        "data", "value", "values", "config", "default", "defaults", "root",
+        "main", "head", "master", "local", "remote", "active", "pending",
+        "done", "clean", "readme.md",
+    }
 )
 
 
@@ -1783,6 +1878,25 @@ def _shorten_milestone_paths(text: str) -> str:
         out.append(text[pos : q1 + 1])
         inner = text[q1 + 1 : q2]
         if (
+            len(inner) > 44
+            and " " not in inner
+            and inner.startswith(("http://", "https://"))
+        ):
+            scheme_end = inner.find("://") + 3
+            slash = inner.find("/", scheme_end)
+            if slash > scheme_end:
+                host = inner[:slash]
+                segs = [p for p in inner[slash + 1 :].split("/") if p]
+                if len(segs) >= 3:
+                    tail = segs[-1]
+                    if len(tail) > 22:
+                        tail = tail[:10] + "..." + tail[-8:]
+                    out.append(f"{host}/.../{tail}")
+                else:
+                    out.append(inner)
+            else:
+                out.append(inner)
+        elif (
             len(inner) > 28
             and " " not in inner
             and ("\\" in inner or "/" in inner)
@@ -1921,16 +2035,37 @@ def _clip_milestone_text(text: str, max_chars: int, *, add_ellipsis: bool = True
     return (cleaned_cut + suffix) if cleaned_cut else text[:limit].rstrip() + suffix
 
 
-def _clean_milestone_bullet(raw: str, max_chars: int = 135) -> str:
+def _strip_list_marker(s_ln: str) -> str | None:
+    """Strip `- `, `* `, or ordered list prefix (`1. `, `2) `) from a stripped Markdown line."""
+    if s_ln.startswith("- ") or s_ln.startswith("* "):
+        return s_ln[2:].strip()
+    n = len(s_ln)
+    i = 0
+    while i < n and i < 3 and s_ln[i].isdigit():
+        i += 1
+    if 1 <= i <= 3 and i + 1 < n and s_ln[i] in (".", ")") and s_ln[i + 1] == " ":
+        return s_ln[i + 2 :].strip()
+    return None
+
+
+def _clean_milestone_bullet_full(raw: str) -> str:
+    """Normalize Markdown bold wrappers and long paths in a milestone bullet without length clipping."""
     s = " ".join(raw.strip().split())
     if s.startswith("**"):
         close = s.find("**", 2)
         if close > 2:
             head = s[2:close].strip().rstrip(":.")
             rest = s[close + 2 :].strip().lstrip(":").strip()
-            s = f"{head}: {rest}" if rest else head
-    s = _shorten_milestone_paths(s).rstrip(":.").strip()
-    return _clip_milestone_text(s, max_chars)
+            if rest:
+                sep = " " if rest.startswith("(") else ": "
+                s = f"{head}{sep}{rest}"
+            else:
+                s = head
+    return _shorten_milestone_paths(s).rstrip(":.").strip()
+
+
+def _clean_milestone_bullet(raw: str, max_chars: int = 135) -> str:
+    return _clip_milestone_text(_clean_milestone_bullet_full(raw), max_chars)
 
 
 def _is_line_ref_token(tok: str) -> bool:
@@ -1946,6 +2081,27 @@ def _is_line_ref_token(tok: str) -> bool:
     return body.isdigit()
 
 
+def _normalize_code_span_token(raw_span: str) -> tuple[str, str]:
+    """Normalize a backticked code span to `(lower_key, pretty_symbol)` for milestone deduplication."""
+    raw_c = raw_span.strip()
+    # Normalize `var = val`, `key: val`, and `func(arg)` signatures to the core symbol
+    if "=" in raw_c:
+        lhs = raw_c.split("=", 1)[0].strip()
+        if lhs and " " not in lhs and not lhs.endswith(("!", "<", ">")):
+            raw_c = lhs
+    elif ": " in raw_c:
+        lhs = raw_c.split(": ", 1)[0].strip()
+        if lhs and " " not in lhs and "/" not in lhs and "\\" not in lhs and ":" not in lhs:
+            raw_c = lhs
+    p_idx = raw_c.find("(")
+    if p_idx >= 3:
+        raw_c = raw_c[:p_idx].strip()
+    if " " not in raw_c and ("\\" in raw_c or "/" in raw_c):
+        raw_c = _fast_basename(raw_c)
+    pretty = raw_c.rstrip(":.,;)")
+    return pretty.lower(), pretty
+
+
 def _milestone_signature_tokens(text: str) -> tuple[set[str], set[str]]:
     """Return `(all_tokens, code_tokens)` for deduplicating milestones against newer checkpoints."""
     all_toks: set[str] = set()
@@ -1954,26 +2110,27 @@ def _milestone_signature_tokens(text: str) -> tuple[set[str], set[str]]:
     for m in _rx("MILESTONE_TOKEN").finditer(text):
         g_code, g_ascii, g_cjk = m.group(1), m.group(2), m.group(3)
         if g_code:
-            raw_c = g_code.strip()
-            # Normalize `var = val` assignments and `func(arg)` call signatures to the core symbol
-            if "=" in raw_c:
-                lhs = raw_c.split("=", 1)[0].strip()
-                if lhs and " " not in lhs:
-                    raw_c = lhs
-            p_idx = raw_c.find("(")
-            if p_idx >= 3:
-                raw_c = raw_c[:p_idx].strip()
-            if "\\" in raw_c or "/" in raw_c:
-                raw_c = _fast_basename(raw_c)
-            tok = raw_c.lower().rstrip(":.,;)")
-            if (
-                len(tok) >= 3
-                and tok not in stopwords
-                and not _is_line_ref_token(tok)
-                and any(ch.isalpha() for ch in tok)
-            ):
-                all_toks.add(tok)
-                code_toks.add(tok)
+            if len(g_code) <= 64:
+                tok, _ = _normalize_code_span_token(g_code)
+                if (
+                    len(tok) >= 3
+                    and tok not in stopwords
+                    and not _is_line_ref_token(tok)
+                    and any(ch.isalpha() for ch in tok)
+                ):
+                    all_toks.add(tok)
+                    code_toks.add(tok)
+            else:
+                # Consume >64-char code spans cleanly without losing backtick parity on the rest of the line
+                for im in _rx("MILESTONE_INNER_TOKEN").finditer(g_code):
+                    ia, ic = im.group(1), im.group(2)
+                    if ia:
+                        raw_a = _fast_basename(ia) if ("/" in ia or "\\" in ia) else ia
+                        itok = raw_a.lower()
+                        if len(itok) >= 4 and itok not in stopwords and not _is_line_ref_token(itok):
+                            all_toks.add(itok)
+                    elif ic:
+                        all_toks.add(ic)
         elif g_ascii:
             raw_a = _fast_basename(g_ascii) if ("/" in g_ascii or "\\" in g_ascii) else g_ascii
             tok = raw_a.lower()
@@ -1982,6 +2139,67 @@ def _milestone_signature_tokens(text: str) -> tuple[set[str], set[str]]:
         elif g_cjk:
             all_toks.add(g_cjk)
     return all_toks, code_toks
+
+
+def _extract_code_symbol_pretty_map(text: str) -> dict[str, str]:
+    """Map normalized code tokens back to their first original-cased symbol in `text`."""
+    mapping: dict[str, str] = {}
+    stopwords = _MILESTONE_STOPWORDS
+    for m in _rx("MILESTONE_TOKEN").finditer(text):
+        g_code = m.group(1)
+        if not g_code or len(g_code) > 64:
+            continue
+        tok, pretty = _normalize_code_span_token(g_code)
+        if (
+            tok not in mapping
+            and len(tok) >= 3
+            and tok not in stopwords
+            and not _is_line_ref_token(tok)
+            and any(ch.isalpha() for ch in tok)
+        ):
+            mapping[tok] = pretty
+    return mapping
+
+
+def _is_hex_sha(tok: str) -> bool:
+    return 12 <= len(tok) <= 64 and all(ch in "0123456789abcdef" for ch in tok)
+
+
+def _hex_prefix_in_text(full_sha: str, text_low: str) -> bool:
+    """Return True if a >=7-hex-char prefix of `full_sha` appears as a standalone hex token in `text_low`."""
+    p7 = full_sha[:7]
+    pos = 0
+    n = len(text_low)
+    while True:
+        idx = text_low.find(p7, pos)
+        if idx < 0:
+            return False
+        prev_hex = idx > 0 and text_low[idx - 1] in "0123456789abcdef"
+        if not prev_hex:
+            end = idx + 7
+            while end < n and text_low[end] in "0123456789abcdef":
+                end += 1
+            matched = text_low[idx:end]
+            if full_sha.startswith(matched):
+                return True
+        pos = idx + 1
+
+
+def _code_token_covered(tok: str, text_low: str, toks: set[str]) -> bool:
+    """Return True if `tok` (including full git SHA shortened to >=7 hex chars) is present in `text_low`/`toks`."""
+    if tok in toks or tok in text_low:
+        return True
+    if _is_hex_sha(tok):
+        return _hex_prefix_in_text(tok, text_low)
+    return False
+
+
+def _token_covered(tok: str, text_low: str, toks: set[str]) -> bool:
+    if tok in toks or tok in text_low:
+        return True
+    if _is_hex_sha(tok):
+        return _hex_prefix_in_text(tok, text_low)
+    return False
 
 
 def _compact_parent_milestone_label(cleaned: str) -> str:
@@ -2001,21 +2219,43 @@ def _compact_parent_milestone_label(cleaned: str) -> str:
     return _clip_milestone_text(label, 54, add_ellipsis=False)
 
 
-def extract_checkpoint_milestones(cp_content: str) -> tuple[list[str], list[str]]:
-    """Extract concise completed milestones, key fixes/findings, and `Commitments/Constraints` from a `CHECKPOINT` summary."""
+def _is_durable_state_bullet(cleaned_full: str, parent_label: str) -> bool:
+    """Return True if an `Active Context` bullet represents durable workspace/repo/env state rather than transient noise."""
+    low = cleaned_full.lower()
+    if any(low.startswith(pref) for pref in _SKIP_STATE_PREFIXES):
+        return False
+    combined = f"{parent_label} {cleaned_full}".lower()
+    if not any(cue in combined for cue in _STATE_DURABLE_CUES):
+        return False
+    # Reject trivial empty status lines like "Background Tasks: None running"
+    _, sep, after_colon = cleaned_full.partition(": ")
+    val_low = after_colon.strip().lower().rstrip(".") if sep else low.rstrip(".")
+    if val_low in ("none", "none running", "n/a", "empty", "clean", "nothing running"):
+        return False
+    return True
+
+
+def _extract_checkpoint_milestone_entries(cp_content: str) -> dict[str, list[tuple[str, str]]]:
+    """Extract categorized `(display_text, full_text)` milestone entries from a `CHECKPOINT` summary."""
+    buckets: dict[str, list[tuple[str, str]]] = {
+        "state": [],
+        "findings": [],
+        "errors": [],
+        "done": [],
+        "constraints": [],
+    }
     if not cp_content:
-        return [], []
+        return buckets
     m_sum = _rx("SUMMARY_BLOCK").search(cp_content)
     body = m_sum.group(1) if m_sum else cp_content
-    primary_done: list[str] = []
-    secondary_findings: list[str] = []
-    constraint_items: list[str] = []
     sec_kind = ""
     parent_stack: list[tuple[int, str, int]] = []
     next_container_id = 1
     container_emitted: dict[int, int] = {}
-    findings_last_idx_by_cid: dict[int, int] = {}
+    errors_last_idx_by_cid: dict[int, int] = {}
     skip_below_indent: int | None = None
+
+    bucket_caps = {"state": 6, "findings": 12, "errors": 12, "done": 16, "constraints": 6}
 
     for line in body.splitlines():
         s_ln = line.strip()
@@ -2040,17 +2280,17 @@ def extract_checkpoint_milestones(cp_content: str) -> tuple[list[str], list[str]
                     "next step",
                     "not started",
                     "blocked",
-                    "active context",
                     "task overview",
                 )
             ):
                 sec_kind = ""
+            elif "active context" in low:
+                sec_kind = "state"
             elif any(k in low for k in ("done", "completed", "resolved design decision", "key decision", "progress")):
                 sec_kind = "done"
-            elif any(
-                k in low
-                for k in ("errors & fixes", "errors and fixes", "bugs & fixes", "bugs and fixes", "key findings")
-            ):
+            elif any(k in low for k in ("errors & fixes", "errors and fixes", "bugs & fixes", "bugs and fixes")):
+                sec_kind = "errors"
+            elif "key findings" in low:
                 sec_kind = "findings"
             elif "commitment" in low or "constraint" in low:
                 sec_kind = "constraints"
@@ -2062,7 +2302,8 @@ def extract_checkpoint_milestones(cp_content: str) -> tuple[list[str], list[str]
 
         expanded = line.replace("\t", "  ")
         indent = len(expanded) - len(expanded.lstrip(" "))
-        if not (s_ln.startswith("- ") or s_ln.startswith("* ")):
+        b_raw = _strip_list_marker(s_ln)
+        if b_raw is None:
             continue
 
         if skip_below_indent is not None:
@@ -2073,85 +2314,259 @@ def extract_checkpoint_milestones(cp_content: str) -> tuple[list[str], list[str]
         while parent_stack and parent_stack[-1][0] >= indent:
             parent_stack.pop()
 
-        b_raw = s_ln[2:].strip()
         if not b_raw:
             continue
 
         if sec_kind == "constraints":
             if indent == 0:
-                cleaned_c = _clean_milestone_bullet(b_raw, max_chars=120)
-                if len(cleaned_c) >= 12 and len(constraint_items) < 4:
-                    constraint_items.append(cleaned_c)
+                full_c = _clean_milestone_bullet_full(b_raw)
+                cleaned_c = _clip_milestone_text(full_c, 120)
+                if len(cleaned_c) >= 12 and len(buckets["constraints"]) < bucket_caps["constraints"]:
+                    buckets["constraints"].append((cleaned_c, full_c))
             continue
 
-        cleaned_raw = _clean_milestone_bullet(b_raw, max_chars=140)
-        low_clean = cleaned_raw.lower()
+        full_raw = _clean_milestone_bullet_full(b_raw)
+        low_clean = full_raw.lower()
         if any(low_clean.startswith(pref) for pref in _SKIP_MILESTONE_CONTAINER_PREFIXES):
             skip_below_indent = indent
             continue
+        if sec_kind == "state" and any(low_clean.startswith(pref) for pref in _SKIP_STATE_PREFIXES):
+            skip_below_indent = indent
+            continue
 
-        is_container = b_raw.endswith(":") and (b_raw.endswith(("**:", "`:")) or len(b_raw) <= 95)
+        is_container = b_raw.endswith((":", "：")) and (
+            b_raw.endswith(("**:", "`:", "**：", "`：")) or len(b_raw) <= 95
+        )
         if is_container:
-            if len(cleaned_raw) >= 4:
-                parent_stack.append((indent, _compact_parent_milestone_label(cleaned_raw), next_container_id))
+            if len(full_raw) >= 4:
+                parent_stack.append((indent, _compact_parent_milestone_label(full_raw), next_container_id))
                 next_container_id += 1
             continue
 
         # Leaf bullet: combine with innermost parent container label when indented
         if indent > 0 and not parent_stack:
             continue
-        if len(cleaned_raw) < 12:
+        if len(full_raw) < 12:
             continue
 
         parent_label = parent_stack[-1][1] if parent_stack else ""
         parent_cid = parent_stack[-1][2] if parent_stack else 0
-        per_container_max = 3 if sec_kind == "done" else 2
+        if sec_kind == "state" and not _is_durable_state_bullet(full_raw, parent_label):
+            continue
+
+        per_container_max = 2 if sec_kind == "state" else 3
 
         if parent_label:
             p_check = parent_label.strip("`").lower()
             child_self_anchored = (
                 sec_kind == "done"
                 and not parent_label.startswith("`")
-                and cleaned_raw.startswith("`")
-                and ": " in cleaned_raw[:64]
-                and len(parent_label) + 2 + len(cleaned_raw) > 140
+                and full_raw.startswith("`")
+                and ": " in full_raw[:64]
+                and len(parent_label) + 2 + len(full_raw) > 140
             )
-            if (p_check and p_check in cleaned_raw.lower()) or child_self_anchored:
-                item = _clip_milestone_text(cleaned_raw, 140)
-            elif sec_kind == "findings" and cleaned_raw.lower().startswith(("fix:", "resolved:", "root cause:")):
-                item = _clip_milestone_text(f"{parent_label} -> {cleaned_raw}", 145)
+            if (p_check and p_check in low_clean) or child_self_anchored:
+                full_item = full_raw
+                disp_item = _clip_milestone_text(full_item, 140)
+            elif sec_kind in ("errors", "findings") and low_clean.startswith(("fix:", "resolved:", "root cause:")):
+                full_item = f"{parent_label} -> {full_raw}"
+                disp_item = _clip_milestone_text(full_item, 145)
             else:
-                item = _clip_milestone_text(f"{parent_label}: {cleaned_raw}", 140)
+                full_item = f"{parent_label}: {full_raw}"
+                disp_item = _clip_milestone_text(full_item, 140)
         else:
-            item = _clip_milestone_text(cleaned_raw, 135)
+            full_item = full_raw
+            disp_item = _clip_milestone_text(full_item, 135)
 
-        if sec_kind == "done":
-            if parent_cid:
-                if container_emitted.get(parent_cid, 0) >= per_container_max:
-                    continue
-                container_emitted[parent_cid] = container_emitted.get(parent_cid, 0) + 1
-            if len(primary_done) < 8:
-                primary_done.append(item)
-        elif sec_kind == "findings":
-            # In Errors & Fixes, upgrade a prior symptom leaf under the same Error container with its `Fix:` leaf
-            if (
-                parent_cid
-                and cleaned_raw.lower().startswith(("fix:", "resolved:"))
-                and parent_cid in findings_last_idx_by_cid
-            ):
-                secondary_findings[findings_last_idx_by_cid[parent_cid]] = item
+        if sec_kind == "errors":
+            # In Errors & Fixes, upgrade a prior symptom leaf under the same Error container with its `Fix:`/`Root cause:` leaf
+            is_error_resolution = low_clean.startswith(("fix:", "resolved:", "root cause:"))
+            if parent_cid and is_error_resolution and parent_cid in errors_last_idx_by_cid:
+                prev_idx = errors_last_idx_by_cid[parent_cid]
+                buckets["errors"][prev_idx] = (disp_item, full_item)
                 continue
             if parent_cid:
                 if container_emitted.get(parent_cid, 0) >= per_container_max:
                     continue
                 container_emitted[parent_cid] = container_emitted.get(parent_cid, 0) + 1
-            if len(secondary_findings) < 4:
-                if parent_cid and not cleaned_raw.lower().startswith(("fix:", "resolved:")):
-                    findings_last_idx_by_cid[parent_cid] = len(secondary_findings)
-                secondary_findings.append(item)
+            if len(buckets["errors"]) < bucket_caps["errors"]:
+                if parent_cid and not is_error_resolution:
+                    errors_last_idx_by_cid[parent_cid] = len(buckets["errors"])
+                buckets["errors"].append((disp_item, full_item))
+        else:
+            if parent_cid:
+                if container_emitted.get(parent_cid, 0) >= per_container_max:
+                    continue
+                container_emitted[parent_cid] = container_emitted.get(parent_cid, 0) + 1
+            if len(buckets[sec_kind]) < bucket_caps[sec_kind]:
+                buckets[sec_kind].append((disp_item, full_item))
 
-    done_items = (primary_done[:8] + secondary_findings[:4])[:10]
+    return buckets
+
+
+def extract_checkpoint_milestones(cp_content: str) -> tuple[list[str], list[str]]:
+    """Extract concise completed milestones, key findings/fixes, durable state, and `Commitments/Constraints`."""
+    buckets = _extract_checkpoint_milestone_entries(cp_content)
+    done_items = [
+        disp
+        for cat in ("done", "findings", "errors", "state")
+        for disp, _ in buckets[cat]
+    ]
+    constraint_items = [disp for disp, _ in buckets["constraints"]]
     return done_items, constraint_items
+
+
+def _build_latest_coverage_units(latest_cp_content: str) -> list[tuple[str, set[str]]]:
+    """Split latest checkpoint into local bullet/paragraph coverage units (parent+child) to avoid global word-soup."""
+    units: list[tuple[str, set[str]]] = []
+    parent_stack: list[tuple[int, str]] = []
+    for line in latest_cp_content.splitlines():
+        s_ln = line.strip()
+        if not s_ln or s_ln.startswith(("<summary>", "</summary>", "<CONTEXT_SUMMARY>", "</CONTEXT_SUMMARY>")):
+            continue
+        if s_ln.startswith("#"):
+            parent_stack.clear()
+            continue
+        expanded = line.replace("\t", "  ")
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        b_raw = _strip_list_marker(s_ln)
+        if b_raw is not None:
+            while parent_stack and parent_stack[-1][0] >= indent:
+                parent_stack.pop()
+            parent_txt = parent_stack[-1][1] if parent_stack else ""
+            combined = f"{parent_txt} {b_raw}" if parent_txt else b_raw
+            if b_raw.endswith((":", "：")) and (b_raw.endswith(("**:", "`:", "**：", "`：")) or len(b_raw) <= 95):
+                parent_stack.append((indent, b_raw))
+        else:
+            combined = s_ln
+        u_low = combined.lower()
+        u_toks, _ = _milestone_signature_tokens(combined)
+        if u_toks:
+            units.append((u_low, u_toks))
+    return units
+
+
+def _enrich_clipped_display_with_lost_symbols(
+    disp_item: str,
+    full_item: str,
+    substantive_missing: set[str],
+    max_total_chars: int = 175,
+) -> str:
+    """When a clipped milestone decayed in its truncated tail, deterministically append 1-3 lost code identifiers."""
+    if not substantive_missing or len(disp_item) >= len(full_item):
+        return disp_item
+    disp_low = disp_item.lower()
+    pretty_map = _extract_code_symbol_pretty_map(full_item)
+    tail_syms: list[str] = []
+    # Iterate pretty_map in original left-to-right appearance order for deterministic output
+    for tok, pretty in pretty_map.items():
+        if tok not in substantive_missing or tok in disp_low or _is_hex_sha(tok):
+            continue
+        if not pretty or len(pretty) > 26 or any(ch.isspace() for ch in pretty) or "`" in pretty:
+            continue
+        tail_syms.append(f"`{pretty}`")
+        if len(tail_syms) >= 3:
+            break
+    if not tail_syms:
+        return disp_item
+    for k in range(len(tail_syms), 0, -1):
+        suffix = f" [lost: {', '.join(tail_syms[:k])}]"
+        if len(disp_item) + len(suffix) <= max_total_chars:
+            return disp_item + suffix
+    return disp_item
+
+
+def _extract_latest_context_signals(
+    latest_cp_content: str,
+) -> tuple[list[tuple[str, set[str]]], set[str], set[str], set[str]]:
+    """Extract latest-CP Active Context units, explicitly removed entity anchors, and archived/active focus tokens."""
+    body = latest_cp_content
+    m_sum = _rx("SUMMARY_BLOCK").search(latest_cp_content)
+    if m_sum:
+        body = m_sum.group(1)
+
+    state_units: list[tuple[str, set[str]]] = []
+    removed_anchors: set[str] = set()
+    archived_raw: set[str] = set()
+    active_raw: set[str] = set()
+
+    sec_kind = ""
+    parent_stack: list[tuple[int, str]] = []
+    rx_removal = _rx("STATE_REMOVAL_CUE")
+    rx_archived = _rx("ARCHIVED_FOCUS_CUE")
+    rx_paren = _rx("PARENTHETICAL_CLAUSE")
+    rx_clause = _rx("CLAUSE_SPLIT")
+
+    for line in body.splitlines():
+        s_ln = line.strip()
+        if not s_ln:
+            continue
+        if s_ln.startswith("#"):
+            parent_stack.clear()
+            h_low = s_ln.lstrip("#").strip().lower()
+            if any(k in h_low for k in ("active context", "current state", "workspace state", "當前狀態", "当前状态")):
+                sec_kind = "state"
+            elif any(k in h_low for k in ("task overview", "goal", "objective", "任務概覽", "任务概览")):
+                sec_kind = "overview"
+            elif any(k in h_low for k in ("next step", "remaining", "下一步", "待辦", "待办")):
+                sec_kind = "next"
+            elif any(k in h_low for k in ("error", "issue", "bug", "錯誤", "错误")):
+                sec_kind = "errors"
+            elif any(k in h_low for k in ("finding", "decision", "architecture", "關鍵發現", "关键发现")):
+                sec_kind = "findings"
+            else:
+                sec_kind = "other"
+            continue
+
+        expanded = line.replace("\t", "  ")
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        b_raw = _strip_list_marker(s_ln)
+        if b_raw is not None:
+            while parent_stack and parent_stack[-1][0] >= indent:
+                parent_stack.pop()
+            parent_txt = parent_stack[-1][1] if parent_stack else ""
+            combined = f"{parent_txt} {b_raw}" if parent_txt else b_raw
+            if b_raw.endswith((":", "：")) and (b_raw.endswith(("**:", "`:", "**：", "`：")) or len(b_raw) <= 95):
+                parent_stack.append((indent, b_raw))
+        else:
+            combined = s_ln
+
+        if sec_kind == "state":
+            u_low = combined.lower()
+            u_toks, _ = _milestone_signature_tokens(combined)
+            if u_toks:
+                state_units.append((u_low, u_toks))
+
+        if sec_kind in ("state", "overview", "findings", "next") and rx_removal.search(s_ln):
+            # Scope removed anchors to the exact parenthetical or clause expressing removal
+            scoped_segments = [m.group(1) for m in rx_paren.finditer(s_ln) if rx_removal.search(m.group(1))]
+            if not scoped_segments:
+                scoped_segments = [seg for seg in rx_clause.split(s_ln) if rx_removal.search(seg)]
+            for seg in scoped_segments:
+                _, seg_code = _milestone_signature_tokens(seg)
+                for tok in seg_code:
+                    if len(tok) >= 4 and tok not in _TRIVIAL_CODE_TOKENS and not _is_hex_sha(tok):
+                        removed_anchors.add(tok)
+
+        if sec_kind == "overview":
+            line_all, line_code = _milestone_signature_tokens(s_ln)
+            distinctive = {t for t in line_code if t not in _TRIVIAL_CODE_TOKENS} | {
+                t
+                for t in line_all
+                if any(ch in "-_./" or ch.isdigit() for ch in t) and len(t) >= 4
+            }
+            if rx_archived.search(s_ln):
+                archived_raw.update(distinctive)
+            else:
+                active_raw.update(distinctive)
+        elif sec_kind in ("state", "next"):
+            _, line_code = _milestone_signature_tokens(s_ln)
+            for tok in line_code:
+                if tok not in _TRIVIAL_CODE_TOKENS and tok not in removed_anchors:
+                    active_raw.add(tok)
+
+    archived_only = archived_raw - active_raw
+    return state_units, removed_anchors, archived_only, active_raw
 
 
 def build_anti_decay_milestone_digest(
@@ -2166,78 +2581,211 @@ def build_anti_decay_milestone_digest(
 
     latest_low = latest_cp_content.lower()
     latest_toks, _ = _milestone_signature_tokens(latest_cp_content)
+    latest_units = _build_latest_coverage_units(latest_cp_content)
+    latest_state_units, removed_anchors, archived_only_toks, active_focus_toks = _extract_latest_context_signals(
+        latest_cp_content
+    )
+    rx_removal = _rx("STATE_REMOVAL_CUE")
+    rx_scratch = _rx("EPHEMERAL_SCRATCH_REF")
 
     # Scan newest earlier checkpoint -> oldest so the richest surviving wording wins on dedup
     kept_token_sets: list[set[str]] = []
     by_cp: dict[tuple[int, int], list[str]] = {}
     for cp_step, cp_line, cp_txt in reversed(prev_checkpoints):
-        done_items, constraint_items = extract_checkpoint_milestones(cp_txt)
-        candidates = [(item, False) for item in done_items] + [(item, True) for item in constraint_items]
-        for item, is_constraint in candidates:
-            all_toks, code_toks = _milestone_signature_tokens(item)
-            if not all_toks:
-                continue
-            if item.lower() in latest_low:
-                continue
-            direct_hits = all_toks & latest_toks
-            overlap_latest = len(direct_hits)
-            if overlap_latest < len(all_toks):
-                overlap_latest += sum(1 for t in (all_toks - direct_hits) if t in latest_low)
-            code_missing = [t for t in code_toks if t not in latest_low]
-            # Still well-covered in latest summary -> skip to avoid duplication
-            if code_toks and not code_missing:
-                if len(code_toks) >= 2 or overlap_latest / len(all_toks) >= 0.45:
+        buckets = _extract_checkpoint_milestone_entries(cp_txt)
+        decayed_by_cat: dict[str, list[tuple[float, int, str]]] = {
+            "state": [],
+            "findings": [],
+            "errors": [],
+            "done": [],
+            "constraints": [],
+        }
+
+        for cat in ("state", "findings", "errors", "done", "constraints"):
+            for orig_idx, (disp_item, full_item) in enumerate(buckets[cat]):
+                all_toks, code_toks = _milestone_signature_tokens(full_item)
+                if not all_toks:
                     continue
-            if overlap_latest / len(all_toks) >= 0.60 and not (code_toks and len(code_missing) == len(code_toks)):
-                continue
-            # Deduplicate against a newer earlier-checkpoint milestone already kept
-            if any(
-                len(all_toks & prev_ts) / max(1, min(len(all_toks), len(prev_ts))) >= 0.60
-                for prev_ts in kept_token_sets
-            ):
-                continue
-            kept_token_sets.append(all_toks)
-            label = f"[Constraint] {item}" if is_constraint else item
-            by_cp.setdefault((cp_step, cp_line), []).append(label)
+                if disp_item.lower() in latest_low or full_item.lower() in latest_low:
+                    continue
+
+                code_missing = [t for t in code_toks if not _code_token_covered(t, latest_low, latest_toks)]
+                substantive_missing = {t for t in code_missing if t not in _TRIVIAL_CODE_TOKENS}
+
+                # Guard mutable Active Context [State] items against resurrecting deleted or in-place-updated state
+                if cat == "state":
+                    if removed_anchors and (code_toks & removed_anchors) and not rx_removal.search(full_item):
+                        continue
+                    if code_toks and not substantive_missing and latest_state_units:
+                        if any(
+                            all(_code_token_covered(t, su_low, su_toks) for t in code_toks)
+                            for su_low, su_toks in latest_state_units
+                        ):
+                            continue
+
+                best_local_ratio = 0.0
+                best_local_code_hits = 0
+                for u_low, u_toks in latest_units:
+                    direct = all_toks & u_toks
+                    hits = len(direct)
+                    if hits < len(all_toks):
+                        hits += sum(1 for t in (all_toks - direct) if _token_covered(t, u_low, u_toks))
+                    ratio = hits / len(all_toks)
+                    if ratio > best_local_ratio:
+                        best_local_ratio = ratio
+                    if code_toks:
+                        chits = sum(1 for t in code_toks if _code_token_covered(t, u_low, u_toks))
+                        if chits > best_local_code_hits:
+                            best_local_code_hits = chits
+
+                global_direct = all_toks & latest_toks
+                global_hits = len(global_direct)
+                if global_hits < len(all_toks):
+                    global_hits += sum(
+                        1 for t in (all_toks - global_direct) if _token_covered(t, latest_low, latest_toks)
+                    )
+                global_ratio = global_hits / len(all_toks)
+
+                # Decide whether latest checkpoint still covers this milestone
+                if cat == "constraints":
+                    if (best_local_ratio >= 0.55 or (global_ratio >= 0.65 and best_local_ratio >= 0.40)) and len(
+                        substantive_missing
+                    ) < 2:
+                        continue
+                else:
+                    # 1. All code anchors co-located in one latest unit -> well covered
+                    if code_toks and not code_missing and best_local_code_hits == len(code_toks):
+                        if len(code_toks) >= 2 or best_local_ratio >= 0.45:
+                            continue
+                    # 2. Significant technical detail lost (>=2 distinct code symbols vanished) -> always retain
+                    has_heavy_code_decay = len(substantive_missing) >= 2
+                    if not has_heavy_code_decay:
+                        sole_code_lost = bool(code_toks and len(substantive_missing) == len(code_toks))
+                        if best_local_ratio >= 0.58 and not (sole_code_lost and best_local_ratio < 0.72):
+                            continue
+                        if not substantive_missing and global_ratio >= 0.72 and best_local_ratio >= 0.42:
+                            continue
+
+                # Deduplicate against a newer earlier-checkpoint milestone already kept
+                if any(
+                    len(all_toks & prev_ts) / max(1, min(len(all_toks), len(prev_ts))) >= 0.60
+                    for prev_ts in kept_token_sets
+                ):
+                    continue
+                kept_token_sets.append(all_toks)
+
+                rendered_item = _enrich_clipped_display_with_lost_symbols(disp_item, full_item, substantive_missing)
+                if cat == "constraints":
+                    label = f"[Constraint] {rendered_item}"
+                elif cat == "state":
+                    label = f"[State] {rendered_item}"
+                else:
+                    label = rendered_item
+                # Rank genuinely vanished / symbol-depleted items ahead of partially-covered ones within each category,
+                # while demoting ephemeral scratch-script typos and explicitly archived earlier-focus summaries.
+                code_loss_ratio = (len(substantive_missing) / len(code_toks)) if code_toks else (1.0 - best_local_ratio)
+                severity_score = (1.0 - best_local_ratio) + 0.5 * code_loss_ratio + min(
+                    0.5, len(substantive_missing) * 0.08
+                )
+                if cat in ("errors", "done") and rx_scratch.search(full_item[:72]):
+                    severity_score -= 0.55
+                if archived_only_toks and not (code_toks & active_focus_toks):
+                    arch_hits = len(all_toks & archived_only_toks)
+                    if arch_hits >= 2 or bool(code_toks & archived_only_toks):
+                        severity_score -= 0.35
+                decayed_by_cat[cat].append((-round(severity_score, 3), orig_idx, label))
+
+        for cat_list in decayed_by_cat.values():
+            cat_list.sort(key=lambda x: (x[0], x[1]))
+
+        # Prioritize durable state first, then round-robin interleave surviving decayed findings/errors/done
+        ordered_labels: list[str] = [x[2] for x in decayed_by_cat["state"]]
+        rr_cats = ("findings", "errors", "done")
+        max_rr = max((len(decayed_by_cat[c]) for c in rr_cats), default=0)
+        for idx in range(max_rr):
+            for c in rr_cats:
+                if idx < len(decayed_by_cat[c]):
+                    ordered_labels.append(decayed_by_cat[c][idx][2])
+        ordered_labels.extend(x[2] for x in decayed_by_cat["constraints"])
+        if ordered_labels:
+            by_cp[(cp_step, cp_line)] = ordered_labels
 
     if not by_cp:
         return "", 0
 
     path_hint = f"`{transcript_path}`" if transcript_path else "`transcript_full.jsonl`"
-    note = (
+    full_note = (
         f"*(Earlier milestones from prior checkpoints no longer detailed in `<CONTEXT_SUMMARY>`; "
         f"`read_file` {path_hint} at the cited line for full archived summary)*"
     )
+    compact_note = (
+        "*(Earlier checkpoint milestones omitted from `<CONTEXT_SUMMARY>`; "
+        "`read_file` `transcript_full.jsonl` at cited line)*"
+    )
+    note = full_note if (budget_chars - len(full_note) - 2) >= 320 else compact_note
     avail = budget_chars - len(note) - 2
     if avail < 100:
         return "", 0
 
-    # Prefer keeping the most recent dropped checkpoints first, then display chronologically.
-    # Cap per-checkpoint items when multiple checkpoints have decayed items so older checkpoints aren't starved.
-    selected_rows: list[tuple[int, int, str, int]] = []
+    # Allocate breadth-first across checkpoints (newest -> oldest) so every decayed checkpoint
+    # gets a representative milestone + line pointer before newer checkpoints take extra slots.
+    # This avoids non-monotonic checkpoint drops as budget grows on 3+ checkpoint chains.
+    cp_keys = sorted(by_cp.keys(), reverse=True)
+    prefixes = {
+        k: (f"- [cp @ step {k[0]}, line {k[1]}]: " if k[1] > 0 else f"- [cp @ step {k[0]}]: ")
+        for k in cp_keys
+    }
+    row_items_by_cp: dict[tuple[int, int], list[str]] = {}
+    exhausted: set[tuple[int, int]] = set()
     used = 0
-    per_cp_limit = 4 if len(by_cp) >= 2 else 8
-    for cp_step, cp_line in sorted(by_cp.keys(), reverse=True):
-        items = by_cp[(cp_step, cp_line)][:per_cp_limit]
-        prefix = f"- [cp @ step {cp_step}, line {cp_line}]: " if cp_line > 0 else f"- [cp @ step {cp_step}]: "
-        row_items: list[str] = []
-        row_len = len(prefix)
-        for it in items:
-            sep_len = 2 if row_items else 0
-            if used + row_len + sep_len + len(it) + (1 if selected_rows else 0) > avail:
-                break
-            row_items.append(it)
-            row_len += sep_len + len(it)
-        if row_items:
-            row_str = prefix + "; ".join(row_items)
-            selected_rows.append((cp_step, cp_line, row_str, len(row_items)))
-            used += len(row_str) + 1
 
-    if not selected_rows:
+    for slot in range(8):
+        progressed = False
+        for key in cp_keys:
+            if key in exhausted:
+                continue
+            items = by_cp[key]
+            if slot >= len(items):
+                exhausted.add(key)
+                continue
+            it = items[slot]
+            if slot == 0:
+                row_sep = 1 if row_items_by_cp else 0
+                prefix_len = len(prefixes[key])
+                need = row_sep + prefix_len + len(it)
+                if used + need <= avail:
+                    row_items_by_cp[key] = [it]
+                    used += need
+                    progressed = True
+                else:
+                    rem_first = avail - used - row_sep - prefix_len
+                    if rem_first >= 85:
+                        clipped_it = _clip_milestone_text(it, rem_first)
+                        if clipped_it:
+                            row_items_by_cp[key] = [clipped_it]
+                            used += row_sep + prefix_len + len(clipped_it)
+                            progressed = True
+                    exhausted.add(key)
+            else:
+                if key not in row_items_by_cp:
+                    exhausted.add(key)
+                    continue
+                need = 2 + len(it)
+                if used + need <= avail:
+                    row_items_by_cp[key].append(it)
+                    used += need
+                    progressed = True
+                else:
+                    exhausted.add(key)
+        if not progressed:
+            break
+
+    if not row_items_by_cp:
         return "", 0
-    selected_rows.sort(key=lambda x: x[0])
-    total_count = sum(cnt for _, _, _, cnt in selected_rows)
-    return note + "\n" + "\n".join(row for _, _, row, _ in selected_rows), total_count
+    ordered_keys = sorted(row_items_by_cp.keys())
+    rows = [prefixes[k] + "; ".join(row_items_by_cp[k]) for k in ordered_keys]
+    total_count = sum(len(row_items_by_cp[k]) for k in ordered_keys)
+    return note + "\n" + "\n".join(rows), total_count
 
 
 def _format_rel_or_abs(p: Path, workspace_roots: list[Path]) -> str:

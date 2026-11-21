@@ -1678,11 +1678,39 @@ def build_rehydration(
         or cfg.max_referenced_files > 0
     )
 
+    has_prev_cp = bool(prev_checkpoints and target_cp_content)
+    milestone_digest = ""
+    decayed_milestones_count = 0
+    # In completed_qa (no skills/files), compute anti-decay milestones before the earlier-user timeline
+    # so an overflowing pre-window paste cannot starve multi-checkpoint anti-decay.
+    ms_first = (
+        has_prev_cp
+        and rem_pool is not None
+        and not (will_have_skills or will_have_files)
+        and "budgetAllUserChars" not in cfg.explicit_keys
+    )
+    if ms_first:
+        ms_share = 0.50 if earlier_user_messages else 0.65
+        ms_budget = min(1400, int(rem_pool * ms_share))
+        if ms_budget >= 240:
+            milestone_digest, decayed_milestones_count = build_anti_decay_milestone_digest(
+                prev_checkpoints,
+                target_cp_content,
+                full_path,
+                budget_chars=ms_budget,
+            )
+            if milestone_digest:
+                rem_pool = max(0, rem_pool - len(milestone_digest) - 64)
+
     if rem_pool is not None and "budgetAllUserChars" not in cfg.explicit_keys:
-        eff_user_budget = min(
-            cfg.budget_all_user_chars,
-            int(rem_pool * 0.25) if (will_have_skills or will_have_files) else rem_pool,
-        )
+        if will_have_skills or will_have_files:
+            user_cap = int(rem_pool * 0.25)
+        elif ms_first and workspace_roots and rem_pool >= 640:
+            # Leave room (344+ chars after the 96-char timeline header overhead) for Workspace Reality Notice
+            user_cap = rem_pool - 440
+        else:
+            user_cap = rem_pool
+        eff_user_budget = min(cfg.budget_all_user_chars, user_cap)
 
     total_real_users = sum(1 for _, txt, _, _ in user_messages if not txt.startswith("--- [/fork branch "))
     earlier_budget_truncated = False
@@ -1710,15 +1738,13 @@ def build_rehydration(
     if rem_pool is not None and "budgetAllUserChars" not in cfg.explicit_keys and earlier_user_block:
         rem_pool = max(0, rem_pool - len(earlier_user_block) - 96)
 
-    milestone_digest = ""
-    decayed_milestones_count = 0
-    if prev_checkpoints and target_cp_content:
+    if has_prev_cp and not ms_first:
         if rem_pool is None:
             ms_budget = 1400
         elif will_have_skills or will_have_files:
             ms_budget = min(1200, int(rem_pool * 0.18))
         else:
-            ms_budget = min(1400, int(rem_pool * 0.45))
+            ms_budget = min(1400, int(rem_pool * 0.65))
         if ms_budget >= 240:
             milestone_digest, decayed_milestones_count = build_anti_decay_milestone_digest(
                 prev_checkpoints,

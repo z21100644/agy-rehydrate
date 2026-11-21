@@ -2837,6 +2837,345 @@ class RehydrateRegressionTests(unittest.TestCase):
         self.assertFalse(helpers.is_eligible_text_file(str(outside_src)))
         self.assertFalse(helpers.is_eligible_text_file(str(outside_src), _allowed_prefixes=()))
 
+    def test_anti_decay_ordered_lists_active_state_unclipped_sig_and_local_coverage(self) -> None:
+        import rehydrate_helpers as helpers
+
+        # 1. Ordered lists (`1. `, `2) `), separate findings/errors buckets (>4 findings must not starve 5th or Errors),
+        #    unclipped root-cause signature + deterministic `[lost: ...]`, SHA prefix & `key: val` dedup,
+        #    local line-unit coverage against word-soup, and selective durable Active Context state extraction.
+        cp1 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Audit PR 14\n<summary>\n"
+            "## 2. Progress\n"
+            "1. **Round 1 — Initial PR Review**:\n"
+            "   - Found 3 concrete bugs including `parseUsageRow` swallowing SQLite errors.\n"
+            "2) **Round 2 — Re-verification**:\n"
+            "   - Confirmed all fixes and verified multi-process WAL stress test.\n"
+            "## 3. Key Findings\n"
+            "- **PR #14 (`29025ab431c2451287215950a4673b3e3dd73866`) Status**: Clean and ready to merge.\n"
+            "- **Confirmed Upstream Bug (Outside Scope)**:\n"
+            "  - **Subagent queued follow-up wipes active alerts** (`server.mjs` L403-407 & L528-544): "
+            "When a subagent has an active execution and a user queues `USER_INPUT` (`step_type = 14`), both "
+            "`showTurnMetrics=false` (L531 `turnSteps.findLast()` picks queued step) and `showTurnMetrics=true` "
+            "(L405 `firstTurnStep = userStepIndex ?? metricsUserStepIndex` truncates SQL `WHERE idx >= ?`) "
+            "clear `turnQueue` to `null` and `requestError` to `'none'`.\n"
+            "- **Truncated Cloud Telemetry**: `0 / 0 cached · New conversation` rendered on truncated slices.\n"
+            "- **Docs Sync Note**: `agy-capsule/README.md` does not yet document `v1.4.1` cloud telemetry.\n"
+            "- **Deliberate PR #14 Trade-off**: `usage_history.mjs` L118-121 increments `unread++` on mid-read write "
+            "(`after.key !== before.key`), 23/66 stress scans report transient `unread: 1-2`.\n"
+            "## 4. Errors & Fixes\n"
+            "1. **`node` not recognized in PowerShell**: Fixed by invoking fnm `node.exe` directly.\n"
+            "2. **`curl.exe` to `https://github.com/org/repo/commit/29025ab431c2451287215950a4673b3e3dd73866.patch` "
+            "returned HTTP 503**: Worked around cleanly using GitHub REST API `Accept: application/vnd.github.diff`.\n"
+            "## 5. Active Context\n"
+            "- **Local Workspace State**: `D:\\workspace\\demo-repo` is unmodified by us, at `v1.4.1` + PR #14 "
+            "minus the final 4-line `??` + test update from commit `29025ab431c2451287215950a4673b3e3dd73866`.\n"
+            "- **Scratch Files Persisted**:\n"
+            "  - `probe_usage.mjs`: temporary scratch probe.\n"
+            "- **Background Tasks / Subagents**: None running.\n"
+            "- **Currently editing**: `temp_notes.md`.\n"
+            "## 7. Commitments & Constraints\n"
+            "- **Sandbox Rules**: Always try commands sandboxed first (`BypassSandbox: false`); only elevate single "
+            "network commands that genuinely need it.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        # CP2 drops: (a) workspace 4-line delta (scattering `local`/`workspace`/`state`/`v1.4.1`/`commit`/`29025ab` across
+        # unrelated lines), (b) two-layer root cause symbols of Subagent bug, (c) 5th Key Finding (`unread++` / `after.key`),
+        # (d) `curl.exe` HTTP 503 REST API workaround; while KEEPING short SHA `29025ab`, `node.exe`, and rephrased Sandbox constraint.
+        cp2 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Test PR 2\n<summary>\n"
+            "## 2. Progress\n"
+            "1. **PR 1 Review**: Audited all PR #14 files through commit `29025ab` (clean and merged as `c1fa56b`).\n"
+            "2. **PR 2 Update**: Verified `v1.4.1` local state update with zero regressions.\n"
+            "## 3. Key Findings\n"
+            "- **Upstream Issues**:\n"
+            "  - Subagent queued follow-up `USER_INPUT` (`step_type = 14`) clears `turnQueue` / `requestError` (`server.mjs` L403-407).\n"
+            "  - `agy-capsule/README.md` does not yet document `v1.4.1` cloud telemetry.\n"
+            "- **Environment**: `node` is not in `PATH`; invoke fnm `node.exe` directly.\n"
+            "## 5. Active Context\n"
+            "- **User Workspace**: `D:\\workspace\\demo-repo` remains completely unmodified by us.\n"
+            "## 7. Commitments & Constraints\n"
+            "- **Sandbox & Truthfulness**: Always try commands sandboxed first; only elevate (`BypassSandbox: true`) "
+            "the single network command that genuinely needs it.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+
+        # Helper unit checks: list marker stripping, SHA prefix safety, `: ` key normalization & space-slash safety
+        self.assertEqual(helpers._strip_list_marker("1. item"), "item")
+        self.assertEqual(helpers._strip_list_marker("12) item"), "item")
+        self.assertIsNone(helpers._strip_list_marker("2026.01 release"))
+        self.assertIsNone(helpers._strip_list_marker("1.4.1 release"))
+        self.assertTrue(helpers._code_token_covered("29025ab431c2451287215950a4673b3e3dd73866", "commit `29025ab`", set()))
+        self.assertFalse(helpers._code_token_covered("29025ab431c2451287215950a4673b3e3dd73866", "commit `29025abffff`", set()))
+        self.assertEqual(helpers._normalize_code_span_token("BypassSandbox: false")[0], "bypasssandbox")
+        self.assertEqual(helpers._normalize_code_span_token("ino:mtimeNs:size")[0], "ino:mtimens:size")
+        self.assertEqual(helpers._normalize_code_span_token("0 / 0 cached · New")[0], "0 / 0 cached · new")
+
+        # Extraction checks: ordered lists parsed, separate buckets unstarved, Active Context keeps only durable state
+        done1, cons1 = helpers.extract_checkpoint_milestones(cp1)
+        joined1 = "\n".join(done1)
+        self.assertIn("parseUsageRow", joined1)
+        self.assertIn("usage_history.mjs", joined1)
+        self.assertIn("curl.exe", joined1)
+        self.assertIn("Local Workspace State", joined1)
+        self.assertNotIn("probe_usage.mjs", joined1)
+        self.assertNotIn("None running", joined1)
+        self.assertNotIn("temp_notes.md", joined1)
+        self.assertEqual(len(cons1), 1)
+        # Clean bold+(paren) join without double colon (`alerts (`server.mjs`...)`, not `alerts: (`server.mjs`...)`)
+        self.assertIn("wipes active alerts (`server.mjs`", joined1)
+        self.assertNotIn("wipes active alerts: (`server.mjs`", joined1)
+        for item in done1 + cons1:
+            self.assertEqual(item.count("`") % 2, 0, f"Unbalanced backticks: {item!r}")
+
+        # Anti-decay digest: recovers all 4 decayed truths with zero false positives on SHA or Sandbox constraint
+        digest, cnt = helpers.build_anti_decay_milestone_digest(
+            [(164, 165, cp1)],
+            cp2,
+            self.ws / "transcript_full.jsonl",
+            budget_chars=1400,
+        )
+        self.assertGreaterEqual(cnt, 4)
+        self.assertIn("[State] Local Workspace State:", digest)
+        self.assertIn("minus the final 4-line", digest)
+        self.assertIn("Subagent queued follow-up wipes active alerts", digest)
+        self.assertIn("[lost: `showTurnMetrics`", digest)
+        self.assertIn("curl.exe", digest)
+        self.assertIn("usage_history.mjs", digest)
+        # False-positive suppression: short SHA `29025ab` & rephrased `BypassSandbox` constraint must NOT be duplicated
+        self.assertNotIn("[Constraint]", digest)
+        self.assertNotIn("PR #14 (`29025ab431c", digest)
+        self.assertNotIn("node` not recognized", digest)
+        self.assertEqual(digest.count("`") % 2, 0, f"Unbalanced backticks in digest: {digest!r}")
+
+        # Determinism check: repeated calls must emit byte-identical `[lost: ...]` ordering
+        digest2, cnt2 = helpers.build_anti_decay_milestone_digest(
+            [(164, 165, cp1)],
+            cp2,
+            self.ws / "transcript_full.jsonl",
+            budget_chars=1400,
+        )
+        self.assertEqual((digest, cnt), (digest2, cnt2))
+
+    def test_multi_cp_completed_qa_budget_stale_state_parity_and_demotion(self) -> None:
+        import rehydrate_helpers as helpers
+
+        # 1. Backtick parity on >64-char inline code spans must NOT invert subsequent prose into code tokens
+        long_css_line = (
+            "- `server.mjs` L1276-1288: `.usage-range` and `.usage-nav-total` both "
+            "`flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;`; "
+            "`.usage-model-tokens` adds `white-space: nowrap;`; `usage_ui.mjs` L356 adds `title=\"x\"`."
+        )
+        _, css_code = helpers._milestone_signature_tokens(long_css_line)
+        self.assertIn(".usage-model-tokens", css_code)
+        self.assertIn("usage_ui.mjs", css_code)
+        self.assertNotIn("adds", css_code)
+        pretty_map = helpers._extract_code_symbol_pretty_map(long_css_line)
+        self.assertIn(".usage-model-tokens", pretty_map)
+        self.assertNotIn("adds", pretty_map)
+
+        # 2. Stale/superseded [State] suppression, parenthetical removal scoping, scratch & archived-focus demotion
+        cp_old1 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Inspect old repo\n<summary>\n"
+            "## 3. Key Findings\n"
+            "- **Archived Widget Note (`legacy-widget`)**: Legacy widget cache used `legacyCacheKey` in `widget_old.mjs`.\n"
+            "- **Core Scheduler Note (`core-engine`)**: Lease jitter uses `leaseBackoffMs` in `scheduler.py`.\n"
+            "## 4. Errors & Fixes\n"
+            "1. **`scratch\\probe_legacy.mjs` failed with `TypeError: panel.toggleAttribute is not a function`**: "
+            "Caused by outdated scratch DOM stub missing `replayStats()` and `toggleAttribute`.\n"
+            "2. **Production parser crash in `row_parser.mjs`**: Missing `steps` table check swallowed `SQLITE_BUSY`.\n"
+            "## 5. Active Context\n"
+            "- **Local Workspace State**: `removed-repo` is unmodified by us, behind `abc1234` by a 4-line `??` patch.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp_old2 = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Check PR 2\n<summary>\n"
+            "## 2. Progress\n"
+            f"{long_css_line}\n"
+            "## 5. Active Context\n"
+            "- **User Workspace**: `removed-repo` remains completely unmodified by us.\n"
+            "- **Live Service**: `live-service` is running on build 101.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        cp_latest = (
+            "<CONTEXT_SUMMARY>\n# User Requests\n1. Final audit\n<summary>\n"
+            "## 1. Task Overview\n"
+            "- **Current Focus**: Harden `core-engine` scheduling and anti-decay pipeline.\n"
+            "- **Completed Earlier Focus (Archived)**: Code review of `legacy-widget` latest merged commit `c1fa56b`.\n"
+            "## 5. Active Context\n"
+            "- **User Workspace (`D:\\work`)**: Only `kept-app/` and `scratch_test/` currently exist (`removed-repo` was removed by user).\n"
+            "- **Live Service**: `live-service` upgraded cleanly to build 102.\n"
+            "</summary>\n</CONTEXT_SUMMARY>"
+        )
+        _, removed_anchors, archived_only, _ = helpers._extract_latest_context_signals(cp_latest)
+        self.assertIn("removed-repo", removed_anchors)
+        self.assertNotIn("kept-app", removed_anchors)
+        self.assertNotIn("scratch_test", removed_anchors)
+        self.assertIn("legacy-widget", archived_only)
+        self.assertNotIn("latest", archived_only)
+        self.assertNotIn("commit", archived_only)
+
+        digest, cnt = helpers.build_anti_decay_milestone_digest(
+            [(100, 101, cp_old1), (200, 201, cp_old2)],
+            cp_latest,
+            self.ws / "transcript_full.jsonl",
+            budget_chars=1400,
+        )
+        self.assertGreaterEqual(cnt, 4)
+        # Superseded/removed [State] entries from BOTH cp_old2 and cp_old1 must NOT resurrect
+        self.assertNotIn("[State] User Workspace: `removed-repo`", digest)
+        self.assertNotIn("[State] Local Workspace State: `removed-repo`", digest)
+        self.assertNotIn("[State] Live Service: `live-service`", digest)
+        # Backtick parity fix emits real selector instead of bogus `adds`
+        self.assertIn("[lost: `.usage-model-tokens`", digest)
+        self.assertNotIn("`adds`", digest)
+        # Real active-focus finding & production error outrank archived-focus & scratch probe typo
+        self.assertIn("scheduler.py", digest)
+        self.assertIn("row_parser.mjs", digest)
+        if "widget_old.mjs" in digest:
+            self.assertLess(digest.index("scheduler.py"), digest.index("widget_old.mjs"))
+        if "probe_legacy.mjs" in digest:
+            self.assertLess(digest.index("row_parser.mjs"), digest.index("probe_legacy.mjs"))
+        self.assertEqual(digest.count("`") % 2, 0)
+
+        # 3. Tight budget with long Windows-style transcript path falls back to compact note instead of collapsing to 0
+        long_path = Path(
+            "C:\\Users\\DeveloperName\\.gemini\\antigravity\\brain\\f2b26847-594e-4a0d-b2ea-a7a226fb4bf8\\.system_generated\\logs\\transcript_full.jsonl"
+        )
+        tight_digest, tight_cnt = helpers.build_anti_decay_milestone_digest(
+            [(100, 101, cp_old1), (200, 201, cp_old2)],
+            cp_latest,
+            long_path,
+            budget_chars=360,
+        )
+        self.assertGreaterEqual(tight_cnt, 1)
+        self.assertLessEqual(len(tight_digest), 360)
+        self.assertIn("transcript_full.jsonl", tight_digest)
+
+        # 4. End-to-end 3-checkpoint completed_qa with huge pre-window user paste + long final reply
+        # must NOT starve anti-decay milestones or Workspace Reality Notice
+        (self.ws / "kept-app").mkdir(exist_ok=True)
+        long_paste = "Detailed initial specification dump for old task:\n" + ("spec line alpha beta gamma\n" * 95)
+        long_reply = "Completed full multi-part verification summary:\n" + (
+            "- Verified subsystem component check passed cleanly with deterministic metrics.\n" * 44
+        )
+        logs_3cp = self.tmp_root / "brain" / "cid-3cp-qa-starve" / ".system_generated" / "logs"
+        rows_3cp = [
+            {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{long_paste}</USER_REQUEST>"},
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "",
+                "tool_calls": [{"name": "read_file", "args": {"Path": str(self.ws / "removed-repo" / "index.js")}}],
+            },
+            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "x" * 70000},
+            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Reviewed old repo."},
+            {"step_index": 10, "type": "CHECKPOINT", "content": cp_old1},
+            {"step_index": 20, "type": "USER_INPUT", "content": "<USER_REQUEST>Review follow-up commit</USER_REQUEST>"},
+            {"step_index": 21, "type": "PLANNER_RESPONSE", "content": "Follow-up verified."},
+            {"step_index": 30, "type": "CHECKPOINT", "content": cp_old2},
+            {"step_index": 40, "type": "USER_INPUT", "content": "<USER_REQUEST>Final audit</USER_REQUEST>"},
+            {"step_index": 41, "type": "GENERIC", "status": "DONE", "content": "y" * 80000},
+            {"step_index": 42, "type": "PLANNER_RESPONSE", "content": long_reply},
+            {"step_index": 50, "type": "CHECKPOINT", "content": cp_latest},
+        ]
+        _write_jsonl(logs_3cp / "transcript_full.jsonl", rows_3cp)
+        res_3cp = mod.build_rehydration(logs_3cp / "transcript_full.jsonl", workspace_roots=[self.ws])
+        self.assertIsNotNone(res_3cp)
+        assert res_3cp is not None
+        msg_3cp, st_3cp = res_3cp
+        self.assertEqual(st_3cp["session_mode"], "completed_qa")
+        self.assertGreaterEqual(st_3cp["decayed_milestones"], 2)
+        self.assertIn("Earlier Checkpoints Milestone Index", msg_3cp)
+        self.assertIn("[cp @ step 10, line 5]:", msg_3cp)
+        self.assertIn("[cp @ step 30, line 8]:", msg_3cp)
+        self.assertNotIn("[State] User Workspace: `removed-repo`", msg_3cp)
+        self.assertNotIn("[State] Local Workspace State: `removed-repo`", msg_3cp)
+        self.assertGreaterEqual(st_3cp["stale_paths"], 1)
+        self.assertIn("Workspace Reality & File Status Notice", msg_3cp)
+        self.assertLessEqual(st_3cp["chars"], st_3cp["ratio_cap"])
+
+    def test_anti_decay_breadth_first_monotonic_on_four_checkpoints(self) -> None:
+        import rehydrate_helpers as helpers
+
+        cp1 = (
+            "## 3. Key Findings\n"
+            "- **Parser Limit**: `chunk_lexer.py` rejects nested `triple_quote_span` tokens exceeding 4KB buffers.\n"
+            "- **Cache Invariant**: `wal_compactor.py` requires `pragma_sync_mode` enabled before checkpoint replay.\n"
+            "## 4. Errors & Fixes\n"
+            "- **`socket_bridge.py` EPIPE**: Fixed half-closed stream crash by awaiting `drain_frame_queue` on EOF.\n"
+        )
+        cp2 = (
+            "## 3. Key Findings\n"
+            "- **Scheduler Drift**: `cron_jitter.py` miscomputes `next_fire_epoch` across DST spring-forward windows.\n"
+            "- **Retry Ceiling**: `backoff_policy.py` caps `jitter_window_ms` at 30s to avoid thundering herds.\n"
+            "## 4. Errors & Fixes\n"
+            "- **`tls_handshake.py` timeout**: Fixed SNI mismatch in `verify_peer_chain` under proxy tunneling.\n"
+            "- **`metrics_sink.py` overflow**: Switched `histogram_bucket_idx` from int16 to int32 counters.\n"
+        )
+        cp3 = (
+            "## 3. Key Findings\n"
+            "- **Rehydrate Guard**: `workspace_notice.py` detects `stale_disk_ref` entries removed outside the IDE.\n"
+            "- **Span Tokenizer**: `backtick_scanner.py` handles `oversized_css_span` without flipping quote parity.\n"
+            "## 4. Errors & Fixes\n"
+            "- **`path_norm.py` basename bug**: Ignored labels with spaces in `extract_display_basename` helper.\n"
+            "- **`digest_order.py` tie-break**: Sorted `lost_symbol_set` deterministically via `pretty_symbol_map`.\n"
+        )
+        cp4_latest = (
+            "## 1. Task Overview\n"
+            "- **Current Focus**: Finalize multi-checkpoint breadth-first allocation in `digest_scheduler.py`.\n"
+            "## 5. Active Context\n"
+            "- Working in `D:\\workspace\\rehydrate-core`.\n"
+        )
+        long_win_path = Path(
+            r"C:\Users\Developer\.gemini\antigravity\brain\f2b26847-594e-4a0d-b2ea-a7a226fb4bf8"
+            r"\.system_generated\logs\transcript_full.jsonl"
+        )
+        prev_cps = [(100, 101, cp1), (200, 201, cp2), (300, 301, cp3)]
+
+        # Breadth-first allocation must cover all 3 prior checkpoints monotonically as budget increases
+        seen_cp_sets: list[set[int]] = []
+        prev_count = 0
+        for budget in (750, 800, 900, 1000, 1200, 1400, 1600):
+            digest, cnt = helpers.build_anti_decay_milestone_digest(
+                prev_cps, cp4_latest, long_win_path, budget_chars=budget
+            )
+            self.assertLessEqual(len(digest), budget)
+            present = {
+                step for step in (100, 200, 300) if f"[cp @ step {step}, line {step + 1}]:" in digest
+            }
+            if seen_cp_sets:
+                # Monotonicity: once an earlier checkpoint is covered, raising budget must never drop it
+                self.assertTrue(
+                    seen_cp_sets[-1].issubset(present),
+                    f"Budget {budget} dropped checkpoints {seen_cp_sets[-1] - present}",
+                )
+            seen_cp_sets.append(present)
+            if budget >= 800:
+                self.assertEqual(present, {100, 200, 300}, f"Expected all 3 CPs at budget={budget}")
+                # Chronological row ordering
+                p1 = digest.index("[cp @ step 100, line 101]:")
+                p2 = digest.index("[cp @ step 200, line 201]:")
+                p3 = digest.index("[cp @ step 300, line 301]:")
+                self.assertTrue(p1 < p2 < p3)
+            if budget >= 800:
+                self.assertGreaterEqual(cnt, prev_count)
+                prev_count = cnt
+
+        # Unbalanced checkpoints: a sparse older CP must not cap a rich newer CP at 4 items when space remains
+        sparse_cp = "## 3. Key Findings\n- **Tiny Note**: `alpha_flag` kept enabled.\n"
+        rich_cp = "## 3. Key Findings\n" + "\n".join(
+            f"- **Item {i}**: `unique_sym_{i}` verified in `mod_{i}.py`." for i in range(1, 7)
+        )
+        unbal_digest, unbal_cnt = helpers.build_anti_decay_milestone_digest(
+            [(10, 11, sparse_cp), (20, 21, rich_cp)],
+            cp4_latest,
+            self.ws / "transcript_full.jsonl",
+            budget_chars=1400,
+        )
+        self.assertIn("[cp @ step 10, line 11]:", unbal_digest)
+        self.assertIn("[cp @ step 20, line 21]:", unbal_digest)
+        self.assertGreaterEqual(unbal_cnt, 6)
+
     def test_line_endings_and_no_pycache(self) -> None:
         self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])
         hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))
