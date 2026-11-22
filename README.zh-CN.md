@@ -14,7 +14,7 @@
 
 - **平时零额外开销（~1 ms 增量尾扫）**：每次 `PreInvocation` 以 `python -S -B` / `python3 -S -B` 执行（快速路径仅导入 `json`、`os`、`sys`），按字节偏移（`rehydrate_state.json`）增量扫描日志；普通对话轮次直接返回 `{}` 零 Token 消耗，仅在刚写入新 `CHECKPOINT`（手动 `/compact` 或跨过 256K 自动压缩）后的首轮触发无损回水，内置存量老会话防误触守卫（`FRESH_CHECKPOINT_MAX_GAP = 8`）与双重幂等保护。
 - **确定性四层固定配额回水**：以可预期、可配置的四层结构取代易漂移的自适应／NLP 摘要启发式规则：
-  1. **完整用户提问时间线**（`budgetAllUserChars = 24,000`）：跨 `/fork` 分支编号还原完整提问时间线；第 1 条与最近 75 条提问优先全文保留（超额时按预算折叠），过滤更早期的 `<= 4` 字符纯非 ASCII／非数字寒暄，并对 `> 800` 字符的长粘贴内容进行折叠且保留 `transcript_full.jsonl` 精确行号指针。
+  1. **完整用户提问时间线**（`budgetAllUserChars = 24,000`）：跨 `/fork` 分支编号还原完整提问时间线；第 1 条与最近 75 条提问优先全文保留（超额时按预算折叠），过滤更早期的 `<= 4` 字符纯非 ASCII／非数字寒暄，并对已包含于第 2 层或早于近期窗口的 `> 800` 字符长粘贴进行折叠且保留章节或 `transcript_full.jsonl` 行号指针。
   2. **压缩前近期逐字对话**（`budgetRecentTurnsChars = 28,000`、`maxSingleTurnChars = 12,000`）：由新到旧回填逐字 User／Assistant 对话与单行去重工具轨迹（含压缩前尚未完成的工具调用），跨切块时保证单轮原子性绝不截断。
   3. **活跃技能、规范文档与仓库规则指针**（`budgetSkillsSpecsChars = 14,000`）：列出所触及 Git／项目根目录下的 `AGENTS.md`／`GEMINI.md` 路径指针，并从磁盘实时重读已触及的 `SKILL.md`／`*SPEC*`／`*PLAN*`／`*TEMPLATE*`／`*HANDOFF*` 文档。
   4. **活跃工作区文件实时重读**（`budgetFilesTotalChars = 28,000`、`budgetSingleFileChars = 8,000`）：从当前压缩周期（`fileScopeSincePrevCheckpoint = true`）实时重读最多 5 个修改文件与 2 个参考文件；严格 Fail-Closed 限定于工作区根目录（可选全局 `extraAllowedPaths`），解析符号链接并拦截 `.env*`、私钥、二进制文件、系统路径与 `scratch/`。

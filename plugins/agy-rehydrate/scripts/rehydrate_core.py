@@ -716,9 +716,24 @@ def _clip_preserving_fences(
     return f"{head}{omission_fn(omitted)}{tail}", True
 
 
-def fold_user_paste(txt: str, seg_path: Path | None, line_no: int, step_idx: int) -> tuple[str, bool]:
+def fold_user_paste(
+    txt: str,
+    seg_path: Path | None,
+    line_no: int,
+    step_idx: int,
+    *,
+    in_verbatim_section: bool = False,
+) -> tuple[str, bool]:
     if len(txt) <= FOLD_PASTE_THRESHOLD_CHARS:
         return txt, False
+    if in_verbatim_section:
+        return _clip_preserving_fences(
+            txt,
+            FOLD_PASTE_HEAD_CHARS,
+            FOLD_PASTE_TAIL_CHARS,
+            lambda om: f"\n  ...[folded {om} chars; full text kept verbatim in Section 2 @ Step {step_idx}]...\n",
+            120,
+        )
     loc = f"{seg_path} line {line_no} (step {step_idx})" if seg_path else f"step {step_idx}"
     return _clip_preserving_fences(
         txt,
@@ -1284,9 +1299,14 @@ def resolve_fork_ancestors(full_path: Path, cached_ancestors: Any = None) -> lis
 def format_user_timeline(
     user_messages: list[tuple[int, str, Path | None, int]],
     budget_chars: int = DEFAULT_BUDGET_ALL_USER_CHARS,
+    *,
+    fold_positions: set[int] | frozenset[int] | None = None,
+    verbatim_positions: set[int] | frozenset[int] | None = None,
 ) -> tuple[str, int, int, int, int]:
     """Render complete numbered user prompt timeline with older short-turn denoising and paste folding."""
     total_real = sum(1 for _, txt, _, _ in user_messages if not txt.startswith("--- [/fork branch "))
+    verbatim_in_sec2 = verbatim_positions or frozenset()
+    forced_fold = (fold_positions or frozenset()) | verbatim_in_sec2
 
     def render_pass(fold_before_recent: int) -> tuple[list[tuple[bool, bool, str]], int]:
         entries: list[tuple[bool, bool, str]] = []
@@ -1294,7 +1314,7 @@ def format_user_timeline(
         filtered_short = 0
         verbatim_cutoff = total_real - RECENT_USER_VERBATIM_COUNT
         fold_cutoff = total_real - fold_before_recent
-        for step_s, txt, spath, lno in user_messages:
+        for pos, (step_s, txt, spath, lno) in enumerate(user_messages):
             if txt.startswith("--- [/fork branch "):
                 entries.append((False, False, f"- {txt}"))
                 continue
@@ -1304,8 +1324,14 @@ def format_user_timeline(
                 continue
             out_txt = txt
             did_fold = False
-            if idx <= fold_cutoff:
-                out_txt, did_fold = fold_user_paste(txt, spath, lno, step_s)
+            if idx <= fold_cutoff or pos in forced_fold:
+                out_txt, did_fold = fold_user_paste(
+                    txt,
+                    spath,
+                    lno,
+                    step_s,
+                    in_verbatim_section=(pos in verbatim_in_sec2),
+                )
             first_line = out_txt.split("\n", 1)[0]
             sep = "\n" if _advance_fence_state(first_line, None) is not None else " "
             entries.append((True, did_fold, f"- [#{idx} @ step {step_s}]:{sep}{out_txt}"))
@@ -1689,7 +1715,7 @@ def build_rehydration(
 
     all_checkpoints: list[int] = list(checkpoints)
     user_messages: list[tuple[int, str, Path | None, int]] = []
-    dialogue_entries: list[str] = []
+    dialogue_entries: list[tuple[str, int | None]] = []
     modified_touch: dict[str, tuple[str, int]] = {}
     read_touch: dict[str, tuple[str, int]] = {}
     skill_spec_touch: dict[str, tuple[str, int]] = {}
@@ -1708,7 +1734,7 @@ def build_rehydration(
                 f"-> {str(seg['cid'])[:8]} @ step {seg_min}] ---"
             )
             user_messages.append((seg_min, fork_banner, None, 0))
-            dialogue_entries.append(fork_banner)
+            dialogue_entries.append((fork_banner, None))
 
         with open(seg_path, "r", encoding="utf-8-sig", errors="replace") as f:
             for line_no, line in enumerate(f, 1):
@@ -1735,8 +1761,9 @@ def build_rehydration(
                 elif stype == "USER_INPUT":
                     utext = extract_user_text(str(obj.get("content") or ""))
                     if utext and not is_compact_slash_cmd(utext):
+                        user_pos = len(user_messages)
                         user_messages.append((step_idx, utext, seg_path, line_no))
-                        dialogue_entries.append(f"[Step {step_idx} | User]:\n{utext}")
+                        dialogue_entries.append((f"[Step {step_idx} | User]:\n{utext}", user_pos))
                         pending_tools.clear()
                 elif stype == "PLANNER_RESPONSE":
                     tcs = obj.get("tool_calls") or []
@@ -1772,33 +1799,41 @@ def build_rehydration(
                         if pending_tools:
                             tool_prefix = f"  (Tools run: {_format_pending_tools(pending_tools)})\n"
                             pending_tools.clear()
-                        dialogue_entries.append(f"[Step {step_idx} | Assistant]:\n{tool_prefix}{mcontent}")
+                        dialogue_entries.append((f"[Step {step_idx} | Assistant]:\n{tool_prefix}{mcontent}", None))
 
     if pending_tools:
         dialogue_entries.append(
-            f"[Pre-Compaction In-Progress Tools]: {_format_pending_tools(pending_tools, keep_tail=True)}"
+            (f"[Pre-Compaction In-Progress Tools]: {_format_pending_tools(pending_tools, keep_tail=True)}", None)
         )
 
     prev_cp = max((c for c in all_checkpoints if c < target_cp), default=None)
     file_min_step = (prev_cp + 1) if (cfg.file_scope_since_prev_checkpoint and prev_cp is not None) else -1
 
-    # Layer 1: Complete User Request Timeline
-    all_user_block, real_user_count, kept_user_count, filtered_short_count, folded_paste_count = format_user_timeline(
-        user_messages, budget_chars=cfg.budget_all_user_chars
-    )
-
-    # Layer 2: Recent Pre-Compaction Verbatim Dialogue
-    kept_turns: list[str] = []
+    # Layer 2: Recent Pre-Compaction Verbatim Dialogue (computed before Layer 1 to deduplicate long pastes)
+    kept_turn_items: list[tuple[str, int | None, bool]] = []
     used_turns = 0
-    for entry in reversed(dialogue_entries):
+    for entry, u_pos in reversed(dialogue_entries):
         clipped_entry = clip_turn_text(entry, cfg.max_single_turn_chars)
-        if used_turns + len(clipped_entry) > cfg.budget_recent_turns_chars and kept_turns:
+        if used_turns + len(clipped_entry) > cfg.budget_recent_turns_chars and kept_turn_items:
             break
-        kept_turns.append(clipped_entry)
+        kept_turn_items.append((clipped_entry, u_pos, clipped_entry == entry))
         used_turns += len(clipped_entry) + 2
-    kept_turns.reverse()
-    while kept_turns and kept_turns[0].startswith("--- [/fork branch "):
-        kept_turns.pop(0)
+    kept_turn_items.reverse()
+    while kept_turn_items and kept_turn_items[0][0].startswith("--- [/fork branch "):
+        kept_turn_items.pop(0)
+    kept_turns = [t for t, _, _ in kept_turn_items]
+    dialogue_user_positions = {u_pos for _, u_pos, _ in kept_turn_items if u_pos is not None}
+    dialogue_verbatim_user_positions = {
+        u_pos for _, u_pos, is_verbatim in kept_turn_items if u_pos is not None and is_verbatim
+    }
+
+    # Layer 1: Complete User Request Timeline (fold >800-char pastes already present in Layer 2)
+    all_user_block, real_user_count, kept_user_count, filtered_short_count, folded_paste_count = format_user_timeline(
+        user_messages,
+        budget_chars=cfg.budget_all_user_chars,
+        fold_positions=dialogue_user_positions,
+        verbatim_positions=dialogue_verbatim_user_positions,
+    )
 
     # Layer 3: Active Skills, Spec Docs & Repo Rule Pointers
     skill_blocks: list[str] = []

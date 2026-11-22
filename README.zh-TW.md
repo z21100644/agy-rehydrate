@@ -14,7 +14,7 @@
 
 - **平時零額外開銷（~1 ms 增量尾掃）**：於每次 `PreInvocation` 以 `python -S -B` / `python3 -S -B` 執行（快速路徑僅載入 `json`、`os`、`sys`），依位元組偏移（`rehydrate_state.json`）增量掃描日誌；非壓縮輪次直接回傳 `{}` 零 Token 消耗，僅在剛產生新 `CHECKPOINT`（手動 `/compact` 或跨越 256K 自動壓縮）後的首輪觸發無損回水，並具備存量老會話防誤觸（`FRESH_CHECKPOINT_MAX_GAP = 8`）與雙重冪等保護。
 - **確定性四層固定配額回水**：以可預期、可設定的四層結構取代易漂移的自適應／NLP 摘要啟發式規則：
-  1. **完整使用者提問時間軸**（`budgetAllUserChars = 24,000`）：跨 `/fork` 分支編號還原完整提問時間軸；第 1 則與最近 75 則提問優先全文保留（超額時按預算折疊），過濾更早期的 `<= 4` 字元純非 ASCII／非數字寒暄，並對 `> 800` 字元的長貼上內容進行折疊且保留 `transcript_full.jsonl` 精確行號指標。
+  1. **完整使用者提問時間軸**（`budgetAllUserChars = 24,000`）：跨 `/fork` 分支編號還原完整提問時間軸；第 1 則與最近 75 則提問優先全文保留（超額時按預算折疊），過濾更早期的 `<= 4` 字元純非 ASCII／非數字寒暄，並對已包含於第 2 層或早於近期視窗的 `> 800` 字元長貼上進行折疊且保留章節或 `transcript_full.jsonl` 行號指標。
   2. **壓縮前近期逐字對話**（`budgetRecentTurnsChars = 28,000`、`maxSingleTurnChars = 12,000`）：由新至舊回填逐字 User／Assistant 對話與單行去重工具軌跡（含壓縮前尚未結束的工具呼叫），跨切塊時保證單輪原子性絕不攔腰切斷。
   3. **活躍技能、規範文件與倉庫規則指標**（`budgetSkillsSpecsChars = 14,000`）：列出所觸及 Git／專案根目錄下的 `AGENTS.md`／`GEMINI.md` 路徑指標，並從磁碟即時重讀已觸及的 `SKILL.md`／`*SPEC*`／`*PLAN*`／`*TEMPLATE*`／`*HANDOFF*` 文件。
   4. **活躍工作區檔案即時重讀**（`budgetFilesTotalChars = 28,000`、`budgetSingleFileChars = 8,000`）：自當前壓縮週期（`fileScopeSincePrevCheckpoint = true`）即時重讀最多 5 個修改檔與 2 個參考檔；嚴格 Fail-Closed 限定於工作區根目錄（可選全域 `extraAllowedPaths`），解析符號連結並攔截 `.env*`、私鑰、二進位檔、系統目錄與 `scratch/`。

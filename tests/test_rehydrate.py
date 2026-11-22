@@ -1551,6 +1551,112 @@ class RehydrateTests(unittest.TestCase):
                 self.assertIn("disabled=5", st_out)
                 self.assertIn("rehydrated=8", st_out)
 
+    def test_layer1_folds_long_pastes_already_in_layer2(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            logs = root / "brain" / "sess-dedup" / ".system_generated" / "logs"
+            full_log = logs / "transcript_full.jsonl"
+
+            older_paste_mid = "OLDER_PASTE_UNIQUE_MIDDLE_TOKEN_111"
+            older_paste = (
+                "Earlier spec header\n"
+                + ("old line\n" * 60)
+                + older_paste_mid
+                + "\n"
+                + ("old tail\n" * 60)
+            )
+            recent_paste_mid = "RECENT_PASTE_UNIQUE_MIDDLE_TOKEN_222"
+            recent_paste = (
+                "Check robocopy output:\n```text\n"
+                + ("copied file line\n" * 40)
+                + recent_paste_mid
+                + "\n"
+                + ("summary line\n" * 40)
+                + "```"
+            )
+            clipped_paste_mid = "CLIPPED_PASTE_UNIQUE_MIDDLE_TOKEN_333"
+            clipped_paste = (
+                "Huge log start\n"
+                + ("log_row_alpha\n" * 160)
+                + clipped_paste_mid
+                + "\n"
+                + ("log_row_omega\n" * 160)
+            )
+
+            records = [
+                # Step 0: older >800 paste pushed out of Layer 2 by Step 1's large assistant reply
+                {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>\n{older_paste}\n</USER_REQUEST>"},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Long analysis:\n" + ("detail " * 600)},
+                # Step 2: short recent prompt in Layer 2 (<= 800 chars, must stay verbatim in Layer 1)
+                {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>\nShort follow-up question\n</USER_REQUEST>"},
+                {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Short answer."},
+                # Step 4: >800 paste that fits verbatim in Layer 2 (must fold in Layer 1 with Section 2 pointer)
+                {"step_index": 4, "type": "USER_INPUT", "content": f"<USER_REQUEST>\n{recent_paste}\n</USER_REQUEST>"},
+                {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "Confirmed applied."},
+                {"step_index": 6, "type": "CHECKPOINT", "content": "<summary>cp6</summary>"},
+            ]
+            _write_jsonl(full_log, records)
+
+            cfg = core.RehydrateConfig(
+                budget_all_user_chars=24_000,
+                budget_recent_turns_chars=3_500,
+                max_single_turn_chars=3_000,
+            )
+            res = core.build_rehydration(full_log, config=cfg, workspace_roots=[ws], up_to_checkpoint_step=6)
+            self.assertIsNotNone(res)
+            assert res is not None
+            msg, stats = res
+
+            sec1 = msg.split("## 2. Recent Pre-Compaction Verbatim Dialogue")[0]
+            sec2 = msg.split("## 2. Recent Pre-Compaction Verbatim Dialogue")[1]
+
+            # 1) Older paste NOT in Layer 2 stays 100% verbatim in Layer 1
+            self.assertNotIn("[Step 0 | User]:", sec2)
+            self.assertIn(older_paste_mid, sec1)
+
+            # 2) Short recent prompt in Layer 2 stays verbatim in Layer 1
+            self.assertIn("Short follow-up question", sec1)
+            self.assertIn("Short follow-up question", sec2)
+
+            # 3) Recent >800 paste kept verbatim in Layer 2 is folded in Layer 1 with Section 2 pointer
+            self.assertNotIn(recent_paste_mid, sec1)
+            self.assertIn("full text kept verbatim in Section 2 @ Step 4", sec1)
+            self.assertIn(recent_paste_mid, sec2)
+            self.assertEqual(stats["folded_paste_msgs"], 1)
+            self.assertTrue(_commonmark_fences_balanced(msg))
+            for chunk in stats["chunks"]:
+                self.assertTrue(_commonmark_fences_balanced(chunk))
+
+            # 4) Huge paste clipped in Layer 2 must fold in Layer 1 with read_file pointer (not claiming verbatim)
+            full_log_clipped = logs / "transcript_full_clipped.jsonl"
+            _write_jsonl(
+                full_log_clipped,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>\n{clipped_paste}\n</USER_REQUEST>"},
+                    {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Analyzed."},
+                    {"step_index": 2, "type": "CHECKPOINT", "content": "<summary>cp2</summary>"},
+                ],
+            )
+            cfg_clip = core.RehydrateConfig(
+                budget_all_user_chars=24_000,
+                budget_recent_turns_chars=5_000,
+                max_single_turn_chars=1_500,
+            )
+            res2 = core.build_rehydration(
+                full_log_clipped, config=cfg_clip, workspace_roots=[ws], up_to_checkpoint_step=2
+            )
+            self.assertIsNotNone(res2)
+            assert res2 is not None
+            msg2, stats2 = res2
+            sec1_2 = msg2.split("## 2. Recent Pre-Compaction Verbatim Dialogue")[0]
+            self.assertNotIn(clipped_paste_mid, sec1_2)
+            self.assertNotIn("full text kept verbatim in Section 2", sec1_2)
+            self.assertIn("read_file", sec1_2)
+            self.assertIn("line 1 (step 0)", sec1_2)
+            self.assertEqual(stats2["folded_paste_msgs"], 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
