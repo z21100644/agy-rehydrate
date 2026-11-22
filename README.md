@@ -2,23 +2,25 @@
 
 # AGY Post-Compact Rehydration (`agy-rehydrate`)
 
-Standalone native plugin for **Google Antigravity** (Desktop App 2.x, CLI `agy`, and IDE), adapted from [AGY Post-Compact Rehydration](https://agy-rehydrate.pages.dev/) with full cross-platform support (**Windows / macOS / Linux**) and multi-surface compatibility.
+Standalone native plugin for **Google Antigravity** (Desktop App 2.x, CLI `agy`, and IDE), adapted from [AGY Harness Hook Tricks: Post-Compact Rehydration](https://agy-harness-hook-tricks.pages.dev/compact-rehydration) with full cross-platform support (**Windows / macOS / Linux**) and multi-surface compatibility.
 
 Zero third-party dependencies — requires only `Python 3.11.2+` in `PATH`.
 
 ---
 
-## Core Capabilities
+## Core Capabilities (`v2.1.0`)
 
-- **Zero Overhead on Normal Turns (~1 ms)**: Uses byte-offset incremental tail scanning (`rehydrate_state.json`) during `PreInvocation` and immediately returns `{}` unless a fresh `CHECKPOINT` (`/compact` or 256K auto-compaction) just occurred.
-- **Self-Adaptive State Recovery (`adaptive: true`)**: Automatically classifies compaction context into three regimes (`completed_qa` / `active_coding` / `mid_turn` 256K mid-tool-loop — gated on eligible workspace modifications) with dynamic preamble-aware framing and proportional pre-compaction size caps (silently returning `{}` when a short Q&A is already 100% covered by `<CONTEXT_SUMMARY>`):
-  1. **Delta Earlier User Request Timeline & Multi-Checkpoint Anti-Decay Index**: Parses native `CHECKPOINT` (`# User Requests`) so `## 1` **only restores earlier prompts omitted by the native 10-request window or across `/fork`** (stripping nested quotes, filtering `<= 4`-char pure-CJK backchannels, folding pre-window raw log pastes first with line pointers), and on multi-compaction sessions recovers dropped `Done` milestones / constraints from earlier checkpoints with exact `transcript_full.jsonl` line pointers.
-  2. **Budget-Driven Pre-Compaction Dialogue**: Keeps `2` exchanges (`4` entries) in `completed_qa` and `active_coding`, and `3` exchanges (`6` entries) in `mid_turn` (`[ERROR]`-tagged tool trajectories); keeps earlier Assistant replies verbatim whenever remaining turn budget allows and dynamically scales middle-folding only on overflow, while suppressing stale pre-checkpoint dialogue on delayed mid-turn auto-compactions (`max_step - checkpoint > 8`).
-  3. **Live Workspace Reality & File Status Notice**: Silently detects missing/moved workspace paths still referenced in `<CONTEXT_SUMMARY>` (listing live top-level workspace entries), external disk edits since the last tool touch, and uninjected modified files (with an explicit re-read advisory) while enforcing all 3 security gates.
-  4. **Restored Active Skills, Specs & Edit-Hunk Windowed Files**: Re-reads recently accessed (`status == "DONE"`, `<= 25` steps read-only, `<= 120` steps modified) custom `SKILL.md` / `*SPEC*` / `*PLAN*` / `*TEMPLATE*` / `*HANDOFF*` files and extracts file headers + `±45` lines around `edit_file` anchors for active workspace files (turn-aware within the current compaction window; skips completed-turn read-only files unless `maxReferencedFiles > 0`), with sequential `## 1..N` headings and whole-file trailing trim under cap pressure.
+`<CONTEXT_SUMMARY>` is lossy, while local `transcript_full.jsonl` and workspace files on disk are lossless ground truth.
+
+- **Zero Overhead on Normal Turns (~1 ms)**: Runs `python -S -B` / `python3 -S -B` during `PreInvocation` (importing only `json`, `os`, `sys`) with incremental byte-offset tail scanning (`rehydrate_state.json`), returning `{}` with zero token overhead unless a fresh `CHECKPOINT` (`/compact` or 256K auto-compaction) just occurred (`FRESH_CHECKPOINT_MAX_GAP = 8` guard and dual idempotency protection).
+- **Deterministic 4-Layer State Recovery**: Predictable, fixed-budget layers without fragile adaptive/NLP summary heuristics:
+  1. **Complete User Request Timeline** (`budgetAllUserChars = 24,000`): Numbered full user prompt timeline across `/fork` branches; prompt #1 and the last 75 prompts are kept verbatim (subject to budget folding), older `<= 4`-char non-ASCII/non-digit backchannels are filtered, and `> 800`-char pastes are folded with `transcript_full.jsonl` line pointers.
+  2. **Recent Pre-Compaction Verbatim Dialogue** (`budgetRecentTurnsChars = 28,000`, `maxSingleTurnChars = 12,000`): Reverse-walked verbatim User/Assistant exchanges with single-line deduplicated tool trajectories (plus pre-compaction in-progress tools), never split mid-turn across chunks.
+  3. **Restored Active Skills, Spec Docs & Repo Rule Pointers** (`budgetSkillsSpecsChars = 14,000`): `AGENTS.md` / `GEMINI.md` path pointers at touched git or project roots plus live disk reads of touched `SKILL.md` / `*SPEC*` / `*PLAN*` / `*TEMPLATE*` / `*HANDOFF*` files.
+  4. **Restored Active Workspace Files** (`budgetFilesTotalChars = 28,000`, `budgetSingleFileChars = 8,000`): Live disk reads of Top 5 modified + Top 2 referenced workspace files from the current compaction cycle (`fileScopeSincePrevCheckpoint = true`), strictly fail-closed to workspace roots (plus optional global-only `extraAllowedPaths`), resolving symlinks and blocking `.env*`, private keys, binaries, system paths, and `scratch/`.
 - **Cross-`/fork` Lineage Stitching**: Automatically traces parent conversation segments up to 8 hops with strict step-range isolation (`[min_step, K - 1]`).
-- **48 KiB Chunking & Fail-Open Safety**: Splits injected `SystemMessage` blocks under `44,000` UTF-8 bytes to prevent truncation at Antigravity's 48 KiB step cap, and guarantees Fail-Open `{}` output on any unexpected exception.
-- **`/rehydrate` Diagnostic Skill**: Built-in `status`, `inspect`, `preview`, and `show-config` CLI subcommands to inspect sessions or dry-run rehydration before running `/compact`.
+- **48 KiB Chunking & Fail-Open Safety**: Splits injected `SystemMessage` blocks under `44,000` UTF-8 bytes with CommonMark fence-safe clipping and turn-atomic chunk boundaries, and guarantees Fail-Open `{}` output on any unexpected exception.
+- **`/rehydrate` Diagnostic Skill**: Built-in `status`, `inspect`, `preview`, and `show-config` read-only CLI subcommands (supporting `--cwd`, `--checkpoint`, `--limit`, and `--full`) to inspect sessions or dry-run rehydration before running `/compact`.
 
 ---
 
@@ -47,15 +49,18 @@ Create `<workspace>/.agents/rehydrate.json` (or `~/.agents/rehydrate.json` globa
 ```json
 {
   "enabled": true,
-  "adaptive": true,
   "budgetAllUserChars": 24000,
-  "budgetRecentTurnsChars": 14000,
-  "budgetSkillsSpecsChars": 12000,
-  "budgetFilesTotalChars": 24000,
-  "budgetSingleFileChars": 10000,
-  "maxRecentEntries": 6,
-  "maxModifiedFiles": 3,
-  "maxReferencedFiles": 0,
-  "maxModifiedAgeSteps": 60
+  "budgetRecentTurnsChars": 28000,
+  "budgetSkillsSpecsChars": 14000,
+  "budgetFilesTotalChars": 28000,
+  "budgetSingleFileChars": 8000,
+  "maxSingleTurnChars": 12000,
+  "maxModifiedFiles": 5,
+  "maxReferencedFiles": 2,
+  "fileScopeSincePrevCheckpoint": true
 }
 ```
+
+Global-only security controls in `~/.agents/rehydrate.json` (ignored or cannot be loosened by workspace configs):
+- `"extraAllowedPaths": ["~/path/to/trusted/dir"]` — allow Layer 4 live disk reads from explicit non-workspace directories (still subject to secret/binary/system-path filters).
+- `"enabled": false` in `~/.agents/rehydrate.json` cannot be overridden to `true` by a workspace `.agents/rehydrate.json`.

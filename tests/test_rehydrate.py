@@ -1,3197 +1,1556 @@
 #!/usr/bin/env python3
-"""Comprehensive regression and performance test suite for `agy-rehydrate`."""
+"""Comprehensive unit and integration tests for `agy-rehydrate`."""
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import io
 import json
 import os
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import sys
-import time
+import tempfile
 import unittest
+from unittest import mock
 
 sys.dont_write_bytecode = True
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_SRC = REPO_ROOT / "plugins" / "agy-rehydrate"
-SCRIPTS_DIR = PLUGIN_SRC / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+PLUGIN_ROOT = (
+    _REPO_ROOT / "plugins" / "agy-rehydrate"
+    if (_REPO_ROOT / "plugins" / "agy-rehydrate" / "plugin.json").is_file()
+    else _REPO_ROOT
+)
+SCRIPTS_DIR = PLUGIN_ROOT / "scripts"
+HOOK_SCRIPT = SCRIPTS_DIR / "rehydrate_after_compact.py"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
-import rehydrate_after_compact as mod  # noqa: E402
+import rehydrate_after_compact as rh_entry
+import rehydrate_cli as cli
+import rehydrate_core as core
 
 
-def _write_jsonl(path: Path, rows: list[dict]) -> None:
+def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-class RehydrateRegressionTests(unittest.TestCase):
-    """End-to-end and unit regression suite for self-adaptive post-compact rehydration."""
+_CM_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
-    def setUp(self) -> None:
-        self.tmp_root = REPO_ROOT / ".tmp_unittest_rehydrate"
-        if self.tmp_root.exists():
-            shutil.rmtree(self.tmp_root, ignore_errors=True)
-        self.ws = self.tmp_root / "workspace"
-        self.ws.mkdir(parents=True, exist_ok=True)
 
-    def tearDown(self) -> None:
-        if self.tmp_root.exists():
-            shutil.rmtree(self.tmp_root, ignore_errors=True)
+def _commonmark_fences_balanced(text: str) -> bool:
+    """Independent CommonMark fenced-code-block balance checker."""
+    active: tuple[str, int] | None = None
+    for line in text.split("\n"):
+        m = _CM_FENCE_RE.match(line)
+        if not m:
+            continue
+        marker, rest = m.groups()
+        ch, length = marker[0], len(marker)
+        if active is None:
+            if ch == "`" and "`" in rest:
+                continue
+            active = (ch, length)
+        else:
+            a_ch, a_len = active
+            if ch == a_ch and length >= a_len and not rest.strip():
+                active = None
+    return active is None
 
-    def test_trivial_greeting_silent_bypass_and_hook_idempotency(self) -> None:
-        logs = self.tmp_root / "brain" / "cid-trivial" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>你好</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "你好！有什麼我可以協助的嗎？"},
-            {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>/compact</USER_REQUEST>"},
-            {
-                "step_index": 3,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 你好\n<summary>Greeting.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs / "transcript.jsonl", rows)
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
 
-        self.assertIsNone(mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws]))
+@contextmanager
+def _symlink_or_mock_resolve(link_path: Path, target_path: Path):
+    """Create a real symlink when OS permits, else mock `Path.resolve` for `link_path -> target_path`."""
+    try:
+        os.symlink(target_path, link_path)
+        created_real = True
+    except (OSError, NotImplementedError):
+        created_real = False
 
-        payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
-        p = subprocess.run(
-            [sys.executable, "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertEqual(json.loads(p.stdout.strip()), {})
-        state_file = logs / "rehydrate_state.json"
-        self.assertTrue(state_file.is_file())
-        mtime_first = state_file.stat().st_mtime_ns
+    if created_real:
+        try:
+            yield
+        finally:
+            try:
+                link_path.unlink()
+            except OSError:
+                pass
+        return
 
-        # Repeat normal-turn call with unchanged transcript must skip redundant state disk write
-        time.sleep(0.02)
-        p2 = subprocess.run(
-            [sys.executable, "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertEqual(json.loads(p2.stdout.strip()), {})
-        self.assertEqual(state_file.stat().st_mtime_ns, mtime_first)
+    link_key = os.path.normcase(os.path.normpath(str(link_path)))
+    orig_resolve = Path.resolve
+    resolved_target = orig_resolve(target_path)
 
-    def test_completed_qa_two_exchanges_and_checkpoint_delta_dedup(self) -> None:
-        ref_doc = self.ws / "guide.md"
-        ref_doc.write_text("# Guide\n" + ("Line content.\n" * 200), encoding="utf-8")
-        logs = self.tmp_root / "brain" / "cid-qa" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>早期需求一：架構設定 A</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到 A。"},
-            {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>近期問題二：檢查文件</USER_REQUEST>"},
-            {
-                "step_index": 3,
-                "type": "PLANNER_RESPONSE",
-                "content": "先讀取 guide.md。",
-                "tool_calls": [{"name": "read_file", "args": {"Path": str(ref_doc)}}],
-            },
-            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": "x" * 6000},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "已完成檢查。" + ("中段補充細節文字。" * 130) + "結論無誤。"},
-            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>最後問題三：確認目前結論</USER_REQUEST>"},
-            {"step_index": 7, "type": "PLANNER_RESPONSE", "content": "最終結論：維持自適應兩輪問答。"},
-            {
-                "step_index": 8,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n"
-                    "1. 近期問題二：檢查文件\n2. 最後問題三：確認目前結論\n"
-                    "<summary>QA summary.</summary>\n</CONTEXT_SUMMARY>"
-                ),
-            },
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["session_mode"], "completed_qa")
-        self.assertEqual(st["kept_turns"], 4)
-        self.assertEqual(st["folded_assistant_turns"], 1)
-        self.assertEqual(st["earlier_user_msgs"], 1)
-        self.assertEqual(st["files"], 0)
-        self.assertIn("早期需求一：架構設定 A", msg)
-        self.assertIn("[Step 2 | User]:", msg)
-        self.assertIn("(Tools run: read_file(guide.md))", msg)
-        self.assertLessEqual(st["chars"], st["ratio_cap"])
+    def _patched_resolve(self: Path, strict: bool = False) -> Path:
+        if os.path.normcase(os.path.normpath(str(self))) == link_key:
+            return resolved_target
+        return orig_resolve(self, strict=strict)
 
-    def test_attachment_dedup_provenance_and_truncated_tail_recovery(self) -> None:
-        logs = self.tmp_root / "brain" / "cid-att" / ".system_generated" / "logs"
-        long_paste = (
-            "Ran check git\nAnalyzed a.py:L1-10\nEdited b.py\nCreated c.py\n\n"
-            "已完成第一階段修改：\n\n1. **模組甲**\n   - 細節說明\n"
-            + ("中間長段實作紀錄文字 " * 260)
-            + "\n最終驗收結論：全部 34 項測試通過。"
-        )
-        prefix_in_cp = long_paste[:1200] + "\n<truncated 3200 bytes>"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{long_paste}</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到長篇紀錄。"},
-            {
-                "step_index": 2,
-                "type": "USER_INPUT",
-                "media": [{"mime_type": "image/png", "uri": "C:/tmp/media_999_shot.png"}],
-                "content": "<USER_REQUEST>看一下呼吸燈配色</USER_REQUEST>",
-            },
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "配色正常。"},
-            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>倒數第二問</USER_REQUEST>"},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "回覆倒數第二問。"},
-            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>最後一問</USER_REQUEST>"},
-            {"step_index": 7, "type": "PLANNER_RESPONSE", "content": "回覆最後一問。"},
-            {
-                "step_index": 8,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n"
-                    f"1. {prefix_in_cp}\n"
-                    "2. 看一下呼吸燈配色\n  - [Attachment: image/png (C:/tmp/media_999_shot.png)]\n"
-                    "3. 倒數第二問\n4. 最後一問\n"
-                    "<summary>Summary.</summary>\n</CONTEXT_SUMMARY>"
-                ),
-            },
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertNotIn("看一下呼吸燈配色", msg)
-        self.assertEqual(st["deduped_summary_user_msgs"], 1)
-        self.assertIn("#2 `media_999_shot.png` @ step 2", msg)
-        self.assertIn("[Opening preserved in <CONTEXT_SUMMARY>; recovered truncated tail", msg)
-        self.assertIn("最終驗收結論：全部 34 項測試通過。", msg)
+    with mock.patch.object(Path, "resolve", _patched_resolve):
+        yield
 
-    def test_file_tier_ranking_indented_hunk_and_three_security_gates(self) -> None:
-        outside = self.tmp_root / "outside_secret.txt"
-        outside.write_text("TOP_SECRET_OUTSIDE", encoding="utf-8")
-        (self.ws / ".env").write_text("SECRET_TOKEN=123", encoding="utf-8")
 
-        src_js = self.ws / "telemetry.mjs"
-        test_js = self.ws / "telemetry.test.mjs"
-        rd1 = self.ws / "README.md"
-        rd2 = self.ws / "README.zh-TW.md"
-        rd3 = self.ws / "README.zh-CN.md"
-        err_py = self.ws / "denied.py"
-
-        js_lines = [f"export function pad_{i:03d}() {{ return 'val_{i:03d}_padding'; }}" for i in range(1, 351)]
-        js_lines[219] = "        if (ok) {\n            cnt += 1;\n        }"
-        src_js.write_text("\n".join(js_lines) + "\n", encoding="utf-8")
-        test_js.write_text("import assert from 'node:assert';\nassert.ok(true);\n", encoding="utf-8")
-        err_py.write_text("DENIED_FILE_CONTENT = 1\n", encoding="utf-8")
-        for rd in (rd1, rd2, rd3):
-            rd.write_text("# Doc\n" + ("Documentation line.\n" * 180), encoding="utf-8")
-
-        logs = self.tmp_root / "brain" / "cid-sec" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>更新 telemetry 與說明文件</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "name": "edit_file",
-                        "args": {
-                            "Path": str(src_js),
-                            "Replacement": "\n        if (ok) {\n            cnt += 1;\n        }\n",
-                        },
-                    },
-                    {"name": "edit_file", "args": {"Path": str(test_js), "Replacement": "assert.ok(true);"}},
-                    {"name": "read_file", "args": {"Path": str(outside)}},
-                    {"name": "read_file", "args": {"Path": str(self.ws / ".env")}},
-                    {"name": "edit_file", "args": {"Path": str(err_py), "Replacement": "x"}},
+class RehydrateTests(unittest.TestCase):
+    def test_fast_path_skips_heavy_imports_under_python_S_B(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            logs = Path(td) / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            _write_jsonl(
+                compact,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>"},
+                    {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "hello"},
                 ],
-            },
-            {"step_index": 2, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 3, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 4, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 5, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 6, "type": "TOOL_RESPONSE", "status": "ERROR", "content": "Permission denied"},
-            {
-                "step_index": 7,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(rd1), "Replacement": "# Doc"}},
-                    {"name": "edit_file", "args": {"Path": str(rd2), "Replacement": "# Doc"}},
-                    {"name": "edit_file", "args": {"Path": str(rd3), "Replacement": "# Doc"}},
-                ],
-            },
-            {"step_index": 8, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 9, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 10, "type": "TOOL_RESPONSE", "status": "DONE", "content": "ok"},
-            {"step_index": 11, "type": "PLANNER_RESPONSE", "content": "已全部更新完成。"},
-            {
-                "step_index": 12,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 更新 telemetry 與說明文件\n<summary>Done</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["session_mode"], "active_coding")
-        self.assertTrue(st["file_paths"][0].endswith("telemetry.mjs"))
-        self.assertTrue(st["file_paths"][1].endswith("telemetry.test.mjs"))
-        self.assertIn("cnt += 1;", msg)
-        self.assertNotIn("TOP_SECRET_OUTSIDE", msg)
-        self.assertNotIn("SECRET_TOKEN", msg)
-        self.assertNotIn("DENIED_FILE_CONTENT", msg)
-        self.assertLessEqual(st["chars"], st["ratio_cap"])
+            )
+            payload = json.dumps({"transcriptPath": str(compact), "cwd": td})
+            probe = (
+                "import io, json, sys; "
+                f"sys.path.insert(0, {str(SCRIPTS_DIR)!r}); "
+                "import rehydrate_after_compact as m; "
+                f"sys.stdin = io.StringIO({payload!r}); "
+                "buf = io.StringIO(); "
+                "orig = sys.stdout; sys.stdout = buf; "
+                "rc = m.run_hook(); "
+                "sys.stdout = orig; "
+                "heavy = [k for k in ('pathlib','datetime','unicodedata','argparse','rehydrate_core','rehydrate_cli') if k in sys.modules]; "
+                "print(json.dumps({'rc': rc, 'out': buf.getvalue().strip(), 'heavy': heavy}))"
+            )
+            res = subprocess.run(
+                [sys.executable, "-S", "-B", "-c", probe],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            info = json.loads(res.stdout.strip())
+            self.assertEqual(info["rc"], 0)
+            self.assertEqual(info["out"], "{}")
+            self.assertEqual(info["heavy"], [])
 
-    def test_mid_turn_scoped_read_and_fork_lineage_isolation(self) -> None:
-        mod_file = self.ws / "worker.py"
-        mod_file.write_text("\n".join(f"ROW_{i:03d} = {i}" for i in range(1, 301)) + "\n", encoding="utf-8")
-
-        parent_logs = self.tmp_root / "brain" / "parent-11112222" / ".system_generated" / "logs"
-        _write_jsonl(
-            parent_logs / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>父分支初始需求</USER_REQUEST>"},
-                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "父分支回覆。"},
-                {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>分叉後父分支不應洩漏的訊息</USER_REQUEST>"},
-            ],
-        )
-
-        child_logs = self.tmp_root / "brain" / "child-33334444" / ".system_generated" / "logs"
-        _write_jsonl(
-            child_logs / "transcript_full.jsonl",
-            [
-                {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>子分支檢查 worker.py 第 150 行</USER_REQUEST>"},
-                {
-                    "step_index": 3,
-                    "type": "PLANNER_RESPONSE",
-                    "content": "讀取 145-155 行。",
-                    "tool_calls": [{"name": "read_file", "args": {"Path": str(mod_file), "StartLine": 145, "EndLine": 155}}],
-                },
-                {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": "lines 145-155"},
-                {
-                    "step_index": 5,
-                    "type": "CHECKPOINT",
-                    "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 子分支檢查 worker.py 第 150 行\n<summary>Mid</summary>\n</CONTEXT_SUMMARY>",
-                },
-            ],
-        )
-        ancestors = [{"cid": "parent-11112222", "path": str(parent_logs / "transcript_full.jsonl"), "min_step": 0, "max_step": 1}]
-        res = mod.build_rehydration(child_logs / "transcript_full.jsonl", ancestors=ancestors, workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["session_mode"], "mid_turn")
-        self.assertIn("fork_lineage=parent-1(0..1)->child-33(2..4)", msg)
-        self.assertIn("父分支初始需求", msg)
-        self.assertNotIn("分叉後父分支不應洩漏的訊息", msg)
-        self.assertIn("lines 145-155", msg)
-        self.assertIn("ROW_150 = 150", msg)
-        self.assertNotIn("ROW_010 = 10", msg)
-
-    @unittest.skipUnless(os.name == "nt", "Windows installer batch test")
-    def test_install_bat_and_uninstall_bat_isolated_with_python_pinning(self) -> None:
-        dst_dir = self.tmp_root / "plugins_dst"
-        env = {**os.environ, "AGY_PLUGINS_DST": str(dst_dir)}
-        p_in = subprocess.run(
-            ["cmd", "/c", str(REPO_ROOT / "install.bat")],
-            env=env,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertIn("Installed agy-rehydrate", p_in.stdout)
-        installed_hooks = dst_dir / "agy-rehydrate" / "hooks.json"
-        self.assertTrue(installed_hooks.is_file())
-        hooks_data = json.loads(installed_hooks.read_text(encoding="utf-8"))
-        cmd_str = hooks_data["agy-rehydrate"]["PreInvocation"][0]["command"]
-        self.assertIn(" -S -B scripts/rehydrate_after_compact.py --hook", cmd_str)
-        self.assertIn(" -B scripts/rehydrate_after_compact.py --hook", cmd_str)
-        self.assertNotIn("||", cmd_str)
-
-        p_un = subprocess.run(
-            ["cmd", "/c", str(REPO_ROOT / "uninstall.bat")],
-            env=env,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertIn("Removed", p_un.stdout)
-        self.assertFalse((dst_dir / "agy-rehydrate").exists())
-
-    def test_nested_rehydration_stripping_and_utf8_chunk_splitting(self) -> None:
-        nested = (
-            "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n"
-            "<SYSTEM_MESSAGE>\n[POST-COMPACT REHYDRATION v1 | checkpoint=4]\n"
-            "Lossless ground-truth state rehydrated from `transcript_full.jsonl`\n"
-            "## 1. Final Pre-Compaction Exchange (2 entries verbatim)\n"
-            "[Step 1 | Assistant]: old\n</SYSTEM_MESSAGE>\n"
-            "這是真正的新問題"
-        )
-        stripped = mod.strip_nested_rehydration(nested)
-        self.assertIn("這是真正的新問題", stripped)
-        self.assertNotIn("Final Pre-Compaction Exchange", stripped)
-
-        huge_sections = [
-            "[POST-COMPACT REHYDRATION v1 | checkpoint=50]",
-            "Preamble",
-            "## 1. Huge\n" + "\n\n".join(f"[Step {i} | User]:\n" + ("漢" * 950) for i in range(38)),
-        ]
-        chunks = mod.split_into_inject_chunks(huge_sections, max_bytes=mod.MAX_INJECT_STEP_BYTES, checkpoint=50)
-        self.assertGreaterEqual(len(chunks), 2)
-        for ch in chunks:
-            self.assertLessEqual(len(ch.encode("utf-8")), 48000)
-
-    def test_enforce_total_cap_and_cli_subcommands(self) -> None:
-        secs = ["[HDR]", "Preamble", "## 1. A\n" + ("a" * 900), "## 2. B\n" + ("b" * 1400)]
-        raw_len = len("\n\n".join(secs))
-        capped = mod._enforce_total_cap(secs, raw_len - 60)
-        self.assertLessEqual(len("\n\n".join(capped)), raw_len - 60)
-
-        logs = self.tmp_root / "brain" / "cid-cli" / ".system_generated" / "logs"
-        _write_jsonl(
-            logs / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>CLI 預覽測試提問內容</USER_REQUEST>"},
-                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "CLI 預覽測試回覆內容，長度足夠觸發正常輸出。" * 8},
-            ],
-        )
-        p_cfg = subprocess.run(
-            [sys.executable, "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--cwd", str(self.ws), "show-config"],
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertTrue(json.loads(p_cfg.stdout)["adaptive"])
-
-        p_ins = subprocess.run(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS_DIR / "rehydrate_after_compact.py"),
-                "--cwd",
-                str(self.ws),
-                "inspect",
-                str(logs / "transcript_full.jsonl"),
-            ],
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        ins_data = json.loads(p_ins.stdout)
-        self.assertTrue(ins_data["simulated"])
-        self.assertEqual(ins_data["session_mode"], "completed_qa")
-
-    def test_fast_path_hook_skips_heavy_imports_and_uses_s_flag(self) -> None:
-        logs = self.tmp_root / "brain" / "cid-fast" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>normal query</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "normal answer"},
-        ]
-        _write_jsonl(logs / "transcript.jsonl", rows)
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
-
-        probe_code = "\n".join(
-            [
-                "import io, sys",
-                f"sys.path.insert(0, {repr(str(SCRIPTS_DIR))})",
-                "import rehydrate_after_compact as m",
-                f"sys.stdin = io.StringIO({repr(payload)})",
-                "rc = m.run_hook()",
-                "assert rc == 0",
-                "for legacy in ('_RE_MOD', '_PATH_CLS', '_DATETIME_CLS', '_DEQUE_CLS', '_COMPILED_REGEX'):",
-                "    assert legacy not in m.__dict__, f'legacy global {legacy} leaked on entrypoint'",
-                "for banned in (",
-                "    'dataclasses', 'pathlib', 'datetime', 'argparse', 'urllib', 'unicodedata',",
-                "    'rehydrate_helpers', 'rehydrate_engine', 'rehydrate_cli',",
-                "):",
-                "    assert banned not in sys.modules, f'{banned} imported on normal turn'",
-                "import rehydrate_helpers as mh",
-                "assert not mh._COMPILED_REGEX and mh._RE_MOD is None and mh._PATH_CLS is None and mh._DATETIME_CLS is None and mh._DEQUE_CLS is None",
+    def test_disabled_config_advances_state_to_keep_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            (ws / ".agents").mkdir(parents=True)
+            (ws / ".agents" / "rehydrate.json").write_text('{"enabled": false}\n', encoding="utf-8")
+            logs = root / "brain" / "c-disabled" / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            records = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nhello\n</USER_REQUEST>"},
+                {"step_index": 1, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
             ]
-        )
-        p_probe = subprocess.run(
-            [sys.executable, "-S", "-B", "-c", probe_code],
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertEqual(json.loads(p_probe.stdout.strip()), {})
+            _write_jsonl(compact, records)
+            payload = json.dumps({"transcriptPath": str(compact), "workspacePaths": [str(ws)], "cwd": str(ws)})
 
-        p_cli = subprocess.run(
-            [sys.executable, "-S", "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        self.assertEqual(json.loads(p_cli.stdout.strip()), {})
+            # First call sees checkpoint -> checks config (disabled) -> returns {} and advances state
+            res1 = subprocess.run(
+                [sys.executable, "-S", "-B", str(HOOK_SCRIPT), "--hook"],
+                input=payload,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(res1.stdout.strip(), "{}")
+            state_path = logs / "rehydrate_state.json"
+            self.assertTrue(state_path.is_file())
+            st1 = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(st1["last_rehydrated_checkpoint"], 1)
+            self.assertEqual(st1.get("last_status"), "disabled")
 
-    def test_sync_nonzero_exit_and_async_running_task_resolution(self) -> None:
-        ok_py = self.ws / "ok_file.py"
-        denied_py = self.ws / "denied_done.py"
-        ok_py.write_text("VALUE = 42\n", encoding="utf-8")
-        denied_py.write_text("SHOULD_NOT_APPEAR = 999\n", encoding="utf-8")
+            # Second call with a normal appended step must stay on fast-path without importing rehydrate_core
+            records.append({"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>\nnext\n</USER_REQUEST>"})
+            _write_jsonl(compact, records)
+            probe = (
+                "import io, json, sys; "
+                f"sys.path.insert(0, {str(SCRIPTS_DIR)!r}); "
+                "import rehydrate_after_compact as m; "
+                f"sys.stdin = io.StringIO({payload!r}); "
+                "buf = io.StringIO(); orig = sys.stdout; sys.stdout = buf; "
+                "m.run_hook(); sys.stdout = orig; "
+                "print(json.dumps({'out': buf.getvalue().strip(), 'loaded_core': 'rehydrate_core' in sys.modules}))"
+            )
+            res2 = subprocess.run([sys.executable, "-S", "-B", "-c", probe], capture_output=True, text=True, check=True)
+            info = json.loads(res2.stdout.strip())
+            self.assertEqual(info["out"], "{}")
+            self.assertFalse(info["loaded_core"])
 
-        # 1. Resolved background tasks, sync non-zero exit vs fake exit string inside stdout,
-        #    DONE step with Encountered error, and flat interim assistant merging.
-        logs = self.tmp_root / "brain" / "cid-async" / ".system_generated" / "logs"
-        tool_calls_batch = [
-            {"name": "run_command", "args": {"CommandLine": "false_cmd"}},
-            {"name": "run_command", "args": {"CommandLine": "grep_exit1_text"}},
-            {"name": "write_file", "args": {"Path": str(denied_py)}},
-            {"name": "write_file", "args": {"Path": str(ok_py)}},
-            {"name": "run_command", "args": {"CommandLine": "bg_ok_job"}},
-            {"name": "run_command", "args": {"CommandLine": "bg_fail_job"}},
-        ]
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>run checks and update ok_file.py</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": tool_calls_batch},
-            {
-                "step_index": 2,
-                "type": "GENERIC",
-                "status": "DONE",
-                "content": "Created At: 2026-11-16T21:00:00+08:00\nCompleted At: 2026-11-16T21:00:01+08:00\nCommand exited with code 1.\n\nCommand output:\nfail",
-            },
-            {
-                "step_index": 3,
-                "type": "GENERIC",
-                "status": "DONE",
-                "content": "Created At: 2026-11-16T21:00:02+08:00\nCompleted At: 2026-11-16T21:00:03+08:00\nCommand exited with code 0.\n\nCommand output:\nCommand exited with code 1.",
-            },
-            {
-                "step_index": 4,
-                "type": "GENERIC",
-                "status": "DONE",
-                "content": "Created At: 2026-11-16T21:00:04+08:00\nCompleted At: 2026-11-16T21:00:05+08:00\nEncountered error in step execution: blocked",
-            },
-            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "Wrote ok_file.py"},
-            {
-                "step_index": 6,
-                "type": "GENERIC",
-                "status": "RUNNING",
-                "content": "Created At: 2026-11-16T21:00:06+08:00\nTool is running as a background task with task id: cid-async/task-1\nTask logs...",
-            },
-            {
-                "step_index": 7,
-                "type": "GENERIC",
-                "status": "RUNNING",
-                "content": "Created At: 2026-11-16T21:00:07+08:00\nTool is running as a background task with task id: cid-async/task-2\nTask logs...",
-            },
-            {"step_index": 8, "type": "PLANNER_RESPONSE", "content": "Waiting for background tasks."},
-            {
-                "step_index": 9,
-                "type": "SYSTEM_MESSAGE",
-                "status": "DONE",
-                "content": 'sender=cid-async/task-1 content=Task id "cid-async/task-1" finished with result:\nCommand exited with code 0.\n\nCommand output:\npassed',
-            },
-            {
-                "step_index": 10,
-                "type": "SYSTEM_MESSAGE",
-                "status": "DONE",
-                "content": 'sender=cid-async/task-2 content=Task id "cid-async/task-2" finished with result:\nCommand exited with code 1.\n\nCommand output:\nboom',
-            },
-            {"step_index": 11, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "final_echo"}}]},
-            {"step_index": 12, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0."},
-            {"step_index": 13, "type": "PLANNER_RESPONSE", "content": "Done after async jobs."},
-            {"step_index": 14, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. run checks and update ok_file.py\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["session_mode"], "active_coding")
-        self.assertIn("run_command(`false_cmd`) [ERROR]", msg)
-        self.assertIn("run_command(`grep_exit1_text`),", msg)
-        self.assertNotIn("run_command(`grep_exit1_text`) [ERROR]", msg)
-        self.assertIn("write_file(denied_done.py) [ERROR]", msg)
-        self.assertIn("run_command(`bg_ok_job`),", msg)
-        self.assertNotIn("run_command(`bg_ok_job`) [ERROR]", msg)
-        self.assertNotIn("run_command(`bg_ok_job`) [RUNNING]", msg)
-        self.assertIn("run_command(`bg_fail_job`) [ERROR]", msg)
-        self.assertEqual(msg.count("(Tools run:"), 1)
-        self.assertNotIn("SHOULD_NOT_APPEAR", msg)
-        self.assertIn("VALUE = 42", msg)
+    def test_hook_fail_open_on_bad_stdin(self) -> None:
+        for bad in ("", "   ", "{not json", "[]", json.dumps({"conversationId": "nonexistent-id-xyz"})):
+            res = subprocess.run(
+                [sys.executable, "-S", "-B", str(HOOK_SCRIPT), "--hook"],
+                input=bad,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(res.stdout.strip(), "{}")
 
-        # 2. Unresolved RUNNING task at compaction preserves mid_turn + [RUNNING]
-        logs_run = self.tmp_root / "brain" / "cid-running" / ".system_generated" / "logs"
-        rows_run = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>launch background suite</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "still_running"}}]},
-            {
-                "step_index": 2,
-                "type": "GENERIC",
-                "status": "RUNNING",
-                "content": "Tool is running as a background task with task id: cid-running/task-3",
-            },
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Launched background suite; waiting for result."},
-            {"step_index": 4, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. launch background suite\n<summary>Running</summary>\n</CONTEXT_SUMMARY>"},
-        ]
-        _write_jsonl(logs_run / "transcript_full.jsonl", rows_run)
-        res_run = mod.build_rehydration(logs_run / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_run)
-        assert res_run is not None
-        msg_run, st_run = res_run
-        self.assertEqual(st_run["session_mode"], "mid_turn")
-        self.assertIn("run_command(`still_running`) [RUNNING]", msg_run)
+    def test_full_4_layer_hook_trigger_idempotency_and_non_git_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "workspace"
+            sub = ws / "pkg"
+            sub.mkdir(parents=True)
+            # Intentionally NO .git directory to verify non-git AGENTS.md discovery
+            (ws / "AGENTS.md").write_text("# Workspace rules\n", encoding="utf-8")
+            src_mod = sub / "app.py"
+            src_mod.write_text("def greet():\n    return 'hello world'\n", encoding="utf-8")
+            src_ref = sub / "utils.py"
+            src_ref.write_text("VALUE = 42\n", encoding="utf-8")
+            spec_doc = ws / "DESIGN_SPEC.md"
+            spec_doc.write_text("# Spec\n````md\n```python\nx = 1\n```\n````\n", encoding="utf-8")
+            secret_env = ws / ".env"
+            secret_env.write_text("API_KEY=SUPER_SECRET_123\n", encoding="utf-8")
+            outside = root / "outside.txt"
+            outside.write_text("OUTSIDE_SECRET\n", encoding="utf-8")
+            # Outside AGENTS.md must NOT be discovered beyond workspace boundary
+            (root / "GEMINI.md").write_text("# Outside rule\n", encoding="utf-8")
 
-    def test_primary_code_not_evicted_by_wrappers_and_two_turn_window(self) -> None:
-        src_py = self.ws / "guardrails.py"
-        hj = self.ws / "hooks.json"
-        ibat = self.ws / "install.bat"
-        ish = self.ws / "install.sh"
-        src_py.write_text("PRIMARY_CODE = True\n", encoding="utf-8")
-        hj.write_text("{}\n", encoding="utf-8")
-        ibat.write_text("@echo off\n", encoding="utf-8")
-        ish.write_text("#!/bin/sh\n", encoding="utf-8")
+            conv = root / "brain" / "conv-1111"
+            scratch = conv / "scratch"
+            scratch.mkdir(parents=True)
+            scratch_file = scratch / "temp.py"
+            scratch_file.write_text("TEMP_SCRATCH = 1\n", encoding="utf-8")
 
-        logs_a = self.tmp_root / "brain" / "cid-tier" / ".system_generated" / "logs"
-        rows_a = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>optimize guardrails and wrappers</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(src_py), "Replacement": "PRIMARY_CODE = True"}},
-                    {"name": "edit_file", "args": {"Path": str(hj), "Replacement": "{}"}},
-                    {"name": "edit_file", "args": {"Path": str(ibat), "Replacement": "@echo off"}},
-                    {"name": "edit_file", "args": {"Path": str(ish), "Replacement": "#!/bin/sh"}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 6, "type": "PLANNER_RESPONSE", "content": "Updated all 4 files." * 20},
-            {"step_index": 7, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. optimize guardrails and wrappers\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
-        ]
-        _write_jsonl(logs_a / "transcript_full.jsonl", rows_a)
-        res_a = mod.build_rehydration(logs_a / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_a)
-        assert res_a is not None
-        _, st_a = res_a
-        self.assertTrue(st_a["file_paths"][0].endswith("guardrails.py"))
-
-        # Turn N-1 primary code edit > 60 steps before checkpoint must survive Turn N cleanup wrappers + docs
-        qg = self.ws / "quality_gate.py"
-        ub = self.ws / "uninstall.bat"
-        us = self.ws / "uninstall.sh"
-        tp = self.ws / "tests" / "test_packaging.py"
-        rd = self.ws / "README.md"
-        tp.parent.mkdir(parents=True, exist_ok=True)
-        qg.write_text("QUALITY_GATE_CODE = 1\n", encoding="utf-8")
-        ub.write_text("@echo off\n", encoding="utf-8")
-        us.write_text("#!/bin/sh\n", encoding="utf-8")
-        tp.write_text("class T: pass\n", encoding="utf-8")
-        rd.write_text("# README\n" + ("doc line\n" * 40), encoding="utf-8")
-
-        logs_b = self.tmp_root / "brain" / "cid-2turn" / ".system_generated" / "logs"
-        rows_b = [
-            {"step_index": 100, "type": "USER_INPUT", "content": "<USER_REQUEST>optimize quality_gate.py</USER_REQUEST>"},
-            {"step_index": 105, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": str(qg), "Replacement": "QUALITY_GATE_CODE = 1"}}]},
-            {"step_index": 106, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 120, "type": "PLANNER_RESPONSE", "content": "Optimized quality_gate.py." * 15},
-            {"step_index": 160, "type": "USER_INPUT", "content": "<USER_REQUEST>remove low-ROI plugins and update uninstall/README</USER_REQUEST>"},
-            {
-                "step_index": 170,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(ub), "Replacement": "@echo off"}},
-                    {"name": "edit_file", "args": {"Path": str(us), "Replacement": "#!/bin/sh"}},
-                    {"name": "edit_file", "args": {"Path": str(tp), "Replacement": "class T: pass"}},
-                    {"name": "edit_file", "args": {"Path": str(rd), "Replacement": "# README"}},
-                ],
-            },
-            {"step_index": 171, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 172, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 173, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 174, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 182, "type": "PLANNER_RESPONSE", "content": "Cleanup complete." * 15},
-            {"step_index": 184, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. optimize quality_gate.py\n2. remove low-ROI plugins and update uninstall/README\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
-        ]
-        _write_jsonl(logs_b / "transcript_full.jsonl", rows_b)
-        res_b = mod.build_rehydration(logs_b / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_b)
-        assert res_b is not None
-        msg_b, st_b = res_b
-        self.assertTrue(any(p.endswith("quality_gate.py") for p in st_b["file_paths"]), st_b["file_paths"])
-        self.assertNotIn("README.md", "\n".join(st_b["file_paths"]))
-        self.assertIn("QUALITY_GATE_CODE = 1", msg_b)
-
-    def test_markdown_line_safe_folding_and_counter_prompt_dedup(self) -> None:
-        long_url = "file:///d:/antigravity/some_very_long_repository_directory/plugins/config.json"
-        rich_reply = (
-            "Summary sentence opening with clear verdict.\n\n"
-            + ("Detail bullet point line that builds up toward the fold threshold.\n" * 6)
-            + f"1. **Target Link**: ([config.json]({long_url}))\n\n"
-            + "### Metrics Table\n"
-            + "| Case | Median |\n"
-            + "| :--- | :--- |\n"
-            + "| Row 1 | 50 ms |\n"
-            + "| Row 2 | 55 ms |\n"
-            + "```python\n"
-            + ("x = 1234567890\n" * 35)
-            + "y = 999\n"
-            + "```\n"
-            + "Final line after code block."
-        )
-        logs = self.tmp_root / "brain" / "cid-md" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>開始最佳化</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到早期開始。"},
-            {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>中間獨立問題</USER_REQUEST>"},
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "中間回答。"},
-            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>檢查報表</USER_REQUEST>"},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": rich_reply},
-            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>開始最佳化</USER_REQUEST>"},
-            {"step_index": 7, "type": "PLANNER_RESPONSE", "content": "已完成第二次最佳化。"},
-            {
-                "step_index": 8,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n"
-                    "1. 檢查報表\n2. 開始最佳化\n"
-                    "<summary>Summary.</summary>\n</CONTEXT_SUMMARY>"
-                ),
-            },
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["folded_assistant_turns"], 1)
-        # Earlier step 0 identical short prompt must NOT be suppressed by step 6 copy inside # User Requests
-        self.assertIn("- [#1 @ step 0]: 開始最佳化", msg)
-        # Folded reply must not tear the long markdown link mid-URL or leave unclosed ``` fences
-        if "[config.json](" in msg:
-            self.assertIn(f"[config.json]({long_url})", msg)
-        step5_block = msg.split("[Step 5 | Assistant]:", 1)[1].split("[Step 6 | User]:", 1)[0]
-        fence_lines = sum(1 for ln in step5_block.splitlines() if ln.lstrip().startswith("```"))
-        self.assertEqual(fence_lines % 2, 0, step5_block)
-
-    def test_latest_turn_markdown_safe_clip_and_4500_threshold(self) -> None:
-        link_url = "file:///d:/antigravity/agy-rehydrate/tests/test_rehydrate.py"
-        link_md = f"[test_rehydrate.py]({link_url})"
-        code_target = self.ws / "core.py"
-        code_target.write_text("CORE = 1\n", encoding="utf-8")
-
-        # 1. Latest assistant reply of exactly 4,502 chars with link straddling char 3,200 stays unclipped.
-        head_4502 = "Opening summary line for active coding reply.\n" + ("Detailed line entry for checkpointing work.\n" * 71)
-        self.assertLess(len(head_4502), 3190)
-        pad_to_3185 = "x" * (3185 - len(head_4502))
-        mid_4502 = f"{pad_to_3185}See {link_md} for tests.\n"
-        tail_needed = 4502 - len(head_4502) - len(mid_4502)
-        self.assertGreater(tail_needed, 200)
-        tail_4502 = ("Tail verification detail line.\n" * (tail_needed // 31))
-        tail_4502 += "z" * (4502 - len(head_4502) - len(mid_4502) - len(tail_4502))
-        reply_4502 = head_4502 + mid_4502 + tail_4502
-        self.assertEqual(len(reply_4502), 4502)
-
-        logs_a = self.tmp_root / "brain" / "cid-4502" / ".system_generated" / "logs"
-        _write_jsonl(
-            logs_a / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>run edits</USER_REQUEST>"},
-                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "edit_file", "args": {"Path": str(code_target), "Replacement": "CORE = 1"}}]},
-                {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok " + ("log line\n" * 10000)},
-                {"step_index": 3, "type": "PLANNER_RESPONSE", "content": reply_4502},
-                {"step_index": 4, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. run edits\n<summary>Done</summary>\n</CONTEXT_SUMMARY>"},
-            ],
-        )
-        res_a = mod.build_rehydration(logs_a / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_a)
-        assert res_a is not None
-        msg_a, _ = res_a
-        self.assertNotIn("turn clipped", msg_a)
-        self.assertIn(link_md, msg_a)
-
-        # 2. Oversized user (~5,800 chars) & latest assistant (~6,200 chars) turns fold on line boundaries,
-        #    keep the link straddling char 3,300 intact, and balance ``` fences across total - 1,100.
-        def _make_structured_turn(target_len: int) -> str:
-            pre = "Intro line for oversized structured turn.\n" + ("Preamble line with consistent width padding.\n" * 72)
-            pre += f"6. **Regression**: check {link_md} thoroughly.\n"
-            self.assertGreater(len(pre), 3310)
-            self.assertLess(len(pre), 3430)
-            mid = "Mid section line between link and code fence.\n" * 35
-            code_lines = ["```python\n"] + [f"val_{i:03d} = {i * 10}\n" for i in range(60)] + ["```\n"]
-            code_blk = "".join(code_lines)
-            post = "Final closing line after fenced block."
-            cur = len(pre) + len(mid) + len(code_blk) + len(post)
-            if cur < target_len:
-                extra_lines = (target_len - cur) // 46 + 1
-                mid += "Mid section line between link and code fence.\n" * extra_lines
-            return pre + mid + code_blk + post
-
-        user_big = _make_structured_turn(5800)
-        asst_big = _make_structured_turn(6200)
-        self.assertGreater(len(user_big), 5700)
-        self.assertGreater(len(asst_big), 6100)
-
-        logs_b = self.tmp_root / "brain" / "cid-bigturn" / ".system_generated" / "logs"
-        _write_jsonl(
-            logs_b / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{user_big}</USER_REQUEST>"},
-                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "bg"}}]},
-                {"step_index": 2, "type": "GENERIC", "status": "RUNNING", "content": "Tool is running as a background task with task id: cid-bigturn/t1\n" + ("x" * 135000)},
-                {"step_index": 3, "type": "PLANNER_RESPONSE", "content": asst_big},
-                {"step_index": 4, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. big turn\n<summary>Running</summary>\n</CONTEXT_SUMMARY>"},
-            ],
-        )
-        res_b = mod.build_rehydration(logs_b / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_b)
-        assert res_b is not None
-        msg_b, st_b = res_b
-        self.assertEqual(st_b["session_mode"], "mid_turn")
-        user_blk = msg_b.split("[Step 0 | User]:", 1)[1].split("[Step 3 | Assistant]:", 1)[0]
-        asst_blk = msg_b.split("[Step 3 | Assistant]:", 1)[1].split("## ", 1)[0]
-        for label, blk in (("user", user_blk), ("assistant", asst_blk)):
-            self.assertIn("...[turn clipped (", blk, label)
-            self.assertIn(link_md, blk, label)
-            self.assertIn("Final closing line after fenced block.", blk, label)
-            fences = sum(1 for ln in blk.splitlines() if ln.lstrip().startswith("```"))
-            self.assertEqual(fences % 2, 0, f"{label} unbalanced fences:\n{blk}")
-
-    def test_multi_workspace_config_and_reordered_jsonl_keys(self) -> None:
-        ws1 = self.tmp_root / "ws_primary"
-        ws2 = self.tmp_root / "ws_secondary"
-        (ws1 / ".agents").mkdir(parents=True, exist_ok=True)
-        (ws2 / ".agents").mkdir(parents=True, exist_ok=True)
-
-        # Secondary workspace applies when primary has no .agents/rehydrate.json
-        (ws2 / ".agents" / "rehydrate.json").write_text(
-            json.dumps({"maxModifiedFiles": 5, "maxReferencedFiles": 2}),
-            encoding="utf-8",
-        )
-        cfg_sec_only = mod.load_rehydrate_config([ws1, ws2])
-        self.assertEqual(cfg_sec_only.max_modified_files, 5)
-        self.assertEqual(cfg_sec_only.max_referenced_files, 2)
-
-        # Primary workspace overrides conflicting keys in secondary while preserving non-conflicting keys
-        (ws1 / ".agents" / "rehydrate.json").write_text(
-            json.dumps({"maxModifiedFiles": 4}),
-            encoding="utf-8",
-        )
-        cfg_merged = mod.load_rehydrate_config([ws1, ws2])
-        self.assertEqual(cfg_merged.max_modified_files, 4)
-        self.assertEqual(cfg_merged.max_referenced_files, 2)
-
-        p_cli = subprocess.run(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS_DIR / "rehydrate_after_compact.py"),
-                "--cwd",
-                str(ws1),
-                "--cwd",
-                str(ws2),
-                "show-config",
-            ],
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        cli_cfg = json.loads(p_cli.stdout)
-        self.assertEqual(cli_cfg["workspace"], str(ws1.resolve()))
-        self.assertEqual(cli_cfg["workspaces"], [str(ws1.resolve()), str(ws2.resolve())])
-        self.assertEqual(cli_cfg["maxModifiedFiles"], 4)
-        self.assertEqual(cli_cfg["maxReferencedFiles"], 2)
-
-        # JSONL key-order independence: place "content" first (>2,500 chars) and "step_index" at very end
-        target_py = ws2 / "mod_target.py"
-        target_py.write_text("REORDERED_OK = 1\n", encoding="utf-8")
-        long_ok_tool = "Created At: 2026-11-16T21:00:00+08:00\nCompleted At: 2026-11-16T21:00:01+08:00\nCommand exited with code 0.\n\nCommand output:\n" + (
-            "ok payload line\n" * 200
-        )
-        long_err_tool = "Created At: 2026-11-16T21:00:02+08:00\nCompleted At: 2026-11-16T21:00:03+08:00\nCommand exited with code 1.\n\nCommand output:\n" + (
-            "err payload line\n" * 200
-        )
-        long_write_ok = "Wrote mod_target.py.\n\n" + ("write detail line\n" * 180)
-        std_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>run checks and update mod_target.py</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "run_command", "args": {"CommandLine": "ok_cmd"}},
-                    {"name": "run_command", "args": {"CommandLine": "fail_cmd"}},
-                    {"name": "edit_file", "args": {"Path": str(target_py), "Replacement": "REORDERED_OK = 1"}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": long_ok_tool},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": long_err_tool},
-            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": long_write_ok},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "Finished edits and checks."},
-            {
-                "step_index": 6,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. run checks and update mod_target.py\n<summary>Done</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-
-        def _reorder_row(row: dict) -> dict:
-            order = ("content", "tool_calls", "status", "type", "step_index")
-            reordered = {k: row[k] for k in order if k in row}
-            for k, v in row.items():
-                if k not in reordered:
-                    reordered[k] = v
-            return reordered
-
-        logs_std = self.tmp_root / "brain" / "cid-std" / ".system_generated" / "logs"
-        logs_reo = self.tmp_root / "brain" / "cid-reo" / ".system_generated" / "logs"
-        _write_jsonl(logs_std / "transcript_full.jsonl", std_rows)
-        _write_jsonl(logs_reo / "transcript_full.jsonl", [_reorder_row(r) for r in std_rows])
-
-        res_std = mod.build_rehydration(logs_std / "transcript_full.jsonl", workspace_roots=[ws1, ws2])
-        res_reo = mod.build_rehydration(logs_reo / "transcript_full.jsonl", workspace_roots=[ws1, ws2])
-        self.assertIsNotNone(res_std)
-        self.assertIsNotNone(res_reo)
-        assert res_std is not None and res_reo is not None
-        msg_std, st_std = res_std
-        msg_reo, st_reo = res_reo
-        self.assertEqual(msg_reo, msg_std)
-        self.assertEqual(
-            {k: v for k, v in st_reo.items() if k != "window_raw_chars"},
-            {k: v for k, v in st_std.items() if k != "window_raw_chars"},
-        )
-        self.assertGreater(st_reo["window_raw_chars"], 10000)
-        self.assertGreater(st_std["window_raw_chars"], 10000)
-        self.assertIn("run_command(`ok_cmd`),", msg_reo)
-        self.assertNotIn("run_command(`ok_cmd`) [ERROR]", msg_reo)
-        self.assertIn("run_command(`fail_cmd`) [ERROR]", msg_reo)
-        self.assertIn("REORDERED_OK = 1", msg_reo)
-
-        # Also verify scan_compact_tail handles trailing step_index cleanly on full & incremental scans
-        cp_found, max_found, off1 = mod.scan_compact_tail(logs_reo / "transcript_full.jsonl", 0, None)
-        self.assertEqual(cp_found, 6)
-        self.assertEqual(max_found, 6)
-        with open(logs_reo / "transcript_full.jsonl", "a", encoding="utf-8") as af:
-            af.write(json.dumps({"content": "<USER_REQUEST>next prompt</USER_REQUEST>", "type": "USER_INPUT", "step_index": 7}) + "\n")
-        cp2, max2, _ = mod.scan_compact_tail(logs_reo / "transcript_full.jsonl", off1, cp_found)
-        self.assertEqual(cp2, 6)
-        self.assertEqual(max2, 7)
-
-    def test_duplicate_long_user_fold_fence_safe_budget_cap_and_ask_question(self) -> None:
-        # 1. Verify _split_checkpoint_user_requests handles CP-666-style item with embedded 1..4 sublists
-        #    followed immediately by `(N+1). 3. ...` and `(N+2). /compact`.
-        long_step10 = (
-            "**整體評估：架構與測試均已完整。**\n\n"
-            "### 1. 第一節重點\n"
-            + ("重點說明與效能數據細節列。\n" * 95)
-            + "\n### 2. 已完成項目\n"
-            + "1. **子項一**\n   * 詳細內容甲\n"
-            + "2. **子項二**\n   * 詳細內容乙\n"
-            + "3. **子項三**\n   * 詳細內容丙\n"
-            + "4. **子項四**\n   * 詳細內容丁\n\n"
-            + "### 3. 後續建議\n"
-            + "1. **建議一**\n   * 細節戊\n"
-            + "2. **建議二**\n   * 細節己\n"
-            + "3. **建議三**\n   * 細節庚\n"
-            + "4. **建議四**\n   * 細節辛\n\n"
-            + "結論收尾確認。"
-        )
-        self.assertGreater(len(long_step10), 1200)
-        cp_block = (
-            "1. 前期獨立問題\n"
-            f"2. \n{long_step10}\n"
-            "3. 3. 剩餘小細節：檢查同步\n"
-            "4. /compact \n"
-        )
-        split_items = mod._split_checkpoint_user_requests(cp_block)
-        self.assertEqual([no for no, _ in split_items], [1, 2, 3, 4])
-
-        # 2. End-to-end test: ask_question in < verbatim_start_step (## 1) and >= verbatim_start_step (pinned in
-        #    >6-step tool chain with >2,048-byte GENERIC step), plus duplicate long user prompt folding in ## 2.
-        app_py = self.ws / "app.py"
-        app_py.write_text("APP_READY = True\n", encoding="utf-8")
-
-        logs = self.tmp_root / "brain" / "cid-edge" / ".system_generated" / "logs"
-        rows: list[dict] = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>初始評估請求</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "請先確認插件範圍。",
-                "tool_calls": [
-                    {
-                        "name": "ask_question",
-                        "args": {"questions": [{"is_multi_select": False, "question": "是否刪除舊插件？", "options": ["A1", "A2"]}]},
-                    }
-                ],
-            },
-            {
-                "step_index": 2,
-                "type": "GENERIC",
-                "status": "DONE",
-                "content": "Created At: 2026-11-17T00:00:00+08:00\nCompleted At: 2026-11-17T00:00:01+08:00\nA1: (Recommended) 刪除並保留核心兩支",
-            },
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "已完成早期清理。"},
-            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>前期獨立問題</USER_REQUEST>"},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "前期獨立回覆。"},
-            {"step_index": 10, "type": "USER_INPUT", "content": f"<USER_REQUEST>{long_step10}</USER_REQUEST>"},
-        ]
-
-        # 10-call tool loop between steps 11 and 30 where call #5 is ask_question with >2,200-char GENERIC output
-        step_cursor = 11
-        for call_no in range(1, 11):
-            if call_no == 1:
-                tc = {"name": "edit_file", "args": {"Path": str(app_py), "Replacement": "APP_READY = True"}}
-                res_txt = "Edited app.py"
-            elif call_no == 5:
-                tc = {
-                    "name": "ask_question",
-                    "args": {"questions": [{"is_multi_select": False, "question": "確認拆分方案？", "options": ["A1", "A2"]}]},
-                }
-                res_txt = (
-                    "Created At: 2026-11-17T00:10:00+08:00\n"
-                    "Completed At: 2026-11-17T00:10:05+08:00\n"
-                    "A1: (Recommended) 拆分為四模組；"
-                    + ("補充架構說明文字 " * 260)
-                )
-            else:
-                tc = {"name": "run_command", "args": {"CommandLine": f"check_{call_no}"}}
-                res_txt = f"Command exited with code 0.\n\nCommand output:\nok_{call_no}"
-            rows.append({"step_index": step_cursor, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [tc]})
-            step_cursor += 1
-            rows.append({"step_index": step_cursor, "type": "GENERIC", "status": "DONE", "content": res_txt})
-            step_cursor += 1
-
-        # step_cursor is now 31
-        rows.extend(
-            [
-                {"step_index": 31, "type": "PLANNER_RESPONSE", "content": "已依選擇完成四模組拆分。"},
-                {"step_index": 32, "type": "USER_INPUT", "content": "<USER_REQUEST>3. 剩餘小細節：檢查同步</USER_REQUEST>"},
-                {"step_index": 33, "type": "PLANNER_RESPONSE", "content": "已完成同步檢查。"},
-                {"step_index": 34, "type": "USER_INPUT", "content": "<USER_REQUEST>/compact</USER_REQUEST>"},
-                {
-                    "step_index": 35,
-                    "type": "CHECKPOINT",
-                    "content": f"<CONTEXT_SUMMARY>\n# User Requests\n{cp_block}<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
-                },
-            ]
-        )
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-
-        sec1 = msg.split("## 1.", 1)[1].split("## 2.", 1)[0]
-        self.assertIn("初始評估請求", sec1)
-        self.assertIn("[ask_question] 是否刪除舊插件？ -> A1: (Recommended) 刪除並保留核心兩支", sec1)
-        self.assertNotIn("確認拆分方案？", sec1)
-        self.assertNotIn("整體評估：架構與測試均已完整", sec1)
-        self.assertNotIn("剩餘小細節：檢查同步", sec1)
-
-        self.assertEqual(st["folded_user_turns"], 1)
-        sec2 = msg.split("## 2.", 1)[1]
-        self.assertIn("...[user prompt already verbatim in <CONTEXT_SUMMARY> # User Requests;", sec2)
-        self.assertIn("(+", msg)
-        self.assertIn("ask_question(確認拆分方案？ -> A1: (Recommended) 拆分為四模組；", msg)
-
-        # 3. Fence-safe _enforce_total_cap & _clip_markdown_to_budget across odd fence splits
-        file_a = "### [Modified] `a.py`\n```python\n" + "".join(f"a_{i:03d} = {i}\n" for i in range(60)) + "```\n"
-        file_b = "### [Modified] `b.py`\n```python\n" + "".join(f"b_{i:03d} = {i}\n" for i in range(40)) + "```"
-        sec_hdr = "## 2. Restored Active Workspace Files"
-        raw_secs = [
-            "[POST-COMPACT REHYDRATION v1 | checkpoint=1]",
-            "Preamble",
-            "## 1. User\n- [#1 @ step 0]: prompt",
-            f"{sec_hdr}\n{file_a}\n{file_b}",
-        ]
-        raw_len = len("\n\n".join(raw_secs))
-        base_prefix_len = len("\n\n".join(raw_secs[:3])) + 2 + len(sec_hdr) + 1
-        for cap_delta in (350, 520, 750):
-            target_cap = raw_len - cap_delta
-            capped = mod._enforce_total_cap(raw_secs, target_cap)
-            joined = "\n\n".join(capped)
-            self.assertLessEqual(len(joined), target_cap)
-            fences = sum(1 for ln in joined.splitlines() if ln.lstrip().startswith("```"))
-            self.assertEqual(fences % 2, 0, f"Unbalanced fences at delta={cap_delta}:\n{joined}")
-        tight_cap = base_prefix_len + 180
-        capped_tight = mod._enforce_total_cap(raw_secs, tight_cap)
-        joined_tight = "\n\n".join(capped_tight)
-        self.assertLessEqual(len(joined_tight), tight_cap)
-        self.assertEqual(
-            sum(1 for ln in joined_tight.splitlines() if ln.lstrip().startswith("```")) % 2,
-            0,
-            joined_tight,
-        )
-
-    def test_record_read_touch_range_merging_preserves_open_bounds(self) -> None:
-        p = str(self.ws / "lines_demo.py")
-
-        store1: dict = {}
-        mod._record_read_touch(store1, p, 1, (None, 50))
-        mod._record_read_touch(store1, p, 2, (100, 200))
-        self.assertEqual(store1[mod.canonical_path_key(p)][2], (None, 200))
-
-        store2: dict = {}
-        mod._record_read_touch(store2, p, 1, (100, 200))
-        mod._record_read_touch(store2, p, 2, (None, 50))
-        self.assertEqual(store2[mod.canonical_path_key(p)][2], (None, 200))
-
-        store3: dict = {}
-        mod._record_read_touch(store3, p, 1, (None, 50))
-        mod._record_read_touch(store3, p, 2, (100, None))
-        self.assertEqual(store3[mod.canonical_path_key(p)][2], (None, None))
-
-        store4: dict = {}
-        mod._record_read_touch(store4, p, 1, (50, None))
-        mod._record_read_touch(store4, p, 2, (10, 40))
-        self.assertEqual(store4[mod.canonical_path_key(p)][2], (10, None))
-
-        store5: dict = {}
-        mod._record_read_touch(store5, p, 1, (20, 50))
-        mod._record_read_touch(store5, p, 2, (100, 200))
-        self.assertEqual(store5[mod.canonical_path_key(p)][2], (20, 200))
-
-        # End-to-end check: reading (None, 50) then (100, 200) must preserve lines 1..200 (not drop 1..99)
-        demo_file = self.ws / "lines_demo.py"
-        demo_file.write_text("".join(f"line_{i:03d} = {i}\n" for i in range(1, 251)), encoding="utf-8")
-        logs = self.tmp_root / "brain" / "cid-read-merge" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Inspect lines_demo.py ranges</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "Reading first 50 lines then lines 100-200.",
-                "tool_calls": [
-                    {"name": "view_file", "args": {"AbsolutePath": str(demo_file), "EndLine": 50}},
-                    {"name": "view_file", "args": {"AbsolutePath": str(demo_file), "StartLine": 100, "EndLine": 200}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Viewed lines 1-50."},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Viewed lines 100-200."},
-            {
-                "step_index": 4,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Inspect lines_demo.py ranges\n<summary>Mid-read.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, _ = res
-        self.assertIn("lines 1-200", msg)
-        self.assertIn("line_001 = 1", msg)
-        self.assertIn("line_200 = 200", msg)
-        self.assertNotIn("line_240 = 240", msg)
-
-    def test_non_dict_jsonl_rows_and_corrupt_state_do_not_crash(self) -> None:
-        brain = self.tmp_root / "brain"
-        logs = brain / "cid-nondict" / ".system_generated" / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        code_file = self.ws / "robust.py"
-        code_file.write_text("ROBUST_OK = True\n", encoding="utf-8")
-
-        raw_lines = [
-            "null",
-            "[]",
-            "123",
-            '"just a string"',
-            "true",
-            json.dumps({"step_index": True, "type": "CHECKPOINT", "content": "bool step_index"}),
-            json.dumps(
-                {
-                    "step_index": 0,
-                    "type": "USER_INPUT",
-                    "created_at": "2026-11-18T10:00:00Z",
-                    "content": "<USER_REQUEST>Update robust.py safely</USER_REQUEST>",
-                }
-            ),
-            "null",
-            json.dumps(
+            logs = conv / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            full = logs / "transcript_full.jsonl"
+            records = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nRefactor app\n</USER_REQUEST>"},
                 {
                     "step_index": 1,
                     "type": "PLANNER_RESPONSE",
-                    "created_at": "2026-11-18T10:00:05Z",
                     "content": "",
                     "tool_calls": [
-                        {"name": "edit_file", "args": {"Path": str(code_file), "Replacement": "ROBUST_OK = True"}}
+                        {"name": "read_file", "args": {"Path": str(spec_doc)}},
+                        {"name": "read_file", "args": {"Path": str(src_ref)}},
+                        {"name": "read_file", "args": {"Path": str(secret_env)}},
+                        {"name": "read_file", "args": {"Path": str(outside)}},
+                        {"name": "write_file", "args": {"Path": str(scratch_file)}},
+                        {"name": "edit_file", "args": {"Path": str(src_mod)}},
                     ],
-                }
-            ),
-            "[1, 2, 3]",
-            json.dumps({"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Updated robust.py."}),
-            json.dumps(
-                {
-                    "step_index": 3,
-                    "type": "PLANNER_RESPONSE",
-                    "created_at": "2026-11-18T10:00:10Z",
-                    "content": "Updated robust.py successfully.",
-                }
-            ),
-            json.dumps(
-                {
-                    "step_index": 4,
-                    "type": "CHECKPOINT",
-                    "created_at": "2026-11-18T10:00:15Z",
-                    "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Update robust.py safely\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
-                }
-            ),
-            "null",
-            "[]",
-        ]
-        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-            (logs / fname).write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
-
-        hist_path = self.tmp_root / "history.jsonl"
-        hist_path.write_text(
-            "\n".join(
-                [
-                    "null",
-                    "[]",
-                    "42",
-                    json.dumps({"conversationId": "cid-nondict", "workspace": str(self.ws), "display": "/fork", "timestamp": 1795000000000}),
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        # Direct API calls must all ignore non-dict rows cleanly
-        first_info = mod.read_first_step_info(logs / "transcript_full.jsonl")
-        self.assertIsNotNone(first_info)
-        assert first_info is not None
-        self.assertEqual(first_info[0], 0)
-
-        step_hit = mod.find_step_epoch_in_transcript(logs / "transcript_full.jsonl", 3)
-        self.assertIsNotNone(step_hit)
-        assert step_hit is not None
-        self.assertEqual(step_hit[0], 4)
-
-        ws_map, fevents = mod.load_history_fork_hints(brain)
-        self.assertIn("cid-nondict", ws_map)
-        self.assertEqual(len(fevents), 1)
-
-        cp_found, max_found, _ = mod.scan_compact_tail(logs / "transcript.jsonl", 0, None)
-        self.assertEqual(cp_found, 4)
-        self.assertEqual(max_found, 4)
-
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["checkpoint"], 4)
-        self.assertIn("ROBUST_OK = True", msg)
-
-        # Non-dict rehydrate_state.json must not crash hook subprocess or CLI `list`
-        state_file = logs / "rehydrate_state.json"
-        state_file.write_text("[]", encoding="utf-8")
-        payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
-        p_hook = subprocess.run(
-            [sys.executable, "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
-            input=payload,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        hook_out = json.loads(p_hook.stdout.strip())
-        self.assertIn("injectSteps", hook_out)
-
-        fake_home = self.tmp_root / "fake_home"
-        fake_logs = fake_home / ".gemini" / "antigravity" / "brain" / "cid-nondict-cli" / ".system_generated" / "logs"
-        fake_logs.mkdir(parents=True, exist_ok=True)
-        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-            (fake_logs / fname).write_text("\n".join(raw_lines) + "\n", encoding="utf-8")
-        (fake_logs / "rehydrate_state.json").write_text("null", encoding="utf-8")
-        cli_env = dict(os.environ)
-        cli_env["HOME"] = str(fake_home)
-        cli_env["USERPROFILE"] = str(fake_home)
-        p_status = subprocess.run(
-            [
-                sys.executable,
-                "-B",
-                str(SCRIPTS_DIR / "rehydrate_after_compact.py"),
-                "status",
-                "--limit",
-                "5",
-            ],
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            env=cli_env,
-            check=True,
-        )
-        self.assertIn("cid-nondict-cli", p_status.stdout)
-
-    def test_find_step_epoch_reordered_huge_tail_and_fork_scoring(self) -> None:
-        brain = self.tmp_root / "brain"
-
-        # 1. Reordered JSONL (>180 KB, step_index at end of line > 2 KB, plus non-dict rows near midpoint)
-        reo_logs = brain / "cid-reo-search" / ".system_generated" / "logs"
-        reo_logs.mkdir(parents=True, exist_ok=True)
-        reo_path = reo_logs / "transcript_full.jsonl"
-        reo_lines: list[str] = []
-        for s in range(60):
-            if s == 30:
-                reo_lines.extend(["null"] * 20)
-            pad = ("x" * 2800) + f"_step_{s}"
-            row_str = json.dumps(
-                {
-                    "content": pad,
-                    "created_at": f"2026-11-18T08:{s // 60:02d}:{s % 60:02d}Z",
-                    "type": "PLANNER_RESPONSE",
-                    "step_index": s,
-                }
-            )
-            reo_lines.append(row_str)
-        reo_path.write_text("\n".join(reo_lines) + "\n", encoding="utf-8")
-        self.assertGreater(reo_path.stat().st_size, 160000)
-
-        hit_reo = mod.find_step_epoch_in_transcript(reo_path, 12)
-        self.assertIsNotNone(hit_reo)
-        assert hit_reo is not None
-        self.assertEqual(hit_reo[0], 59)
-        self.assertIsNotNone(hit_reo[1])
-
-        # 2. Huge trailing line > 512 KB must NOT falsely treat an earlier target_step as exact_tip
-        huge_logs = brain / "cid-huge-tail" / ".system_generated" / "logs"
-        huge_logs.mkdir(parents=True, exist_ok=True)
-        huge_path = huge_logs / "transcript_full.jsonl"
-        huge_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T09:00:00Z", "content": "start"},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T09:01:00Z", "content": "mid"},
-            {
-                "step_index": 6,
-                "type": "GENERIC",
-                "created_at": "2026-11-18T09:02:00Z",
-                "content": "Z" * 620000,
-            },
-        ]
-        _write_jsonl(huge_path, huge_rows)
-        hit_mid = mod.find_step_epoch_in_transcript(huge_path, 5)
-        self.assertIsNotNone(hit_mid)
-        assert hit_mid is not None
-        self.assertEqual(hit_mid[0], 6)  # NOT 5 (must not fake exact_tip!)
-
-        # Huge final step itself IS exact_tip when EOF immediately follows
-        hit_tip = mod.find_step_epoch_in_transcript(huge_path, 6)
-        self.assertIsNotNone(hit_tip)
-        assert hit_tip is not None
-        self.assertEqual(hit_tip[0], 6)
-
-        # Huge trailing corrupt/non-JSON line after step 5 must return -1 (unknown), NOT 5
-        corrupt_tail_path = huge_logs / "transcript_corrupt_tail.jsonl"
-        corrupt_tail_path.write_text(
-            json.dumps(huge_rows[0]) + "\n" + json.dumps(huge_rows[1]) + "\n" + ("{" + "Q" * 620000) + "\n",
-            encoding="utf-8",
-        )
-        hit_corrupt = mod.find_step_epoch_in_transcript(corrupt_tail_path, 5)
-        self.assertIsNotNone(hit_corrupt)
-        assert hit_corrupt is not None
-        self.assertEqual(hit_corrupt[0], -1)
-
-        # 3. /fork scoring without history `/fork` entry:
-        #    Recent parent that kept chatting (exact_tip=0, delta=30s) MUST beat old unrelated exact_tip=1 (delta=3h)
-        ws_a = str((self.ws / "proj_a").resolve())
-        ws_b = str((self.ws / "proj_b").resolve())
-        hist_rows = [
-            {"conversationId": "parent-recent-continued", "workspace": ws_a, "display": "msg", "timestamp": 1795000000000},
-            {"conversationId": "unrelated-old-exact-tip", "workspace": ws_a, "display": "msg", "timestamp": 1795000000000},
-            {"conversationId": "child-fork-score", "workspace": ws_a, "display": "msg", "timestamp": 1795000000000},
-            {"conversationId": "unrelated-other-ws", "workspace": ws_b, "display": "msg", "timestamp": 1795000000000},
-        ]
-        _write_jsonl(self.tmp_root / "history.jsonl", hist_rows)
-
-        p_recent = brain / "parent-recent-continued" / ".system_generated" / "logs"
-        _write_jsonl(
-            p_recent / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T09:50:00Z", "content": "init"},
-                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T09:59:30Z", "content": "fork point"},
-                {"step_index": 10, "type": "USER_INPUT", "created_at": "2026-11-18T10:05:00Z", "content": "continued later"},
-            ],
-        )
-        p_old = brain / "unrelated-old-exact-tip" / ".system_generated" / "logs"
-        _write_jsonl(
-            p_old / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T06:50:00Z", "content": "old"},
-                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T07:00:00Z", "content": "old tip"},
-            ],
-        )
-        # Also create 15 unrelated large step-0 conversations to verify fast resolution
-        for idx in range(15):
-            u_logs = brain / f"unrelated-noise-{idx:02d}" / ".system_generated" / "logs"
-            u_rows = [
-                {"step_index": k, "type": "GENERIC", "created_at": f"2026-11-18T05:{k:02d}:00Z", "content": "N" * 4000}
-                for k in range(30)
+                },
+                {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Done editing app.py."},
+                {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>\n/compact\n</USER_REQUEST>"},
+                {"step_index": 4, "type": "CHECKPOINT", "content": "<summary>short summary</summary>"},
             ]
-            _write_jsonl(u_logs / "transcript_full.jsonl", u_rows)
-            _write_jsonl(
-                u_logs / "transcript.jsonl",
-                [{"step_index": k, "type": "GENERIC", "created_at": f"2026-11-18T05:{k:02d}:00Z", "content": "short"} for k in range(30)],
-            )
+            _write_jsonl(compact, records)
+            _write_jsonl(full, records)
 
-        child_logs = brain / "child-fork-score" / ".system_generated" / "logs"
-        _write_jsonl(
-            child_logs / "transcript_full.jsonl",
-            [
-                {"step_index": 10, "type": "USER_INPUT", "created_at": "2026-11-18T10:00:00Z", "content": "forked task"},
-                {"step_index": 11, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T10:00:05Z", "content": "ok"},
-            ],
-        )
-
-        t0 = time.monotonic()
-        ancestors = mod.resolve_fork_ancestors(child_logs / "transcript_full.jsonl")
-        elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 2.0)
-        self.assertEqual(len(ancestors), 1)
-        self.assertEqual(ancestors[0]["cid"], "parent-recent-continued")
-
-        # 4. Unconfirmed stale candidate (>24h) and disjoint-workspace candidate must be rejected;
-        #    explicit `/fork` event in history.jsonl MUST still match a multi-day delayed fork
-        brain2 = self.tmp_root / "brain_stale"
-        p_stale = brain2 / "parent-multiday" / ".system_generated" / "logs"
-        _write_jsonl(
-            p_stale / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-10T10:00:00Z", "content": "day1"},
-                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-10T10:10:00Z", "content": "day1 tip"},
-            ],
-        )
-        p_other_ws = brain2 / "parent-other-ws" / ".system_generated" / "logs"
-        _write_jsonl(
-            p_other_ws / "transcript_full.jsonl",
-            [
-                {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T09:50:00Z", "content": "other"},
-                {"step_index": 9, "type": "PLANNER_RESPONSE", "created_at": "2026-11-18T09:59:45Z", "content": "other tip"},
-            ],
-        )
-        c_stale = brain2 / "child-day8" / ".system_generated" / "logs"
-        _write_jsonl(
-            c_stale / "transcript_full.jsonl",
-            [
-                {"step_index": 10, "type": "USER_INPUT", "created_at": "2026-11-18T10:00:00Z", "content": "day8 child"},
-            ],
-        )
-        hist2 = self.tmp_root / "history.jsonl"
-        _write_jsonl(
-            hist2,
-            [
-                {"conversationId": "parent-multiday", "workspace": ws_a, "display": "old", "timestamp": 1794305400000},
-                {"conversationId": "parent-other-ws", "workspace": ws_b, "display": "other", "timestamp": 1795000000000},
-                {"conversationId": "child-day8", "workspace": ws_a, "display": "child", "timestamp": 1795000000000},
-            ],
-        )
-        self.assertEqual(mod.resolve_fork_ancestors(c_stale / "transcript_full.jsonl"), [])
-
-        # Adding an explicit `/fork` event on `parent-multiday` right before child start unlocks multi-day match
-        fork_ts_ms = int(mod.parse_iso_epoch("2026-11-18T09:59:55Z") * 1000)
-        _write_jsonl(
-            hist2,
-            [
-                {"conversationId": "parent-multiday", "workspace": ws_a, "display": "/fork", "timestamp": fork_ts_ms},
-                {"conversationId": "parent-other-ws", "workspace": ws_b, "display": "other", "timestamp": fork_ts_ms},
-                {"conversationId": "child-day8", "workspace": ws_a, "display": "child", "timestamp": fork_ts_ms},
-            ],
-        )
-        confirmed = mod.resolve_fork_ancestors(c_stale / "transcript_full.jsonl")
-        self.assertEqual(len(confirmed), 1)
-        self.assertEqual(confirmed[0]["cid"], "parent-multiday")
-
-    def test_same_turn_multiple_final_replies_and_interrupted_turn_tools(self) -> None:
-        worker_py = self.ws / "worker_bg.py"
-        worker_py.write_text("WORKER_BG = 1\n", encoding="utf-8")
-
-        # 1. Multiple final replies in the same turn + interrupted turns (tools-only & narration+tools)
-        logs = self.tmp_root / "brain" / "cid-multi-reply" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Start migration step A</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "migrate_step_a"}}],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\n\nok"},
-            # User interrupts turn 0 before any assistant reply
-            {"step_index": 3, "type": "USER_INPUT", "content": "<USER_REQUEST>Actually run step B with narration</USER_REQUEST>"},
-            {
-                "step_index": 4,
-                "type": "PLANNER_RESPONSE",
-                "content": "Starting step B migration now.",
-                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "migrate_step_b"}}],
-            },
-            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "Command exited with code 0.\n\nok"},
-            # User interrupts turn 3 after narration + tool
-            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>Launch async job and summarize twice</USER_REQUEST>"},
-            {
-                "step_index": 7,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "async_verify"}}],
-            },
-            {
-                "step_index": 8,
-                "type": "GENERIC",
-                "status": "RUNNING",
-                "content": "Created At: 2026-11-18T10:00:01Z\nTool is running as a background task with task id: cid-multi-reply/task-bg-99\nTask logs...",
-            },
-            {"step_index": 9, "type": "PLANNER_RESPONSE", "content": "First complete conclusion: ALPHA_VERDICT."},
-            {
-                "step_index": 10,
-                "type": "SYSTEM_MESSAGE",
-                "status": "DONE",
-                "content": 'sender=cid-multi-reply/task-bg-99 content=Task id "cid-multi-reply/task-bg-99" finished with result:\nCommand exited with code 0.\n\nCommand output:\npassed',
-            },
-            {"step_index": 11, "type": "PLANNER_RESPONSE", "content": "Follow-up update: BETA_VERDICT."},
-            {
-                "step_index": 12,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Start migration step A\n2. Actually run step B with narration\n3. Launch async job and summarize twice\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        cfg_all = mod.RehydrateConfig(max_recent_entries=10, explicit_keys=frozenset({"maxRecentEntries"}))
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", config=cfg_all, workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, _ = res
-
-        # Interrupted tools-only turn preserved
-        self.assertIn("[Interrupted Turn Tools]: run_command(`migrate_step_a`)", msg)
-        # Interrupted narration+tool turn attaches tool to the flushed assistant entry
-        self.assertIn("run_command(`migrate_step_b`)", msg)
-        self.assertIn("Starting step B migration now.", msg)
-        # Same-turn multiple final replies BOTH preserved with Follow-up marker and single (Tools run:)
-        self.assertIn("ALPHA_VERDICT", msg)
-        self.assertIn("[Follow-up @ step 11]:", msg)
-        self.assertIn("BETA_VERDICT", msg)
-        step11_block = msg.split("[Step 11 | Assistant]:", 1)[1]
-        self.assertEqual(step11_block.count("(Tools run:"), 1)
-
-        # 2. Mid-turn `/compact` MUST NOT wipe pending_tools or turn_running_task_ids
-        logs_mc = self.tmp_root / "brain" / "cid-mid-compact" / ".system_generated" / "logs"
-        mc_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Inspect worker_bg.py and run bg_worker</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "read_file", "args": {"Path": str(worker_py)}},
-                    {"name": "run_command", "args": {"CommandLine": "bg_worker"}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "WORKER_BG = 1"},
-            {
-                "step_index": 3,
-                "type": "GENERIC",
-                "status": "RUNNING",
-                "content": "Created At: 2026-11-18T10:01:00Z\nTool is running as a background task with task id: cid-mid-compact/task-live-77\nTask logs...",
-            },
-            {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>/compact</USER_REQUEST>"},
-            {
-                "step_index": 5,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Inspect worker_bg.py and run bg_worker\n<summary>In progress.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs_mc / "transcript_full.jsonl", mc_rows)
-        res_mc = mod.build_rehydration(logs_mc / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_mc)
-        assert res_mc is not None
-        msg_mc, st_mc = res_mc
-        self.assertTrue(st_mc["in_progress_turn"])
-        self.assertEqual(st_mc["session_mode"], "mid_turn")
-        self.assertIn("[Pre-Compaction In-Progress Tools]:", msg_mc)
-        self.assertIn("read_file(worker_bg.py)", msg_mc)
-        self.assertIn("run_command(`bg_worker`) [RUNNING]", msg_mc)
-
-    def test_earlier_timeline_budget_header_cap_stats_and_skipped_eligibility(self) -> None:
-        # 1. Earlier user timeline budget omission/clipping must NOT claim "verbatim" in section header
-        logs_tl = self.tmp_root / "brain" / "cid-tl-budget" / ".system_generated" / "logs"
-        tl_rows: list[dict] = []
-        step = 0
-        for idx in range(1, 13):
-            tl_rows.append(
+            payload = json.dumps(
                 {
-                    "step_index": step,
-                    "type": "USER_INPUT",
-                    "content": f"<USER_REQUEST>Requirement batch #{idx:02d}: " + (f"detail_{idx} " * 24) + "</USER_REQUEST>",
+                    "transcriptPath": str(compact),
+                    "artifactDirectoryPath": str(conv),
+                    "workspacePaths": [str(ws)],
+                    "cwd": str(ws),
                 }
             )
-            step += 1
-            tl_rows.append({"step_index": step, "type": "PLANNER_RESPONSE", "content": f"Handled batch {idx}."})
-            step += 1
-        tl_rows.append(
-            {
-                "step_index": step,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n<summary>Many batches.</summary>\n</CONTEXT_SUMMARY>",
-            }
-        )
-        _write_jsonl(logs_tl / "transcript_full.jsonl", tl_rows)
-        cfg_tight_tl = mod.RehydrateConfig(
-            budget_all_user_chars=1400,
-            max_recent_entries=2,
-            explicit_keys=frozenset({"budgetAllUserChars", "maxRecentEntries"}),
-        )
-        res_tl = mod.build_rehydration(logs_tl / "transcript_full.jsonl", config=cfg_tight_tl, workspace_roots=[self.ws])
-        self.assertIsNotNone(res_tl)
-        assert res_tl is not None
-        msg_tl, st_tl = res_tl
-        sec1_hdr = next(ln for ln in msg_tl.splitlines() if ln.startswith("## 1. Earlier User Request Timeline"))
-        self.assertNotIn("verbatim", sec1_hdr)
-        self.assertIn("earlier prompts kept", sec1_hdr)
-        self.assertLess(st_tl["kept_earlier_user_msgs"], st_tl["earlier_user_msgs"])
-        self.assertIn("omitted for budget", msg_tl)
+            res = subprocess.run(
+                [sys.executable, "-S", "-B", str(HOOK_SCRIPT), "--hook"],
+                input=payload,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            out = json.loads(res.stdout)
+            self.assertIn("injectSteps", out)
+            injected = "\n".join(s["systemMessage"]["systemMessage"] for s in out["injectSteps"])
+            self.assertIn("[POST-COMPACT REHYDRATION v1 | checkpoint=4]", injected)
+            self.assertIn("Refactor app", injected)
+            self.assertNotIn("/compact", injected)
+            self.assertIn("Done editing app.py.", injected)
+            self.assertIn("AGENTS.md", injected)
+            self.assertNotIn("GEMINI.md", injected)
+            self.assertIn("DESIGN_SPEC.md", injected)
+            self.assertIn("`````", injected)  # 5-backtick dynamic fence for 4-backtick content
+            self.assertIn("def greet():", injected)
+            self.assertIn("VALUE = 42", injected)
+            # Security boundaries must hold
+            self.assertNotIn("SUPER_SECRET_123", injected)
+            self.assertNotIn("OUTSIDE_SECRET", injected)
+            self.assertNotIn("TEMP_SCRATCH", injected)
 
-        # Single long earlier prompt clipped directly by budget also must not claim "verbatim"
-        logs_clip = self.tmp_root / "brain" / "cid-tl-single-clip" / ".system_generated" / "logs"
-        single_rows = [
-            {
-                "step_index": 0,
-                "type": "USER_INPUT",
-                "content": "<USER_REQUEST>Single huge earlier prompt: " + ("alpha beta gamma " * 120) + "</USER_REQUEST>",
-            },
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Ack 0."},
-            {"step_index": 2, "type": "USER_INPUT", "content": "<USER_REQUEST>Recent follow-up</USER_REQUEST>"},
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Done follow-up."},
-            {
-                "step_index": 4,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n<summary>Single.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs_clip / "transcript_full.jsonl", single_rows)
-        cfg_clip = mod.RehydrateConfig(
-            budget_all_user_chars=240,
-            max_recent_entries=2,
-            explicit_keys=frozenset({"budgetAllUserChars", "maxRecentEntries"}),
-        )
-        res_clip = mod.build_rehydration(logs_clip / "transcript_full.jsonl", config=cfg_clip, workspace_roots=[self.ws])
-        self.assertIsNotNone(res_clip)
-        assert res_clip is not None
-        msg_clip, _ = res_clip
-        sec1_clip_hdr = next(ln for ln in msg_clip.splitlines() if ln.startswith("## 1. Earlier User Request Timeline"))
-        self.assertNotIn("verbatim", sec1_clip_hdr)
+            # Second invocation with no new checkpoint must return {}
+            res2 = subprocess.run(
+                [sys.executable, "-S", "-B", str(HOOK_SCRIPT), "--hook"],
+                input=payload,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            self.assertEqual(res2.stdout.strip(), "{}")
 
-        # 2. _enforce_total_cap stats reconciliation: partial clip drops 1 of 3 files AND full pop drops section to 0
-        skill_dir = self.ws / "skills" / "demo-skill"
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        skill_md = skill_dir / "SKILL.md"
-        skill_md.write_text("# Demo Skill\n" + ("Skill instruction line padding here.\n" * 60), encoding="utf-8")
-        mod_a = self.ws / "mod_a.py"
-        mod_b = self.ws / "mod_b.py"
-        mod_c = self.ws / "mod_c.py"
-        mod_a.write_text("".join(f'var_1_{j:03d} = "alpha_{j:03d}"\n' for j in range(10)), encoding="utf-8")
-        mod_b.write_text("".join(f'var_2_{j:03d} = "beta_padding_line_{j:03d}_abcdef123456"\n' for j in range(90)), encoding="utf-8")
-        mod_c.write_text("".join(f'var_3_{j:03d} = "gamma_{j:03d}"\n' for j in range(10)), encoding="utf-8")
+            # Double idempotency: delete state file after systemMessage is logged -> still {}
+            (logs / "rehydrate_state.json").unlink()
+            records.append(
+                {
+                    "step_index": 5,
+                    "type": "SYSTEM_MESSAGE",
+                    "content": "[POST-COMPACT REHYDRATION v1 | checkpoint=4]\n...",
+                }
+            )
+            _write_jsonl(compact, records)
+            _write_jsonl(full, records)
+            res3 = subprocess.run(
+                [sys.executable, "-S", "-B", str(HOOK_SCRIPT), "--hook"],
+                input=payload,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            self.assertEqual(res3.stdout.strip(), "{}")
 
-        att_files = [
-            f"attachment_historical_evidence_{k:02d}_extremely_long_filename_proof_xyz.png"
-            for k in range(1, 7)
-        ]
-        att_lines = "\n".join(f"- [Attachment: {fn} (file:///home/user/upload/{fn})]" for fn in att_files)
-        logs_cap = self.tmp_root / "brain" / "cid-cap-stats" / ".system_generated" / "logs"
-        cap_rows = [
-            {
-                "step_index": 0,
-                "type": "USER_INPUT",
-                "media": [{"uri": f"file:///home/user/upload/{fn}"} for fn in att_files],
-                "content": "<USER_REQUEST>Earlier kickoff requirement alpha " + ("req " * 40) + "</USER_REQUEST>",
-            },
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Ack earlier kickoff."},
-            {
-                "step_index": 2,
-                "type": "USER_INPUT",
-                "content": "<USER_REQUEST>Second milestone requirement beta " + ("req " * 40) + "</USER_REQUEST>",
-            },
-            {
-                "step_index": 3,
-                "type": "PLANNER_RESPONSE",
-                "content": "Ack second milestone.\n" + ("Detailed older explanation line.\n" * 40),
-            },
-            {
-                "step_index": 4,
-                "type": "USER_INPUT",
-                "content": "<USER_REQUEST>Update mod_a.py, mod_b.py, mod_c.py per SKILL.md</USER_REQUEST>",
-            },
-            {
-                "step_index": 5,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "view_file", "args": {"AbsolutePath": str(skill_md)}},
-                    {"name": "edit_file", "args": {"Path": str(mod_a), "Replacement": "var_1_005"}},
-                    {"name": "edit_file", "args": {"Path": str(mod_c), "Replacement": "var_3_005"}},
-                    {"name": "edit_file", "args": {"Path": str(mod_b), "Replacement": "var_2_005"}},
+    def test_hook_fail_closed_when_workspace_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            f_out = root / "secret_note.txt"
+            f_out.write_text("MUST_NOT_LEAK_WITHOUT_WS\n", encoding="utf-8")
+            logs = root / "brain" / "conv-2" / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            full = logs / "transcript_full.jsonl"
+            records = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nread note\n</USER_REQUEST>"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "content": "read it",
+                    "tool_calls": [{"name": "read_file", "args": {"Path": str(f_out)}}],
+                },
+                {"step_index": 2, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
+            ]
+            _write_jsonl(compact, records)
+            _write_jsonl(full, records)
+            res = subprocess.run(
+                [sys.executable, "-S", "-B", str(HOOK_SCRIPT), "--hook"],
+                input=json.dumps({"transcriptPath": str(compact)}),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            out = json.loads(res.stdout)
+            injected = "\n".join(s["systemMessage"]["systemMessage"] for s in out["injectSteps"])
+            self.assertNotIn("MUST_NOT_LEAK_WITHOUT_WS", injected)
+
+    def test_multi_checkpoint_file_scope_prevents_stale_files(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            old_file = ws / "abandoned_v1.py"
+            old_file.write_text("OLD_ABANDONED_MARKER = 1\n", encoding="utf-8")
+            new_file = ws / "active_v2.py"
+            new_file.write_text("NEW_ACTIVE_MARKER = 2\n", encoding="utf-8")
+
+            full = root / "brain" / "c-multi" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nPhase 1\n</USER_REQUEST>"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "Edited old file",
+                        "tool_calls": [{"name": "edit_file", "args": {"Path": str(old_file)}}],
+                    },
+                    {"step_index": 2, "type": "CHECKPOINT", "content": "<summary>cp1</summary>"},
+                    {
+                        "step_index": 3,
+                        "type": "SYSTEM_MESSAGE",
+                        "content": "[POST-COMPACT REHYDRATION v1 | checkpoint=2]\n...",
+                    },
+                    {"step_index": 4, "type": "USER_INPUT", "content": "<USER_REQUEST>\nPhase 2\n</USER_REQUEST>"},
+                    {
+                        "step_index": 5,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "Discussing phase 2 without touching workspace files.",
+                    },
+                    {"step_index": 6, "type": "CHECKPOINT", "content": "<summary>cp2</summary>"},
                 ],
-            },
-            {"step_index": 6, "type": "GENERIC", "status": "DONE", "content": "Viewed SKILL.md"},
-            {"step_index": 7, "type": "GENERIC", "status": "DONE", "content": "Edited mod_a.py"},
-            {"step_index": 8, "type": "GENERIC", "status": "DONE", "content": "Edited mod_c.py"},
-            {"step_index": 9, "type": "GENERIC", "status": "DONE", "content": "Edited mod_b.py"},
-            {
-                "step_index": 10,
-                "type": "PLANNER_RESPONSE",
-                "content": "Completed updates across all three files.\n" + ("Summary sentence. " * 45),
-            },
-            {
-                "step_index": 11,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n"
-                    f"1. Update mod_a.py, mod_b.py, mod_c.py per SKILL.md\n{att_lines}\n"
-                    "<summary>Done.</summary>\n</CONTEXT_SUMMARY>"
+            )
+            # Default: fileScopeSincePrevCheckpoint=True -> Phase 1 abandoned file must NOT be re-injected at cp 6
+            res_scoped = core.build_rehydration(full, up_to_checkpoint_step=6, workspace_roots=[ws])
+            self.assertIsNotNone(res_scoped)
+            msg_scoped, stats_scoped = res_scoped
+            self.assertEqual(stats_scoped["prev_checkpoint"], 2)
+            self.assertEqual(stats_scoped["files"], 0)
+            self.assertNotIn("OLD_ABANDONED_MARKER", msg_scoped)
+
+            # Opt-out: fileScopeSincePrevCheckpoint=False -> restores historical workspace file
+            cfg_all = core.RehydrateConfig(file_scope_since_prev_checkpoint=False)
+            res_all = core.build_rehydration(full, up_to_checkpoint_step=6, config=cfg_all, workspace_roots=[ws])
+            self.assertIsNotNone(res_all)
+            msg_all, stats_all = res_all
+            self.assertEqual(stats_all["files"], 1)
+            self.assertIn("OLD_ABANDONED_MARKER", msg_all)
+
+            # When Phase 2 DOES modify a new file, only the new file is restored
+            with open(full, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "step_index": 7,
+                            "type": "PLANNER_RESPONSE",
+                            "content": "Edited active_v2.py",
+                            "tool_calls": [{"name": "edit_file", "args": {"Path": str(new_file)}}],
+                        }
+                    )
+                    + "\n"
+                )
+                f.write(json.dumps({"step_index": 8, "type": "CHECKPOINT", "content": "<summary>cp3</summary>"}) + "\n")
+            res_cp3 = core.build_rehydration(full, up_to_checkpoint_step=8, workspace_roots=[ws])
+            self.assertIsNotNone(res_cp3)
+            msg_cp3, stats_cp3 = res_cp3
+            self.assertEqual(stats_cp3["prev_checkpoint"], 6)
+            self.assertEqual(stats_cp3["files"], 1)
+            self.assertIn("NEW_ACTIVE_MARKER", msg_cp3)
+            self.assertNotIn("OLD_ABANDONED_MARKER", msg_cp3)
+
+    def test_config_security_global_disable_extra_allowed_and_caps(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            extra = root / "trusted_plugin"
+            untrusted_outside = root / "untrusted_outside"
+            ws.mkdir()
+            extra.mkdir()
+            untrusted_outside.mkdir()
+            (ws / ".agents").mkdir()
+
+            global_cfg = root / "global_rehydrate.json"
+            ws_cfg = ws / ".agents" / "rehydrate.json"
+
+            # 1) Global enabled=false cannot be re-enabled by workspace; workspace extraAllowedPaths is ignored
+            global_cfg.write_text(
+                json.dumps({"enabled": False, "extraAllowedPaths": [str(extra)]}),
+                encoding="utf-8",
+            )
+            ws_cfg.write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "extraAllowedPaths": [str(untrusted_outside)],
+                        "budgetRecentTurnsChars": 99_999_999,
+                        "maxModifiedFiles": 999,
+                    }
                 ),
-            },
-        ]
-        _write_jsonl(logs_cap / "transcript_full.jsonl", cap_rows)
-        res_cap = mod.build_rehydration(logs_cap / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_cap)
-        assert res_cap is not None
-        msg_cap, st_cap = res_cap
-        self.assertLessEqual(len(msg_cap), st_cap["ratio_cap"])
-        self.assertEqual(st_cap["files"], len(st_cap["file_paths"]))
-        self.assertEqual(st_cap["skills"], len(st_cap["skill_paths"]))
-        # Dynamic frame_reserve budgets the long attachment preamble upfront so all 3 files stay inside cap cleanly
-        self.assertEqual(st_cap["files"], 3)
-        for fp_entry in st_cap["file_paths"]:
-            _, raw_p = fp_entry.split(":", 1)
-            self.assertIn(f"`{raw_p}`", msg_cap)
-        for sp_entry in st_cap["skill_paths"]:
-            self.assertIn(f"`{sp_entry}`", msg_cap)
+                encoding="utf-8",
+            )
+            cfg = core.load_rehydrate_config(ws, global_config_path=global_cfg)
+            self.assertFalse(cfg.enabled)
+            self.assertEqual(cfg.budget_recent_turns_chars, core.MAX_CONFIG_BUDGET_CHARS)
+            self.assertEqual(cfg.max_modified_files, core.MAX_CONFIG_FILE_SLOTS)
+            self.assertEqual(len(cfg.extra_allowed_paths), 1)
+            self.assertEqual(Path(cfg.extra_allowed_paths[0]).resolve(), extra.resolve())
 
-        # Case 2a-overflow: when stale-path notice + 3 files genuinely push past ratio_cap,
-        # _enforce_total_cap drops trailing whole file blocks cleanly and reconciles stats to surviving headings
-        stale_dir_ref = self.ws / "vanished_legacy_module" / "old_file.py"
-        cap_rows_ov = list(cap_rows[:-1]) + [
-            {
-                "step_index": 11,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n"
-                    f"1. Update mod_a.py, mod_b.py, mod_c.py per SKILL.md\n{att_lines}\n"
-                    f"<summary>Done. Primary ref: `{stale_dir_ref}`.</summary>\n</CONTEXT_SUMMARY>"
-                ),
-            }
-        ]
-        # Make mod_a and mod_c slightly larger so workspace_notice + 3 files exceed ratio_cap
-        mod_a.write_text("".join(f'var_1_{j:03d} = "alpha_detail_{j:03d}_padding"\n' for j in range(18)), encoding="utf-8")
-        mod_c.write_text("".join(f'var_3_{j:03d} = "gamma_detail_{j:03d}_padding"\n' for j in range(18)), encoding="utf-8")
-        logs_cap_ov = self.tmp_root / "brain" / "cid-cap-stats-ov" / ".system_generated" / "logs"
-        _write_jsonl(logs_cap_ov / "transcript_full.jsonl", cap_rows_ov)
-        res_ov = mod.build_rehydration(logs_cap_ov / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_ov)
-        assert res_ov is not None
-        msg_ov, st_ov = res_ov
-        self.assertLessEqual(len(msg_ov), st_ov["ratio_cap"])
-        self.assertEqual(st_ov["files"], len(st_ov["file_paths"]))
-        self.assertLess(st_ov["files"], 3)
-        for fp_entry in st_ov["file_paths"]:
-            _, raw_p = fp_entry.split(":", 1)
-            self.assertIn(f"`{raw_p}`", msg_ov)
-
-        # Case 2b: _enforce_total_cap pops the entire Files section -> files==0 and file_paths==[]
-        tiny_ref = self.ws / "tiny_ref.py"
-        tiny_ref.write_text("TINY_A = 1\nTINY_B = 2\n", encoding="utf-8")
-        logs_drop = self.tmp_root / "brain" / "cid-cap-drop" / ".system_generated" / "logs"
-        drop_rows = [
-            {
-                "step_index": 0,
-                "type": "USER_INPUT",
-                "media": [{"uri": f"file:///home/user/upload/{fn}"} for fn in att_files],
-                "content": "<USER_REQUEST>Read tiny_ref.py and explain thoroughly</USER_REQUEST>",
-            },
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "read_file", "args": {"Path": str(tiny_ref)}}],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "TINY_A = 1"},
-            {
-                "step_index": 3,
-                "type": "PLANNER_RESPONSE",
-                "content": "Analysis:\n" + ("Reasonable detailed explanation line.\n" * 28),
-            },
-            {
-                "step_index": 4,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n"
-                    f"1. Read tiny_ref.py and explain thoroughly\n{att_lines}\n"
-                    "<summary>Done.</summary>\n</CONTEXT_SUMMARY>"
-                ),
-            },
-        ]
-        _write_jsonl(logs_drop / "transcript_full.jsonl", drop_rows)
-        cfg_drop = mod.RehydrateConfig(max_referenced_files=2, explicit_keys=frozenset({"maxReferencedFiles"}))
-        res_drop = mod.build_rehydration(logs_drop / "transcript_full.jsonl", config=cfg_drop, workspace_roots=[self.ws])
-        self.assertIsNotNone(res_drop)
-        assert res_drop is not None
-        msg_drop, st_drop = res_drop
-        self.assertLessEqual(len(msg_drop), st_drop["ratio_cap"])
-        self.assertNotIn(". Restored Active Workspace Files (Live Disk Read)", msg_drop)
-        self.assertEqual(st_drop["files"], 0)
-        self.assertEqual(st_drop["file_paths"], [])
-
-        # 3. skipped_referenced_files must count ONLY eligible workspace files (exclude .env, binary, missing, outside)
-        elig_files = []
-        for idx_e in range(1, 5):
-            ef = self.ws / f"elig_{idx_e}.py"
-            ef.write_text(f"ELIG_{idx_e} = True\n", encoding="utf-8")
-            elig_files.append(ef)
-        env_secret = self.ws / ".env"
-        env_secret.write_text("SECRET=1\n", encoding="utf-8")
-        bin_png = self.ws / "logo.png"
-        bin_png.write_bytes(b"\x89PNG\r\n\x1a\n")
-        missing_py = self.ws / "deleted_missing.py"
-        outside_py = self.tmp_root / "outside_ws.py"
-        outside_py.write_text("OUTSIDE = 1\n", encoding="utf-8")
-
-        # Mode A: completed_qa / active_coding with default max_referenced_files=0 -> 2 eligible reads skipped (not 6)
-        logs_skip_a = self.tmp_root / "brain" / "cid-skip-elig-a" / ".system_generated" / "logs"
-        skip_a_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Read eligible and ineligible files</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "read_file", "args": {"Path": str(elig_files[0])}},
-                    {"name": "read_file", "args": {"Path": str(elig_files[1])}},
-                    {"name": "read_file", "args": {"Path": str(env_secret)}},
-                    {"name": "read_file", "args": {"Path": str(bin_png)}},
-                    {"name": "read_file", "args": {"Path": str(missing_py)}},
-                    {"name": "read_file", "args": {"Path": str(outside_py)}},
+            # 2) Global extraAllowedPaths allows Layer 4 read outside workspace while still blocking .env
+            global_cfg.write_text(json.dumps({"enabled": True, "extraAllowedPaths": [str(extra)]}), encoding="utf-8")
+            ws_cfg.unlink()
+            cfg2 = core.load_rehydrate_config(ws, global_config_path=global_cfg)
+            self.assertTrue(cfg2.enabled)
+            plugin_py = extra / "plugin_code.py"
+            plugin_py.write_text("TRUSTED_PLUGIN_CODE = True\n", encoding="utf-8")
+            plugin_env = extra / ".env"
+            plugin_env.write_text("EXTRA_SECRET_ENV = 1\n", encoding="utf-8")
+            full = root / "brain" / "c-extra" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nedit plugin\n</USER_REQUEST>"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "edited",
+                        "tool_calls": [
+                            {"name": "edit_file", "args": {"Path": str(plugin_py)}},
+                            {"name": "read_file", "args": {"Path": str(plugin_env)}},
+                        ],
+                    },
+                    {"step_index": 2, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
                 ],
-            },
-            *[
-                {"step_index": 2 + i, "type": "GENERIC", "status": "DONE", "content": f"Read result {i}"}
-                for i in range(6)
+            )
+            res = core.build_rehydration(full, up_to_checkpoint_step=2, config=cfg2, workspace_roots=[ws])
+            self.assertIsNotNone(res)
+            msg, _ = res
+            self.assertIn("TRUSTED_PLUGIN_CODE", msg)
+            self.assertNotIn("EXTRA_SECRET_ENV", msg)
+
+    def test_fork_lineage_and_branch_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            brain = Path(td) / "brain"
+            parent_logs = brain / "aaaa1111" / ".system_generated" / "logs"
+            child_logs = brain / "bbbb2222" / ".system_generated" / "logs"
+            parent_full = parent_logs / "transcript_full.jsonl"
+            child_full = child_logs / "transcript_full.jsonl"
+
+            _write_jsonl(
+                parent_full,
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-22T10:00:00Z",
+                        "content": "<USER_REQUEST>\nRoot constraint alpha\n</USER_REQUEST>",
+                    },
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-22T10:00:10Z",
+                        "content": "Acknowledged alpha.",
+                    },
+                    {
+                        "step_index": 2,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-22T10:05:00Z",
+                        "content": "<USER_REQUEST>\nPOST_FORK_PARENT_SECRET_MUST_NOT_LEAK\n</USER_REQUEST>",
+                    },
+                ],
+            )
+            _write_jsonl(
+                child_full,
+                [
+                    {
+                        "step_index": 2,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-22T10:01:00Z",
+                        "content": "<USER_REQUEST>\nChild branch work beta\n</USER_REQUEST>",
+                    },
+                    {
+                        "step_index": 3,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-22T10:01:10Z",
+                        "content": "Working on beta.",
+                    },
+                    {"step_index": 4, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
+                ],
+            )
+            anc = core.resolve_fork_ancestors(child_full)
+            self.assertEqual(len(anc), 1)
+            self.assertEqual(anc[0]["cid"], "aaaa1111")
+            self.assertEqual((anc[0]["min_step"], anc[0]["max_step"]), (0, 1))
+
+            res = core.build_rehydration(child_full, ancestors=anc, workspace_roots=[])
+            self.assertIsNotNone(res)
+            msg, stats = res
+            self.assertEqual(stats["fork_hops"], 1)
+            self.assertIn("Root constraint alpha", msg)
+            self.assertIn("Child branch work beta", msg)
+            self.assertIn("[/fork branch aaaa1111 -> bbbb2222 @ step 2]", msg)
+            self.assertNotIn("POST_FORK_PARENT_SECRET_MUST_NOT_LEAK", msg)
+
+    def test_short_cjk_filter_paste_fold_and_turn_atomic_chunking(self) -> None:
+        # Short CJK denoising
+        self.assertTrue(core.is_low_info_short_turn("好的！"))
+        self.assertTrue(core.is_low_info_short_turn("繼續吧"))
+        self.assertFalse(core.is_low_info_short_turn("修2處"))
+        self.assertFalse(core.is_low_info_short_turn("/plan"))
+        self.assertFalse(core.is_low_info_short_turn("請保留完整日誌"))
+
+        # Older paste folding + >75 short filter
+        msgs = [(0, "立項初始約束", None, 1)]
+        for i in range(1, 80):
+            txt = "好的" if i == 2 else ("x" * 1200 if i == 3 else f"prompt {i}")
+            msgs.append((i, txt, Path("transcript_full.jsonl"), i + 1))
+        block, total, kept, filtered, folded = core.format_user_timeline(msgs)
+        self.assertEqual(total, 80)
+        self.assertEqual(filtered, 1)
+        self.assertEqual(folded, 1)
+        self.assertEqual(kept, 79)
+        self.assertIn("folded 700 chars", block)
+
+        # Turn-atomic 48 KiB chunking: a single turn containing '### ' headings must NOT be split mid-turn
+        turn_with_headings = (
+            "[Step 5 | Assistant]:\n"
+            + "### Heading A\n"
+            + ("中" * 1500)
+            + "\n\n### Heading B\n"
+            + ("文" * 1500)
+        )
+        huge_sec = "## 2. Recent Pre-Compaction Verbatim Dialogue\n\n" + "\n\n".join(
+            [f"[Step {i} | Assistant]:\n" + ("漢" * 4000) for i in range(4)] + [turn_with_headings]
+        )
+        chunks = core.split_into_inject_chunks(
+            ["[POST-COMPACT REHYDRATION v1 | checkpoint=9]", "hdr", huge_sec],
+            checkpoint=9,
+        )
+        self.assertGreater(len(chunks), 1)
+        for ch in chunks:
+            self.assertLessEqual(len(ch.encode("utf-8")), core.MAX_INJECT_STEP_BYTES)
+        self.assertTrue(
+            any(("### Heading A" in ch and "### Heading B" in ch) for ch in chunks),
+            "A single assistant turn containing ### headings was erroneously split across chunks",
+        )
+
+    def test_bilingual_token_estimator_and_dynamic_fencing(self) -> None:
+        self.assertEqual(core._fence_for("plain text"), "```")
+        self.assertEqual(core._fence_for("```python\nx=1\n```"), "````")
+        self.assertEqual(core._fence_for("````carousel\n```py\n````"), "`````")
+        en_tok = core.estimate_tokens("hello world " * 100)  # 1200 ASCII chars -> ~336 tok
+        zh_tok = core.estimate_tokens("壓縮效果評估" * 100)  # 600 CJK chars -> ~690 tok
+        self.assertGreater(zh_tok, en_tok)
+        self.assertGreater(zh_tok, 600)
+
+    def test_pep562_compat_and_cli_subcommands(self) -> None:
+        self.assertTrue(callable(rh_entry.resolve_fork_ancestors))
+        self.assertTrue(callable(rh_entry.build_rehydration))
+
+        with tempfile.TemporaryDirectory() as td:
+            res = subprocess.run(
+                [sys.executable, "-B", str(HOOK_SCRIPT), "--cwd", td, "show-config"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=True,
+            )
+            cfg_json = json.loads(res.stdout)
+            self.assertEqual(cfg_json["budgetRecentTurnsChars"], 28000)
+            self.assertEqual(cfg_json["budgetFilesTotalChars"], 28000)
+            self.assertEqual(cfg_json["budgetSingleFileChars"], 8000)
+            self.assertEqual(cfg_json["maxModifiedFiles"], 5)
+            self.assertEqual(cfg_json["maxReferencedFiles"], 2)
+            self.assertTrue(cfg_json["fileScopeSincePrevCheckpoint"])
+            self.assertEqual(cfg_json["extraAllowedPaths"], [])
+
+    # -------------------------------------------------------------------------
+    # Core regression tests (#5, #7, #11)
+    # -------------------------------------------------------------------------
+
+    def test_posix_temp_path_scoping_and_system_blocks(self) -> None:
+        # Scoped POSIX /tmp/ and /dev/shm/ workspaces are allowed; unscoped or /etc/, /dev/null stay blocked
+        self.assertFalse(
+            core._is_blocked_system_or_temp_path("/tmp/pytest_ws/app.py", "/tmp/pytest_ws/app.py/", ("/tmp/pytest_ws",))
+        )
+        self.assertFalse(
+            core._is_blocked_system_or_temp_path("/dev/shm/ws/app.py", "/dev/shm/ws/app.py/", ("/dev/shm/ws",))
+        )
+        self.assertTrue(core._is_blocked_system_or_temp_path("/tmp/pytest_ws/app.py", "/tmp/pytest_ws/app.py/", None))
+        self.assertTrue(
+            core._is_blocked_system_or_temp_path("/tmp/other/app.py", "/tmp/other/app.py/", ("/home/user/ws",))
+        )
+        self.assertTrue(core._is_blocked_system_or_temp_path("/etc/passwd", "/etc/passwd/", ("/etc",)))
+        self.assertTrue(core._is_blocked_system_or_temp_path("/dev/null", "/dev/null/", ("/dev/shm/ws",)))
+        self.assertTrue(core._is_blocked_system_or_temp_path("/dev/null", "/dev/null/", ("/dev",)))
+
+        # End-to-end temp dir eligibility & expanded sensitive basenames
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            ok_file = ws / "app.py"
+            ok_file.write_text("x = 1\n", encoding="utf-8")
+            ws_pref = core._prepare_prefixes([ws])
+            self.assertTrue(core.is_eligible_text_file(str(ok_file), allowed_prefixes=ws_pref))
+            self.assertFalse(core.is_eligible_text_file(str(ok_file), allowed_prefixes=None))
+
+            for secret_name in (".envrc", ".env~", ".git-credentials"):
+                sf = ws / secret_name
+                sf.write_text("SECRET=1\n", encoding="utf-8")
+                self.assertFalse(core.is_eligible_text_file(str(sf), allowed_prefixes=ws_pref), secret_name)
+
+            aws_cred = ws / ".aws" / "credentials"
+            aws_cred.parent.mkdir(parents=True)
+            aws_cred.write_text("[default]\naws_secret_access_key=abc\n", encoding="utf-8")
+            self.assertFalse(core.is_eligible_text_file(str(aws_cred), allowed_prefixes=ws_pref))
+
+    def test_symlink_skill_scope_and_reverse_env_symlink_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            fake_home = root / "home"
+            token_store = fake_home / ".gemini" / "config" / "plugins" / "secret_plugin" / "token_store.json"
+            token_store.parent.mkdir(parents=True)
+            token_store.write_text('{"token": "SUPER_SECRET_PLUGIN_TOKEN"}\n', encoding="utf-8")
+
+            prod_cfg = ws / "prod_cfg.txt"
+            prod_cfg.write_text("REVERSE_ENV_SYMLINK_SECRET=42\n", encoding="utf-8")
+
+            fake_skill_link = ws / "SKILL.md"
+            reverse_env_link = ws / ".env"
+            full = root / "brain" / "c-sym" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\ncheck files\n</USER_REQUEST>"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "checked",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": str(fake_skill_link)}},
+                            {"name": "read_file", "args": {"Path": str(reverse_env_link)}},
+                        ],
+                    },
+                    {"step_index": 2, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
+                ],
+            )
+
+            with (
+                mock.patch.object(Path, "home", return_value=fake_home),
+                _symlink_or_mock_resolve(fake_skill_link, token_store),
+                _symlink_or_mock_resolve(reverse_env_link, prod_cfg),
+            ):
+                ws_pref = core._prepare_prefixes([ws])
+                skill_pref = core._prepare_prefixes([ws, *core.default_custom_skill_roots(None)])
+                self.assertIsNone(
+                    core._resolve_eligible_file(
+                        str(fake_skill_link),
+                        allowed_prefixes=skill_pref,
+                        require_resolved_basename="SKILL.MD",
+                    )
+                )
+                self.assertFalse(core.is_eligible_text_file(str(reverse_env_link), allowed_prefixes=ws_pref))
+
+                res = core.build_rehydration(full, up_to_checkpoint_step=2, workspace_roots=[ws])
+                self.assertIsNotNone(res)
+                msg, stats = res
+                self.assertEqual(stats["skills"], 0)
+                self.assertEqual(stats["files"], 0)
+                self.assertNotIn("SUPER_SECRET_PLUGIN_TOKEN", msg)
+                self.assertNotIn("REVERSE_ENV_SYMLINK_SECRET", msg)
+
+    def test_workspace_roots_unc_and_extended_win_paths(self) -> None:
+        # Extended-length local Windows drive accepted; UNC, device paths, and non-ASCII drive rejected
+        self.assertEqual(
+            core.normalize_local_path(r"\\?\D:\antigravity\a.py"),
+            os.path.normpath(r"D:\antigravity\a.py"),
+        )
+        for blocked in (
+            r"\\?\UNC\attacker.invalid\share\a.py",
+            r"\\.\PhysicalDrive0",
+            r"\\attacker.invalid\share",
+            "//attacker.invalid/share",
+            "file://attacker.invalid/share",
+            "Ä:\\bad\\path.py",
+        ):
+            self.assertEqual(core.normalize_local_path(blocked), "", blocked)
+
+        # resolve_workspace_roots_from_payload must NEVER call Path.resolve on rejected UNC/remote URIs
+        seen_resolve_inputs: list[str] = []
+        orig_resolve = Path.resolve
+
+        def spy_resolve(self: Path, strict: bool = False) -> Path:
+            seen_resolve_inputs.append(str(self))
+            return orig_resolve(self, strict=strict)
+
+        payload = {
+            "workspacePaths": [
+                r"\\attacker.invalid\share",
+                "//attacker.invalid/share",
+                "file://attacker.invalid/share",
             ],
-            {"step_index": 8, "type": "PLANNER_RESPONSE", "content": "Finished reading all targets and analyzed them thoroughly."},
-            {
-                "step_index": 9,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Read eligible and ineligible files\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs_skip_a / "transcript_full.jsonl", skip_a_rows)
-        res_skip_a = mod.build_rehydration(logs_skip_a / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_skip_a)
-        assert res_skip_a is not None
-        _, st_skip_a = res_skip_a
-        self.assertEqual(st_skip_a["skipped_referenced_files"], 2)
+            "cwd": r"\\attacker.invalid\cwd",
+        }
+        with mock.patch.object(Path, "resolve", spy_resolve):
+            roots = core.resolve_workspace_roots_from_payload(payload)
+        self.assertEqual(roots, [])
+        self.assertEqual(seen_resolve_inputs, [])
 
-        # Mode B: mid_turn (in_progress_turn=True) restores 2 of 4 eligible reads -> skipped=2 (not 5)
-        logs_skip_b = self.tmp_root / "brain" / "cid-skip-elig-b" / ".system_generated" / "logs"
-        skip_b_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Mid-turn read 4 eligible + 3 ineligible</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "Inspecting files mid-turn.",
-                "tool_calls": [
-                    {"name": "read_file", "args": {"Path": str(elig_files[0])}},
-                    {"name": "read_file", "args": {"Path": str(elig_files[1])}},
-                    {"name": "read_file", "args": {"Path": str(elig_files[2])}},
-                    {"name": "read_file", "args": {"Path": str(elig_files[3])}},
-                    {"name": "read_file", "args": {"Path": str(env_secret)}},
-                    {"name": "read_file", "args": {"Path": str(missing_py)}},
-                    {"name": "read_file", "args": {"Path": str(outside_py)}},
+    def test_fork_rejects_old_unrelated_exact_tip_and_inherits_ancestor_prev_cp(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            pre_cp_file = ws / "pre_cp1_abandoned.py"
+            pre_cp_file.write_text("PRE_CP_ABANDONED_ANCESTOR = 1\n", encoding="utf-8")
+            post_cp_file = ws / "post_cp1_active.py"
+            post_cp_file.write_text("POST_CP_ACTIVE_ANCESTOR = 2\n", encoding="utf-8")
+
+            brain = root / "brain"
+            # 1) Unrelated 21-day-old session ending right at step 4 (exact_tip=1, huge time_delta)
+            old_full = brain / "unrelated_old" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                old_full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-01T10:00:00Z", "content": "old0"},
+                    {"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": "2026-11-01T10:01:00Z", "content": "old4"},
                 ],
-            },
-            *[
-                {"step_index": 2 + i, "type": "GENERIC", "status": "DONE", "content": f"Read result {i}"}
-                for i in range(7)
-            ],
-            {
-                "step_index": 9,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. Mid-turn read 4 eligible + 3 ineligible\n<summary>Mid-turn.</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs_skip_b / "transcript_full.jsonl", skip_b_rows)
-        res_skip_b = mod.build_rehydration(logs_skip_b / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_skip_b)
-        assert res_skip_b is not None
-        _, st_skip_b = res_skip_b
-        self.assertTrue(st_skip_b["in_progress_turn"])
-        self.assertEqual(st_skip_b["files"], 2)
-        self.assertEqual(st_skip_b["skipped_referenced_files"], 2)
+            )
+            # 2) True parent forked 2s ago at step 4, then continued to step 6 (exact_tip=0, delta=2s)
+            parent_full = brain / "true_parent" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                parent_full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-22T10:00:00Z", "content": "<USER_REQUEST>\nRoot objective\n</USER_REQUEST>"},
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-22T10:00:05Z",
+                        "content": "edited pre_cp",
+                        "tool_calls": [{"name": "edit_file", "args": {"Path": str(pre_cp_file)}}],
+                    },
+                    {"step_index": 2, "type": "CHECKPOINT", "created_at": "2026-11-22T10:00:10Z", "content": "<summary>cp1</summary>"},
+                    {
+                        "step_index": 4,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-22T10:00:20Z",
+                        "content": "edited post_cp",
+                        "tool_calls": [{"name": "edit_file", "args": {"Path": str(post_cp_file)}}],
+                    },
+                    {"step_index": 6, "type": "USER_INPUT", "created_at": "2026-11-22T10:02:00Z", "content": "parent continued"},
+                ],
+            )
+            # 3) Child forked at step 5 (2 seconds after true_parent step 4)
+            child_full = brain / "child_branch" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                child_full,
+                [
+                    {"step_index": 5, "type": "USER_INPUT", "created_at": "2026-11-22T10:00:22Z", "content": "<USER_REQUEST>\nChild task\n</USER_REQUEST>"},
+                    {"step_index": 6, "type": "PLANNER_RESPONSE", "created_at": "2026-11-22T10:00:25Z", "content": "Child reply"},
+                    {"step_index": 7, "type": "CHECKPOINT", "created_at": "2026-11-22T10:00:30Z", "content": "<summary>cp2</summary>"},
+                ],
+            )
 
-    def test_split_into_inject_chunks_fence_safety_and_small_max_bytes(self) -> None:
-        md_with_internal_h3 = (
-            "### [Modified @ step 5] `docs/guide.md`\n"
-            "```\n"
-            "# Guide Header\n\n"
-            "### Internal Heading Inside Code Fence\n"
-            "Some markdown paragraph with 中文內容.\n\n"
-            "### Second Internal Heading\n"
-            "TAIL_MD_MARKER\n"
-            "```"
+            # True parent must win over 21-day-old unrelated exact-tip session
+            anc = core.resolve_fork_ancestors(child_full)
+            self.assertEqual(len(anc), 1)
+            self.assertEqual(anc[0]["cid"], "true_parent")
+
+            # build_rehydration must inherit prev_checkpoint=2 from ancestor and exclude pre_cp1_abandoned.py
+            res = core.build_rehydration(child_full, ancestors=anc, workspace_roots=[ws])
+            self.assertIsNotNone(res)
+            msg, stats = res
+            self.assertEqual(stats["prev_checkpoint"], 2)
+            self.assertIn("POST_CP_ACTIVE_ANCESTOR", msg)
+            self.assertNotIn("PRE_CP_ABANDONED_ANCESTOR", msg)
+
+            # If true_parent is removed, 21-day-old unrelated exact-tip session must NOT be stitched
+            parent_full.unlink()
+            self.assertEqual(core.resolve_fork_ancestors(child_full), [])
+
+            # 0-byte sibling transcript.jsonl must fall back to valid transcript_full.jsonl during fork discovery
+            zero_parent_logs = brain / "zero_compact_parent" / ".system_generated" / "logs"
+            _write_jsonl(
+                zero_parent_logs / "transcript_full.jsonl",
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-22T10:00:00Z", "content": "root"},
+                    {"step_index": 4, "type": "PLANNER_RESPONSE", "created_at": "2026-11-22T10:00:20Z", "content": "step4"},
+                ],
+            )
+            (zero_parent_logs / "transcript.jsonl").write_bytes(b"")
+            anc_fb = core.resolve_fork_ancestors(child_full)
+            self.assertEqual(len(anc_fb), 1)
+            self.assertEqual(anc_fb[0]["cid"], "zero_compact_parent")
+
+    def test_fence_safe_clipping_folding_and_oversized_chunking(self) -> None:
+        # 1) clip_turn_text on 3-backtick, 4-backtick, and tilde fenced turns
+        for opener, closer in (("```python", "```"), ("````markdown", "````"), ("~~~yaml", "~~~")):
+            body = "\n".join(f"line_{i} = 'payload_{i}'" for i in range(400))
+            turn = f"[Step 10 | Assistant]:\n{opener}\n{body}\n{closer}\nDone."
+            clipped = core.clip_turn_text(turn, max_chars=2000)
+            self.assertIn("turn clipped", clipped)
+            self.assertTrue(_commonmark_fences_balanced(clipped), f"Unbalanced fence for {opener}:\n{clipped}")
+
+        # 2) fold_user_paste on fenced paste with >200 chars after closing fence
+        pasted = "Check this code:\n```python\n" + ("x = 1234567890\n" * 60) + "```\n" + ("after " * 60)
+        folded, did_fold = core.fold_user_paste(pasted, Path("transcript_full.jsonl"), 12, 3)
+        self.assertTrue(did_fold)
+        self.assertTrue(_commonmark_fences_balanced(folded), f"Unbalanced folded paste:\n{folded}")
+
+        # 3) Oversized >44 KB single fenced CJK block chunk splitting
+        big_cjk_code = "\n".join(f"項目_{i} = '測試資料內容'" * 3 for i in range(600))
+        sec4_huge = (
+            "## 4. Restored Active Workspace Files (Live Disk Read)\n"
+            "### [Modified @ step 5] `D:\\ws\\huge_cjk.py`\n"
+            f"```\n{big_cjk_code}\n```"
         )
-        big_code_lines = [f"def fn_{i:03d}(): return '中文payload_{i:03d}_padding_text'" for i in range(160)]
-        very_long_code_line = "LONG_LINE_START_" + ("漢字A" * 240) + "_LONG_LINE_END"
-        big_code_block = (
-            "### [Modified @ step 6] `src/big.py`\n"
-            "```python\n"
-            + "\n".join(big_code_lines[:40])
-            + "\n\n"
-            + very_long_code_line
-            + "\n\n"
-            + "\n".join(big_code_lines[40:])
+        chunks = core.split_into_inject_chunks(
+            ["[POST-COMPACT REHYDRATION v1 | checkpoint=8]", "hdr", sec4_huge],
+            max_bytes=core.MAX_INJECT_STEP_BYTES,
+            checkpoint=8,
+        )
+        self.assertGreater(len(chunks), 1)
+        for ch in chunks:
+            utf8_len = len(ch.encode("utf-8"))
+            self.assertLessEqual(utf8_len, core.MAX_INJECT_STEP_BYTES)
+            self.assertLessEqual(utf8_len + 260, 49_152)
+            self.assertTrue(_commonmark_fences_balanced(ch), "Unbalanced fence in split chunk")
+
+        # 4) FILE_SPLIT_RE must NOT split mid-file on inner `### `func()`` markdown headings
+        api_md_body = ("說明文字" * 2000) + "\n\n### `build_rehydration()`\n\n" + ("細部規格" * 2000)
+        other_md_body = "其他內容" * 2500
+        sec4_docs = (
+            "## 4. Restored Active Workspace Files (Live Disk Read)\n"
+            f"### [Modified @ step 5] `D:\\ws\\API.md`\n```\n{api_md_body}\n```\n\n"
+            f"### [Modified @ step 6] `D:\\ws\\OTHER.md`\n```\n{other_md_body}\n```"
+        )
+        doc_chunks = core.split_into_inject_chunks(
+            ["[POST-COMPACT REHYDRATION v1 | checkpoint=9]", "hdr", sec4_docs],
+            max_bytes=core.MAX_INJECT_STEP_BYTES,
+            checkpoint=9,
+        )
+        self.assertGreater(len(doc_chunks), 1)
+        for ch in doc_chunks:
+            self.assertLessEqual(len(ch.encode("utf-8")), core.MAX_INJECT_STEP_BYTES)
+            self.assertTrue(_commonmark_fences_balanced(ch), "Inner ### `func()` heading broke outer fence")
+        # Both halves of API.md should remain in the same chunk since API.md itself is < 44 KB
+        self.assertTrue(
+            any(("D:\\ws\\API.md" in ch and "### `build_rehydration()`" in ch) for ch in doc_chunks),
+            "API.md was split across chunks at inner ### `build_rehydration()` heading",
+        )
+
+        # 5) Quoted `[Step 0 | User]:` inside a code fence in Layer 2 must NOT split mid-fence across chunks
+        fenced_quote_turn = (
+            "[Step 12 | Assistant]:\n```markdown\n"
+            + ("前段日誌" * 2600)
+            + "\n\n[Step 0 | User]:\nquoted example\n\n"
+            + ("後段日誌" * 1600)
             + "\n```"
         )
-        small_atomic_code = "### [Modified @ step 7] `src/tiny.py`\n```python\nTINY_TOP = 1\nTINY_BOT = 2\n```"
-        sections = [
-            "[POST-COMPACT REHYDRATION v1 | checkpoint=42]",
-            "Preamble text explaining ground truth.",
-            f"## 1. Restored Active Workspace Files (Live Disk Read)\n{md_with_internal_h3}\n\n{big_code_block}\n\n{small_atomic_code}",
+        sec2_quoted = (
+            "## 2. Recent Pre-Compaction Verbatim Dialogue\n\n"
+            "[Step 10 | Assistant]:\n" + ("前置對話" * 3500) + "\n\n"
+            + fenced_quote_turn
+        )
+        q_chunks = core.split_into_inject_chunks(
+            ["[POST-COMPACT REHYDRATION v1 | checkpoint=12]", "hdr", sec2_quoted],
+            max_bytes=core.MAX_INJECT_STEP_BYTES,
+            checkpoint=12,
+        )
+        self.assertGreater(len(q_chunks), 1)
+        for ch in q_chunks:
+            self.assertLessEqual(len(ch.encode("utf-8")), core.MAX_INJECT_STEP_BYTES)
+            self.assertTrue(_commonmark_fences_balanced(ch), "Quoted [Step 0 | User]: inside fence broke chunk balance")
+
+    def test_user_timeline_budget_enforcement_and_kept_count_accuracy(self) -> None:
+        # 1) total_real <= 10 (6 x 6,000-char prompts) must fold & stay within budget
+        msgs_small = [(i, f"PROMPT_{i}_" + ("a" * 6000), Path("t.jsonl"), i + 1) for i in range(6)]
+        blk1, tot1, kept1, _, fold1 = core.format_user_timeline(msgs_small, budget_chars=24_000)
+        self.assertEqual(tot1, 6)
+        self.assertLessEqual(len(blk1), 24_256)
+        self.assertGreater(fold1, 0)
+        rendered_bullets_1 = len(re.findall(r"^- \[#\d+ @ step \d+\]:", blk1, re.M))
+        self.assertEqual(kept1, rendered_bullets_1)
+
+        # 2) Single 30,000-char prompt must stay within budget
+        msgs_one = [(0, "BIG_" + ("z" * 30_000), Path("t.jsonl"), 1)]
+        blk2, tot2, kept2, _, fold2 = core.format_user_timeline(msgs_one, budget_chars=24_000)
+        self.assertEqual((tot2, kept2), (1, 1))
+        self.assertLessEqual(len(blk2), 24_256)
+        self.assertGreaterEqual(fold2, 1)
+
+        # 3) 10 prompts where prompt #1 is huge (25K): latest prompt #10 MUST NOT be dropped
+        msgs_10 = [(0, "FIRST_" + ("h" * 25_000), Path("t.jsonl"), 1)] + [
+            (i, f"SHORT_PROMPT_{i}", Path("t.jsonl"), i + 1) for i in range(1, 10)
         ]
+        blk3, tot3, kept3, _, _ = core.format_user_timeline(msgs_10, budget_chars=24_000)
+        self.assertEqual(tot3, 10)
+        self.assertIn("SHORT_PROMPT_9", blk3)
+        self.assertLessEqual(len(blk3), 24_256)
+        self.assertEqual(kept3, len(re.findall(r"^- \[#\d+ @ step \d+\]:", blk3, re.M)))
 
-        for max_b in (500, 1200, 3000, 4096, 8000):
-            chunks = mod.split_into_inject_chunks(sections, max_bytes=max_b, checkpoint=42)
-            self.assertGreater(len(chunks), 1, f"Expected multiple chunks for max_bytes={max_b}")
-            for idx, ch in enumerate(chunks, 1):
-                utf8_len = len(ch.encode("utf-8"))
-                self.assertLessEqual(
-                    utf8_len,
-                    max_b,
-                    f"Chunk {idx}/{len(chunks)} exceeded max_bytes={max_b} ({utf8_len} bytes)",
-                )
-                fence_cnt = sum(1 for ln in ch.splitlines() if ln.lstrip().startswith("```"))
-                self.assertEqual(
-                    fence_cnt % 2,
-                    0,
-                    f"Unbalanced code fences in chunk {idx}/{len(chunks)} at max_bytes={max_b}:\n{ch}",
-                )
-                if idx > 1:
-                    self.assertTrue(ch.startswith(mod.CONT_MARKER_PREFIX))
-            joined_all = "\n".join(chunks)
-            self.assertIn("Internal Heading Inside Code Fence", joined_all)
-            self.assertIn("TAIL_MD_MARKER", joined_all)
-            self.assertIn("LONG_LINE_START_", joined_all)
-            self.assertIn("_LONG_LINE_END", joined_all)
-            self.assertIn("fn_159", joined_all)
-            # Small code block (<= limit) must remain intact within a single chunk
-            self.assertTrue(any(("TINY_TOP = 1" in c and "TINY_BOT = 2" in c) for c in chunks))
+        # 4) 150 prompts with middle omission: kept_count must match actual rendered bullets
+        msgs_150 = [(i, f"USER_TASK_{i}_" + ("m" * 240), Path("t.jsonl"), i + 1) for i in range(150)]
+        blk4, tot4, kept4, _, _ = core.format_user_timeline(msgs_150, budget_chars=12_000)
+        self.assertEqual(tot4, 150)
+        self.assertLess(kept4, 150)
+        self.assertIn("earlier middle prompts omitted", blk4)
+        self.assertIn("USER_TASK_149_", blk4)
+        self.assertEqual(kept4, len(re.findall(r"^- \[#\d+ @ step \d+\]:", blk4, re.M)))
 
-    def test_eligible_first_mode_and_budget_driven_assistant_folding(self) -> None:
-        # 1. Editing only an out-of-workspace scratch script or deleted file must NOT trigger false active_coding
-        brain_cid = self.tmp_root / "brain" / "cid-scratch-qa"
-        logs = brain_cid / ".system_generated" / "logs"
-        scratch_script = brain_cid / "scratch" / "repro_check.mjs"
-        scratch_script.parent.mkdir(parents=True, exist_ok=True)
-        scratch_script.write_text("console.log('ntfs repro');\n", encoding="utf-8")
-
-        penultimate_reply = (
-            "已實測復現 3 項相容性問題：\n"
-            "1. sqlite_cache.mjs: wal size=12392, mtimeNs=1795011363933579200, "
-            "ctimeNs=1795011363976603700 -> 1795011364017939600 (reads=1..4)。\n"
-            + ("DOM 320x36 與 sqlite-cache.test.mjs#L22-L24 詳細對照證據。\n" * 40)
-            + "4. errors.mjs 屬功能強化，非 Bug 復現。"
-        )
-        self.assertGreater(len(penultimate_reply), 2100)
-        final_reply = "純文字簡體中文版本：\n" + ("問題描述段落。\n" * 60)
-
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>早期初始化設定</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "ok " + ("x" * 160000)},
-            {"step_index": 10, "type": "USER_INPUT", "content": "<USER_REQUEST>確認問題是否能復現</USER_REQUEST>"},
-            {
-                "step_index": 11,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "edit_file", "args": {"Path": str(scratch_script), "Replacement": "console.log('ntfs repro');"}}],
-            },
-            {"step_index": 12, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 13, "type": "PLANNER_RESPONSE", "content": penultimate_reply},
-            {"step_index": 14, "type": "USER_INPUT", "content": "<USER_REQUEST>再給我一次純文字版</USER_REQUEST>"},
-            {"step_index": 15, "type": "PLANNER_RESPONSE", "content": final_reply},
-            {
-                "step_index": 16,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 確認問題是否能復現\n2. 再給我一次純文字版\n<summary>QA done.</summary>\n</CONTEXT_SUMMARY>",
-            },
+    def test_tool_trajectory_dedup_and_compact_preserves_pending_tools(self) -> None:
+        # Consecutive identical tool calls collapse into `×N`
+        repeated_tcs = [
+            {"name": "run_command", "args": {"CommandLine": "pytest -q"}},
+            {"name": "run_command", "args": {"CommandLine": "pytest -q"}},
+            {"name": "run_command", "args": {"CommandLine": "pytest -q"}},
+            {"name": "read_file", "args": {"Path": r"D:\ws\app.py"}},
+            {"name": "read_file", "args": {"Path": r"D:\ws\app.py"}},
         ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws], artifact_dir=brain_cid)
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["session_mode"], "completed_qa")
-        self.assertEqual(st["files"], 0)
-        # Generous eff_recent_budget keeps penultimate empirical reply 100% verbatim instead of blindly folding
-        self.assertEqual(st["folded_assistant_turns"], 0)
-        self.assertIn("1795011363976603700 -> 1795011364017939600", msg)
-        self.assertIn("DOM 320x36", msg)
+        summary = core.summarize_tool_calls(repeated_tcs)
+        self.assertIn("run_command(`pytest -q`) ×3", summary)
+        self.assertIn("read_file(app.py) ×2", summary)
 
-        # 2. When remaining budget is tight, dynamic folding preserves proportionally more than static 420+220
-        tight_cfg = mod.RehydrateConfig(
-            budget_recent_turns_chars=2400,
-            explicit_keys=frozenset({"budgetRecentTurnsChars"}),
-        )
-        res_tight = mod.build_rehydration(
-            logs / "transcript_full.jsonl", config=tight_cfg, workspace_roots=[self.ws], artifact_dir=brain_cid
-        )
-        self.assertIsNotNone(res_tight)
-        assert res_tight is not None
-        msg_tight, st_tight = res_tight
-        self.assertEqual(st_tight["folded_assistant_turns"], 1)
-        self.assertIn("...[assistant details summarized in <CONTEXT_SUMMARY>;", msg_tight)
-        step13_blk = msg_tight.split("[Step 13 | Assistant]:", 1)[1].split("[Step 14 | User]:", 1)[0]
-        self.assertGreater(len(step13_blk), 1100)
-
-    def test_workspace_reality_stale_paths_external_edits_and_manifest(self) -> None:
-        live_keep = self.ws / "agy-rehydrate-main"
-        live_keep.mkdir(parents=True, exist_ok=True)
-        existing_mod = live_keep / "engine.py"
-        existing_mod.write_text("ENGINE_VER = 2\n", encoding="utf-8")
-        # Set mtime clearly in the future relative to the transcript step created_at
-        future_ts = time.time() + 300.0
-        os.utime(existing_mod, (future_ts, future_ts))
-
-        vanished_a = self.ws / "agy-capsule-merged" / "sidecars" / "server.mjs"
-        vanished_b = self.ws / "agy-capsule-merged" / "sidecars" / "sqlite_cache.mjs"
-        vanished_ref = self.ws / "agy-capsule-1.1.0" / "sidecars" / "server.mjs"
-        outside_missing = self.tmp_root / "outside_deleted_secret.txt"
-        secret_env = self.ws / ".env"
-        denied_missing = self.ws / "denied_never_written.py"
-
-        logs = self.tmp_root / "brain" / "cid-stale-ws" / ".system_generated" / "logs"
-        rows: list[dict] = [
-            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-18T10:00:00Z", "content": "<USER_REQUEST>編輯舊目錄與 engine.py</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "created_at": "2026-11-18T10:00:02Z",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(vanished_a), "Replacement": "a"}},
-                    {"name": "edit_file", "args": {"Path": str(vanished_b), "Replacement": "b"}},
-                    {"name": "edit_file", "args": {"Path": str(existing_mod), "Replacement": "ENGINE_VER = 2"}},
-                    {"name": "read_file", "args": {"Path": str(outside_missing)}},
-                    {"name": "read_file", "args": {"Path": str(secret_env)}},
-                    {"name": "edit_file", "args": {"Path": str(denied_missing), "Replacement": "x"}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
-            {"step_index": 4, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
-            {"step_index": 5, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
-            {"step_index": 6, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-18T10:00:03Z", "content": "ok"},
-            {"step_index": 7, "type": "GENERIC", "status": "ERROR", "created_at": "2026-11-18T10:00:03Z", "content": "Permission denied"},
-            {"step_index": 8, "type": "PLANNER_RESPONSE", "content": "編輯完成。"},
-        ]
-        # Advance > 60 steps and > 4 user turns of pure Q&A so existing_mod falls outside active coding window
-        step = 20
-        for q_no in range(1, 7):
-            rows.append({"step_index": step, "type": "USER_INPUT", "content": f"<USER_REQUEST>討論第 {q_no} 題文案</USER_REQUEST>"})
-            rows.append({"step_index": step + 1, "type": "PLANNER_RESPONSE", "content": f"已完成第 {q_no} 題回覆。" * 12})
-            step += 15
-        rows.append(
-            {
-                "step_index": step,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n1. 討論第 6 題文案\n"
-                    f"<summary>Primary: `{self.ws / 'agy-capsule-merged'}`; ref: `{vanished_ref}#L18-L25`.</summary>\n"
-                    "</CONTEXT_SUMMARY>"
-                ),
-            }
-        )
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertEqual(st["session_mode"], "completed_qa")
-        self.assertEqual(st["files"], 0)
-        self.assertGreaterEqual(st["stale_paths"], 2)
-        self.assertGreaterEqual(st["externally_modified_files"], 1)
-        self.assertEqual(st["uninjected_modified_files"], 1)
-        self.assertIn("Workspace Reality & File Status Notice", msg)
-        # Collapsed missing root dirs + live workspace directory listing
-        self.assertIn("agy-capsule-merged", msg)
-        self.assertIn("agy-capsule-1.1.0", msg)
-        self.assertIn("`agy-rehydrate-main/`", msg)
-        # Externally modified & uninjected modified manifest advisory
-        self.assertIn("engine.py", msg)
-        self.assertIn("Modified on disk since last read/edit", msg)
-        self.assertIn("Modified files not injected in this payload", msg)
-        # Security gates strictly upheld: outside, .env, and ERROR-status paths NEVER leaked
-        self.assertNotIn("outside_deleted_secret.txt", msg)
-        self.assertNotIn(".env", msg)
-        self.assertNotIn("denied_never_written.py", msg)
-
-    def test_multi_checkpoint_anti_decay_milestones_and_pre_window_paste_folding(self) -> None:
-        core_src = self.ws / "core_worker.mjs"
-        core_src.write_text("export const WORKER_READY = true;\n", encoding="utf-8")
-
-        cp1 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. UI 融合\n<summary>\n"
-            "### 2. Done\n"
-            "- **Built frosted/native skin switcher (`ui_skins.mjs`, `ui.mjs`)**: Added dual CSS tokens.\n"
-            "- **Added `requestPosition` top/bottom option (`settings.mjs`)**: Synced Popover and Sidebar.\n"
-            "### 7. Commitments & Constraints\n"
-            "- Never touch upstream read-only reference directories.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp2 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. 修正快取\n<summary>\n"
-            "### 2. Done\n"
-            "- **Upgraded `settings.mjs` bigint `ino:mtimeNs:size` cache key (`settings.mjs`)**: Prevented same-ms stale cache.\n"
-            "- **Fixed multi-window ~5s restart loop (`startDeckCoordinator`)**: Added lease coordination.\n"
-            "### 7. Commitments & Constraints\n"
-            "- Never touch upstream read-only reference directories.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp3 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. 最後驗證\n<summary>\n"
-            "### 2. Done\n"
-            "- **Isolated CDP coordinator in `core_worker.mjs`**: Verified 62/62 tests.\n"
-            "### 7. Commitments & Constraints\n"
-            "- Never touch upstream read-only reference directories.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-
-        old_raw_dump = "raw_terminal_output_line_with_no_markdown_headings " * 55
-        current_win_prompt = "本次壓縮視窗內的新需求細節：" + ("保留完整規格說明文字。" * 55)
-        self.assertGreater(len(old_raw_dump), 2200)
-        self.assertGreater(len(current_win_prompt), 600)
-
-        logs = self.tmp_root / "brain" / "cid-multicp" / ".system_generated" / "logs"
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{old_raw_dump}</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到舊 log。"},
-            {"step_index": 10, "type": "CHECKPOINT", "content": cp1},
-            {"step_index": 20, "type": "USER_INPUT", "content": "<USER_REQUEST>修正 settings.mjs 快取</USER_REQUEST>"},
-            {"step_index": 21, "type": "PLANNER_RESPONSE", "content": "已修正。"},
-            {"step_index": 30, "type": "CHECKPOINT", "content": cp2},
-            # Edit core_worker.mjs inside current compaction window (> prev_cp_step=30), 75 steps before cp3 (step 110)
-            {"step_index": 34, "type": "USER_INPUT", "content": f"<USER_REQUEST>{current_win_prompt}</USER_REQUEST>"},
-            {
-                "step_index": 35,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "edit_file", "args": {"Path": str(core_src), "Replacement": "export const WORKER_READY = true;"}}],
-            },
-            {"step_index": 36, "type": "GENERIC", "status": "DONE", "content": "ok " + ("z" * 60000)},
-            {"step_index": 37, "type": "PLANNER_RESPONSE", "content": "已更新 core_worker.mjs。"},
-            # Two more diagnostic turns burning steps up to 110 (within 4 user turns of step 34!)
-            {"step_index": 70, "type": "USER_INPUT", "content": "<USER_REQUEST>跑第一次驗證</USER_REQUEST>"},
-            {"step_index": 75, "type": "PLANNER_RESPONSE", "content": "第一次驗證通過。"},
-            {"step_index": 105, "type": "USER_INPUT", "content": "<USER_REQUEST>跑最後驗證</USER_REQUEST>"},
-            {"step_index": 108, "type": "PLANNER_RESPONSE", "content": "最後驗證 62/62 通過。"},
-            {"step_index": 110, "type": "CHECKPOINT", "content": cp3},
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        # 1. Same-window turn-aware recency keeps core_worker.mjs active even at 75 steps (> 60)
-        self.assertEqual(st["session_mode"], "active_coding")
-        self.assertTrue(any(p.endswith("core_worker.mjs") for p in st["file_paths"]))
-        self.assertIn("WORKER_READY = true", msg)
-        # 2. Anti-decay milestone index recovers vanished cp1 & cp2 milestones with exact line pointers
-        self.assertGreaterEqual(st["decayed_milestones"], 3)
-        self.assertIn("Earlier Checkpoints Milestone Index", msg)
-        self.assertIn("[cp @ step 10, line 3]:", msg)
-        self.assertIn("[cp @ step 30, line 6]:", msg)
-        self.assertIn("ui_skins.mjs", msg)
-        self.assertIn("startDeckCoordinator", msg)
-        # Constraint still present in cp3 must NOT be duplicated in the anti-decay index
-        ms_sec = msg.split("Earlier Checkpoints Milestone Index", 1)[1].split("## ", 1)[0]
-        self.assertNotIn("Never touch upstream read-only", ms_sec)
-        # 3. Pre-window raw dump folded while current-window prompt stays verbatim
-        self.assertGreaterEqual(st["folded_paste_msgs"], 1)
-        self.assertIn("folded", msg.split("Earlier User Request Timeline", 1)[1].split("## ", 1)[0])
-        self.assertIn(current_win_prompt, msg)
-
-    def test_delayed_post_auto_compaction_and_file_block_cap_trimming(self) -> None:
-        # 1. Mid-turn auto-compaction followed by > FRESH_CHECKPOINT_MAX_GAP live steps must suppress stale Section 2
-        logs = self.tmp_root / "brain" / "cid-delayed-cp" / ".system_generated" / "logs"
-        cp1 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. 初始設計\n<summary>\n"
-            "### 2. Done\n- **Implemented `theme_tokens.mjs` dark/light palette**: Verified.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp2 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. 中途任務\n<summary>\n"
-            "### 2. Done\n- **Finished worker migration**: Verified.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>早期重要架構需求</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "收到。"},
-            {"step_index": 5, "type": "CHECKPOINT", "content": cp1},
-            {"step_index": 10, "type": "USER_INPUT", "content": "<USER_REQUEST>中途任務</USER_REQUEST>"},
-            {
-                "step_index": 11,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "mid_turn_check"}}],
-            },
-            {"step_index": 12, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 13, "type": "CHECKPOINT", "content": cp2},
-            # Post-checkpoint live steps continue 25 steps beyond checkpoint 13 before next user turn
-            {"step_index": 38, "type": "PLANNER_RESPONSE", "content": "Live post-checkpoint final reply."},
-        ]
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        res = mod.build_rehydration(logs / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res)
-        assert res is not None
-        msg, st = res
-        self.assertTrue(st["delayed_post_cp"])
-        self.assertEqual(st["delayed_gap"], 25)
-        self.assertFalse(st["in_progress_turn"])
-        self.assertEqual(st["kept_turns"], 0)
-        self.assertIn("delayed_gap=25", msg)
-        self.assertNotIn("[Pre-Compaction In-Progress Tools]", msg)
-        self.assertNotIn("Recent Pre-Compaction", msg)
-        # Earlier user history & decayed cp1 milestone are still preserved!
-        self.assertIn("早期重要架構需求", msg)
-        self.assertIn("theme_tokens.mjs", msg)
-
-        # Verify `--hook` end-to-end when `rehydrate_state.json` already exists from cp 5
-        _write_jsonl(logs / "transcript.jsonl", rows)
-        (logs / "rehydrate_state.json").write_text(
-            json.dumps({"last_rehydrated_checkpoint": 5, "checked_offset": 0}),
-            encoding="utf-8",
-        )
-        hook_payload = json.dumps({"transcriptPath": str(logs / "transcript.jsonl"), "workspacePaths": [str(self.ws)]})
-        p_hook = subprocess.run(
-            [sys.executable, "-S", "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
-            input=hook_payload,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        hook_res = json.loads(p_hook.stdout.strip())
-        self.assertIn("injectSteps", hook_res)
-        injected_txt = "\n".join(st_item["systemMessage"]["systemMessage"] for st_item in hook_res["injectSteps"])
-        self.assertIn("delayed_gap=25", injected_txt)
-        self.assertIn("theme_tokens.mjs", injected_txt)
-        self.assertNotIn("Recent Pre-Compaction", injected_txt)
-
-        # 2. _enforce_total_cap drops trailing whole file blocks cleanly instead of shredding middle files
-        f1 = "### [Modified @ step 1] `a.py`\n```python\n" + "".join(f"a_{i:02d} = {i}\n" for i in range(25)) + "```"
-        f2 = "### [Modified @ step 2] `b.py`\n```python\n" + "".join(f"b_{i:02d} = {i}\n" for i in range(25)) + "```"
-        f3 = "### [Modified @ step 3] `c.py`\n```python\n" + "".join(f"c_{i:02d} = {i}\n" for i in range(25)) + "```"
-        secs = [
-            "[POST-COMPACT REHYDRATION v1 | checkpoint=10]",
-            "Preamble.",
-            f"## 1. Restored Active Workspace Files (Live Disk Read)\n{f1}\n\n{f2}\n\n{f3}",
-        ]
-        # Cap tightly enough to force dropping f3 while comfortably keeping f1 + f2 whole
-        cap_keep_two = len("\n\n".join(secs[:2])) + 2 + len("## 1. Restored Active Workspace Files (Live Disk Read)\n") + len(f1) + 2 + len(f2) + 20
-        trimmed = mod._enforce_total_cap(secs, cap_keep_two)
-        joined = "\n\n".join(trimmed)
-        self.assertLessEqual(len(joined), cap_keep_two)
-        self.assertIn("`a.py`", joined)
-        self.assertIn("`b.py`", joined)
-        self.assertNotIn("`c.py`", joined)
-        self.assertNotIn("truncated ~", joined)
-        self.assertEqual(sum(1 for ln in joined.splitlines() if ln.lstrip().startswith("```")) % 2, 0)
-
-    def test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget(self) -> None:
-        # 1. `Completed At:` in GENERIC tool output (both normal JSON and >2048B fast-path) prevents false external-edit alerts
-        self_edited = self.ws / "README_self.md"
-        fast_edited = self.ws / "README_fast.md"
-        ext_edited = self.ws / "README_ext.md"
-        for fp in (self_edited, fast_edited, ext_edited):
-            fp.write_text("# Doc\ncontent\n", encoding="utf-8")
-
-        completed_ep = mod.parse_iso_epoch("2026-11-19T18:44:12+08:00")
-        self.assertIsNotNone(completed_ep)
-        assert completed_ep is not None
-        os.utime(self_edited, (completed_ep + 0.7, completed_ep + 0.7))
-        os.utime(fast_edited, (completed_ep + 1.2, completed_ep + 1.2))
-        os.utime(ext_edited, (completed_ep + 25.0, completed_ep + 25.0))
-
-        logs_ts = self.tmp_root / "brain" / "cid-completed-at" / ".system_generated" / "logs"
-        rows_ts: list[dict] = [
-            {"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-19T10:43:30Z", "content": "<USER_REQUEST>更新文件</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "created_at": "2026-11-19T10:43:34Z",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(self_edited), "Replacement": "# Doc"}},
-                    {"name": "edit_file", "args": {"Path": str(fast_edited), "Replacement": "# Doc"}},
-                    {"name": "edit_file", "args": {"Path": str(ext_edited), "Replacement": "# Doc"}},
-                ],
-            },
-            {
-                "step_index": 2,
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2026-11-19T10:43:43Z",
-                "content": (
-                    "Created At: 2026-11-19T18:43:43+08:00\n"
-                    "Completed At: 2026-11-19T18:44:12+08:00\n"
-                    "Made 1 replacement."
-                ),
-            },
-            {
-                "step_index": 3,
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2026-11-19T10:43:45Z",
-                "content": (
-                    "Created At: 2026-11-19T18:43:45+08:00\n"
-                    "Completed At: 2026-11-19T18:44:12+08:00\n"
-                    "Made 1 replacement. " + ("x" * 2400)
-                ),
-            },
-            {
-                "step_index": 4,
-                "type": "GENERIC",
-                "status": "DONE",
-                "created_at": "2026-11-19T10:43:46Z",
-                "content": (
-                    "Created At: 2026-11-19T18:43:46+08:00\n"
-                    "Completed At: 2026-11-19T18:44:12+08:00\n"
-                    "Made 1 replacement."
-                ),
-            },
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "已更新三份文件。"},
-        ]
-        # Advance beyond active coding window so files are uninjected and checked for external edits
-        st_cur = 20
-        for q_i in range(1, 7):
-            rows_ts.append({"step_index": st_cur, "type": "USER_INPUT", "content": f"<USER_REQUEST>後續討論 {q_i}</USER_REQUEST>"})
-            rows_ts.append({"step_index": st_cur + 1, "type": "PLANNER_RESPONSE", "content": f"回覆 {q_i}。" * 10})
-            st_cur += 15
-        rows_ts.append(
-            {
-                "step_index": st_cur,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 後續討論 6\n<summary>Done.</summary>\n</CONTEXT_SUMMARY>",
-            }
-        )
-        _write_jsonl(logs_ts / "transcript_full.jsonl", rows_ts)
-        res_ts = mod.build_rehydration(logs_ts / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_ts)
-        assert res_ts is not None
-        msg_ts, st_ts = res_ts
-        self.assertEqual(st_ts["externally_modified_files"], 1)
-        ext_line = next(
-            (ln for ln in msg_ts.splitlines() if "Modified on disk since last read/edit" in ln),
-            "",
-        )
-        self.assertIn("README_ext.md", ext_line)
-        self.assertNotIn("README_self.md", ext_line)
-        self.assertNotIn("README_fast.md", ext_line)
-
-        # 2. Structured item-level shrinking in `build_workspace_reality_notice` never mid-clips with `read_file`
-        for idx_dir in range(8):
-            (self.ws / f"live_project_{idx_dir:02d}").mkdir(exist_ok=True)
-        missing_summary = " ".join(str(self.ws / f"vanished_repo_{i:02d}" / "src" / "main.py") for i in range(7))
-        for cap_c in (190, 260, 360, 600):
-            notice_txt, notice_cnts = mod.build_workspace_reality_notice(
-                modified_touch={},
-                read_touch={},
-                path_touch_epoch={},
-                target_cp_content=missing_summary,
-                workspace_roots=[self.ws],
-                injected_file_keys=set(),
-                max_chars=cap_c,
-            )
-            self.assertEqual(notice_cnts["stale_paths"], 7)
-            self.assertLessEqual(len(notice_txt), cap_c)
-            self.assertNotIn("read_file for full content", notice_txt)
-            self.assertNotIn("truncated ~", notice_txt)
-            for ln in notice_txt.splitlines():
-                self.assertTrue(ln.startswith("- **"), f"Expected clean bullet line, got: {ln!r}")
-                self.assertEqual(ln.count("`") % 2, 0, f"Unbalanced backticks in bullet: {ln!r}")
-
-        # 3. Active coding pre-reserves Workspace Reality budget before `eff_files_budget` so Section 2 stays intact
-        mod_a = self.ws / "core_a.py"
-        mod_b = self.ws / "core_b.py"
-        mod_c = self.ws / "core_c.py"
-        for idx_f, fp in enumerate((mod_a, mod_b, mod_c)):
-            fp.write_text("".join(f"val_{idx_f}_{ln:03d} = '{'x' * 55}'\n" for ln in range(180)), encoding="utf-8")
-        logs_ws = self.tmp_root / "brain" / "cid-ws-pre-reserve" / ".system_generated" / "logs"
-        rows_ws = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>修改 core_a.py, core_b.py, core_c.py</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "created_at": "2026-11-19T10:44:10Z",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(mod_a), "Replacement": "val_0_010 ="}},
-                    {"name": "edit_file", "args": {"Path": str(mod_b), "Replacement": "val_1_010 ="}},
-                    {"name": "edit_file", "args": {"Path": str(mod_c), "Replacement": "val_2_010 ="}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T10:44:12Z", "content": "ok " + ("p" * 45000)},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T10:44:12Z", "content": "ok " + ("q" * 45000)},
-            {"step_index": 4, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-19T10:44:12Z", "content": "ok " + ("r" * 45000)},
-            {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "三個檔案皆已修改並驗證完成。"},
-            {
-                "step_index": 6,
-                "type": "CHECKPOINT",
-                "content": (
-                    "<CONTEXT_SUMMARY>\n# User Requests\n1. 修改 core_a.py, core_b.py, core_c.py\n"
-                    f"<summary>Old paths: `{self.ws / 'gone_old_1'}`, `{self.ws / 'gone_old_2'}`.</summary>\n"
-                    "</CONTEXT_SUMMARY>"
-                ),
-            },
-        ]
-        _write_jsonl(logs_ws / "transcript_full.jsonl", rows_ws)
-        res_ws = mod.build_rehydration(logs_ws / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_ws)
-        assert res_ws is not None
-        msg_ws, st_ws = res_ws
-        self.assertEqual(st_ws["session_mode"], "active_coding")
-        self.assertLessEqual(st_ws["chars"], st_ws["ratio_cap"])
-        self.assertIn("Workspace Reality & File Status Notice", msg_ws)
-        ws_sec = msg_ws.split("Workspace Reality & File Status Notice", 1)[1].split("## ", 1)[0]
-        self.assertIn("Stale / missing paths", ws_sec)
-        self.assertIn("Current live entries in", ws_sec)
-        self.assertNotIn("read_file for full content", ws_sec)
-        self.assertNotIn("truncated ~", ws_sec)
-        self.assertEqual(st_ws["files"], 3)
-
-    def test_progress_template_milestones_and_multi_hunk_radius_shrinking(self) -> None:
-        import rehydrate_helpers as helpers
-
-        # 1. Antigravity numbered `/compact` template (`### 2. Progress`, `### 3. Key Findings`, `### 4. Errors & Fixes`)
-        cp1_progress = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Round 1 refactor\n<summary>\n"
-            "### 1. Task Overview\n"
-            "- Should be ignored as overview.\n"
-            "### 2. Progress\n"
-            "- **Modified `D:\\workspace\\long-repo-name\\plugins\\core\\scripts\\cache_engine.py`**:\n"
-            "  - Added `build_wal_cache_key(stat)` (`L120`) using `ino:mtimeNs:size`.\n"
-            "  - Added `delayed_post_cp = True` guard for stale auto-compactions.\n"
-            "- **Verification Results**:\n"
-            "  - Ran 27 tests in 1.2s, OK.\n"
-            "- **Scratch Files Created**:\n"
-            "  - `scratch/tmp_probe.py`\n"
-            "#### In Progress\n"
-            "- Pending UI polish not finished yet.\n"
-            "### 3. Key Findings\n"
-            "- **Timestamp Semantics**:\n"
-            "  - `Completed At:` inside `GENERIC` output reflects real disk write completion.\n"
-            "### 4. Errors & Fixes\n"
-            "- **Error 1 (stale `wal_index` lock contention)**:\n"
-            "  - Initial naive polling retried for 20s and dropped requests.\n"
-            "  - **Fix**: Switched `wal_index` to atomic rename with exponential backoff.\n"
-            "### 6. Next Steps\n"
-            "- Should be ignored as transient next step.\n"
-            "### 7. Commitments & Constraints\n"
-            "- Keep zero third-party dependencies in runtime scripts.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp2_progress = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Round 2 fixes\n<summary>\n"
-            "### 2. Progress\n"
-            "- **Round 2 Fixes**:\n"
-            "  - `D:\\workspace\\long-repo-name\\plugins\\core\\scripts\\ui_renderer.py`:\n"
-            "    - Added `render_frosted_toolbar()` and synced sidebar alignment.\n"
-            "    - Added `popover_anchor_sync` telemetry counter.\n"
-            "### 7. Commitments & Constraints\n"
-            "- Keep zero third-party dependencies in runtime scripts.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp3_latest = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Release v2\n<summary>\n"
-            "### 2. Progress\n"
-            "- **Released v2.0**: Tagged release and kept `delayed_post_cp` guard in `cache_engine.py`.\n"
-            "### 7. Commitments & Constraints\n"
-            "- Keep zero third-party dependencies in runtime scripts.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-
-        done1, cons1 = helpers.extract_checkpoint_milestones(cp1_progress)
-        self.assertGreaterEqual(len(done1), 4)
-        self.assertEqual(len(cons1), 1)
-        joined1 = "\n".join(done1)
-        # Path shortened to basename, nested sub-bullets captured, Error symptom upgraded to Fix
-        self.assertIn("`cache_engine.py`", joined1)
-        self.assertNotIn("long-repo-name", joined1)
-        self.assertIn("build_wal_cache_key", joined1)
-        self.assertIn("atomic rename with exponential backoff", joined1)
-        self.assertNotIn("naive polling retried", joined1)
-        # Transient sections & noise containers strictly excluded
-        self.assertNotIn("Ran 27 tests", joined1)
-        self.assertNotIn("tmp_probe.py", joined1)
-        self.assertNotIn("Pending UI polish", joined1)
-        self.assertNotIn("transient next step", joined1)
-        for item in done1 + cons1:
-            self.assertEqual(item.count("`") % 2, 0, f"Unbalanced backticks in milestone: {item!r}")
-
-        # 3-level nested bullet in cp2 (`Round 2 Fixes` -> `ui_renderer.py` -> leaf)
-        done2, _ = helpers.extract_checkpoint_milestones(cp2_progress)
-        self.assertTrue(any("`ui_renderer.py`" in d and "render_frosted_toolbar" in d for d in done2))
-
-        # Anti-decay digest across cp1 + cp2 vs cp3: recovers both checkpoints, dedups `delayed_post_cp` & constraint
-        digest, cnt = helpers.build_anti_decay_milestone_digest(
-            [(10, 11, cp1_progress), (20, 21, cp2_progress)],
-            cp3_latest,
-            self.ws / "transcript_full.jsonl",
-            budget_chars=1200,
-        )
-        self.assertGreaterEqual(cnt, 4)
-        self.assertIn("[cp @ step 10, line 11]:", digest)
-        self.assertIn("[cp @ step 20, line 21]:", digest)
-        self.assertIn("build_wal_cache_key", digest)
-        self.assertIn("render_frosted_toolbar", digest)
-        self.assertNotIn("delayed_post_cp", digest)
-        self.assertNotIn("zero third-party dependencies", digest)
-
-        # 2. Multi-hunk `read_modified_hunk_window` shrinks context radius (`ctx=4/2/0`) and water-fills before mid-clip
-        big_file = self.ws / "multi_hunk_mod.py"
-        file_lines = [f"PAD_LINE_{i:04d} = '{'z' * 42}'" for i in range(1, 501)]
-        anchors = [40, 130, 230, 330, 440]
-        snips: list[str] = []
-        for idx_a, ln_no in enumerate(anchors, 1):
-            block_lns = [f"def edit_hunk_{idx_a}_part_{j}(): return 'ANCHOR_{idx_a}_{j}_TOKEN'" for j in range(1, 11)]
-            file_lines[ln_no - 1 : ln_no - 1 + len(block_lns)] = block_lns
-            snips.append("\n".join(block_lns))
-        big_file.write_text("\n".join(file_lines) + "\n", encoding="utf-8")
-
-        # Case A: Medium budget where ctx=8 would overflow, but smaller radii (ctx=4/2/0) fit all 5 hunks cleanly
-        out_med, note_med = helpers.read_modified_hunk_window(str(big_file), snips, max_chars=4200, context_lines=45)
-        self.assertIsNotNone(out_med)
-        assert out_med is not None
-        self.assertLessEqual(len(out_med), 4200)
-        self.assertNotIn("truncated ~", out_med)
-        for idx_a in range(1, 6):
-            self.assertIn(f"ANCHOR_{idx_a}_1_TOKEN", out_med)
-        self.assertIn("hunk lines", note_med)
-
-        # Case B: Tight budget where even ctx=0 exceeds cap -> water-filling keeps all 5 hunk starts visible
-        out_tight, _ = helpers.read_modified_hunk_window(str(big_file), snips, max_chars=2400, context_lines=45)
-        self.assertIsNotNone(out_tight)
-        assert out_tight is not None
-        self.assertLessEqual(len(out_tight), 2400)
-        self.assertNotIn("truncated ~", out_tight)
-        self.assertIn("trimmed from", out_tight)
-        for idx_a in range(1, 6):
-            self.assertIn(f"ANCHOR_{idx_a}_1_TOKEN", out_tight)
-
-        # 3. Long backtick identifier closure, clean parent labels (no `...:` or half-UUID), & self-anchored child elision
-        long_bt = "Updated `test_rehydrate.py`: Added `test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget`"
-        clipped_bt = helpers._clip_milestone_text(long_bt, 90)
-        self.assertLessEqual(len(clipped_bt), 90)
-        self.assertEqual(clipped_bt.count("`") % 2, 0)
-        self.assertIn("`test_completed_at_timestamp_tolerance", clipped_bt)
-        self.assertTrue(clipped_bt.endswith("...`"))
-
-        cp_polish = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Polish test\n<summary>\n"
-            "### 2. Progress\n"
-            "- **Round 2 Live `/compact` (`checkpoint=148`) Bug Fixes**:\n"
-            "  - `D:\\workspace\\repo\\tests\\test_rehydrate.py`: Added `test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget`.\n"
-            "### 3. Key Findings\n"
-            "- **Forensic findings from `9f280ce9-3eeb-4a21-b4b6-4417ba3993c3`**:\n"
-            "  - `step 1981` had been misclassified because `step 1971` touched a scratch file.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        done_pol, _ = helpers.extract_checkpoint_milestones(cp_polish)
-        joined_pol = "\n".join(done_pol)
-        self.assertIn("`test_completed_at_timestamp_tolerance_and_structured_workspace_notice_budget`", joined_pol)
-        self.assertIn("Forensic findings: `step 1981`", joined_pol)
-        self.assertNotIn("...:", joined_pol)
-        self.assertNotIn("9f280ce9-3eeb-4a21`", joined_pol)
-        for it in done_pol:
-            self.assertEqual(it.count("`") % 2, 0, f"Unbalanced backticks: {it!r}")
-
-        # 4. Cross-checkpoint edit anchor scoping: re-edited files drop pre-prev_cp anchors; untouched files keep theirs
-        re_edited = self.ws / "window_scoped.py"
-        untouched = self.ws / "prev_only.py"
-        scoped_lines = [f"FILL_{i:03d} = '{'p' * 24}_{i:03d}'" for i in range(1, 321)]
-        scoped_lines[89] = "def old_round1_anchor(): return 'OLD_CP1_ANCHOR'"
-        scoped_lines[259] = "def new_round2_anchor(): return 'NEW_CP2_ANCHOR'"
-        re_edited.write_text("\n".join(scoped_lines) + "\n", encoding="utf-8")
-        untouched_lines = [f"KEEP_{i:03d} = '{'q' * 24}_{i:03d}'" for i in range(1, 201)]
-        untouched_lines[119] = "def prev_window_anchor(): return 'PREV_ONLY_ANCHOR'"
-        untouched.write_text("\n".join(untouched_lines) + "\n", encoding="utf-8")
-
-        logs_sc = self.tmp_root / "brain" / "cid-cp-anchor-scope" / ".system_generated" / "logs"
-        sc_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Round 1 edit</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "name": "edit_file",
-                        "args": {
-                            "Path": str(re_edited),
-                            "Target": "FILL_090 = 'pppppppppppppppppppppppp_090'",
-                            "Replacement": "def old_round1_anchor(): return 'OLD_CP1_ANCHOR'",
-                        },
-                    },
-                    {
-                        "name": "edit_file",
-                        "args": {
-                            "Path": str(untouched),
-                            "Target": "KEEP_120 = 'qqqqqqqqqqqqqqqqqqqqqqqq_120'",
-                            "Replacement": "def prev_window_anchor(): return 'PREV_ONLY_ANCHOR'",
-                        },
-                    },
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement"},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement"},
-            {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "Round 1 done."},
-            {"step_index": 5, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY><summary>### 2. Progress\n- Round 1 edited both files.</summary></CONTEXT_SUMMARY>"},
-            {"step_index": 6, "type": "USER_INPUT", "content": "<USER_REQUEST>Round 2 edit only window_scoped.py</USER_REQUEST>"},
-            {
-                "step_index": 7,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "name": "edit_file",
-                        "args": {
-                            "Path": str(re_edited),
-                            "Target": "FILL_260 = 'pppppppppppppppppppppppp_260'",
-                            "Replacement": "def new_round2_anchor(): return 'NEW_CP2_ANCHOR'",
-                        },
-                    }
-                ],
-            },
-            {"step_index": 8, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement. " + ("x" * 160000)},
-            {"step_index": 9, "type": "PLANNER_RESPONSE", "content": "Round 2 done."},
-            {"step_index": 10, "type": "CHECKPOINT", "content": "<CONTEXT_SUMMARY><summary>### 2. Progress\n- Round 2 updated window_scoped.py.</summary></CONTEXT_SUMMARY>"},
-        ]
-        _write_jsonl(logs_sc / "transcript_full.jsonl", sc_rows)
-        res_sc = mod.build_rehydration(logs_sc / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_sc)
-        assert res_sc is not None
-        msg_sc, st_sc = res_sc
-        self.assertEqual(st_sc["files"], 2)
-        self.assertIn("NEW_CP2_ANCHOR", msg_sc)
-        self.assertNotIn("OLD_CP1_ANCHOR", msg_sc)
-        self.assertIn("PREV_ONLY_ANCHOR", msg_sc)
-
-    def test_balanced_multi_file_budget_code_span_scanner_and_fast_tail_scan(self) -> None:
-        import rehydrate_helpers as helpers
-
-        # 1. Backtick state machine: tolerate quoted literal backtick inside single-backtick span & handle double-backtick spans
-        quoted_bt = (
-            'Milestone Clipping Pitfalls Uncovered on Real Data: Using `close_tok = "`"` when '
-            '`add_ellipsis=False` on parent headers fabricated half-UUIDs (`` `9f280ce9-3eeb-4a21` ``); '
-            'restricting closure fixed it.'
-        )
-        clipped_q = helpers._clip_milestone_text(quoted_bt, 138)
-        self.assertEqual(helpers._find_unclosed_code_span(clipped_q)[0], -1)
-        self.assertFalse(clipped_q.endswith("...`"))
-        self.assertTrue(clipped_q.endswith("..."))
-
-        dbl_bt = "Observed malformed token `` `9f280ce9-3eeb-4a21-b4b6-4417ba3993c3` `` during replay verification"
-        clipped_d = helpers._clip_milestone_text(dbl_bt, 46)
-        self.assertEqual(helpers._find_unclosed_code_span(clipped_d)[0], -1)
-        self.assertNotIn("``", clipped_d)
-
-        self.assertEqual(
-            helpers._compact_parent_milestone_label("Milestone Clipping Pitfalls Uncovered on Real Data"),
-            "Milestone Clipping Pitfalls Uncovered on Real Data",
-        )
-        self.assertEqual(
-            helpers._compact_parent_milestone_label(
-                "Round 5 Live `/compact` (`checkpoint=407`) Audit & 4-Axis Optimization (this window)"
-            ),
-            "Round 5 Live `/compact` (`checkpoint=407`) Audit",
-        )
-        self.assertEqual(
-            helpers._clip_milestone_text("Pipeline phase transition -> deferred cleanup stage", 29, add_ellipsis=False),
-            "Pipeline phase transition",
-        )
-        self.assertEqual(
-            helpers._clip_milestone_text("Modern compiler backend for C++ template instantiation", 32, add_ellipsis=False),
-            "Modern compiler backend for C++",
-        )
-
-        # 2. Balanced weighted multi-file Section 5 sharing + compact subsequent gap markers
-        def _make_big_py(path: Path, tag: str) -> list[tuple[str, str]]:
-            lines = [f"# {tag} header line {i}" for i in range(1, 25)]
-            for i in range(25, 420):
-                lines.append(f"VAR_{tag}_{i:03d} = '{tag}_payload_value_padding_content_{i:03d}'")
-            edits = [
-                (f"VAR_{tag}_060 = '{tag}_payload_value_padding_content_060'", f"def {tag}_fn_a(): return '{tag}_EDIT_A'"),
-                (f"VAR_{tag}_170 = '{tag}_payload_value_padding_content_170'", f"def {tag}_fn_b(): return '{tag}_EDIT_B'"),
-                (f"VAR_{tag}_280 = '{tag}_payload_value_padding_content_280'", f"def {tag}_fn_c(): return '{tag}_EDIT_C'"),
-                (f"VAR_{tag}_380 = '{tag}_payload_value_padding_content_380'", f"def {tag}_fn_d(): return '{tag}_EDIT_D'"),
+        # /compact must NOT clear pending_tools, and [Pre-Compaction In-Progress Tools] keeps newest 6
+        with tempfile.TemporaryDirectory() as td:
+            full = Path(td) / "brain" / "c-pend" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            recs: list[dict] = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nrun tools\n</USER_REQUEST>"},
             ]
-            text = "\n".join(lines) + "\n"
-            for old, new in edits:
-                text = text.replace(old, new, 1)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-            return edits
-
-        core_a = self.ws / "core_alpha.py"
-        core_b = self.ws / "core_beta.py"
-        test_f = self.ws / "tests" / "test_balanced_suite.py"
-        ed_a = _make_big_py(core_a, "ALPHA")
-        ed_b = _make_big_py(core_b, "BETA")
-        ed_t = _make_big_py(test_f, "TEST")
-
-        logs_bal = self.tmp_root / "brain" / "cid-balanced-files" / ".system_generated" / "logs"
-        tcalls = []
-        for fpath, edits in ((core_a, ed_a), (core_b, ed_b), (test_f, ed_t)):
-            for old, new in edits:
-                tcalls.append({"name": "edit_file", "args": {"Path": str(fpath), "Target": old, "Replacement": new}})
-        bal_rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>Update alpha, beta, and tests</USER_REQUEST>"},
-            {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": tcalls},
-        ]
-        for idx_r in range(len(tcalls)):
-            pad = ("x" * 160000) if idx_r == 0 else ""
-            bal_rows.append({"step_index": 2 + idx_r, "type": "GENERIC", "status": "DONE", "content": "Made 1 replacement. " + pad})
-        fin_step = 2 + len(tcalls)
-        bal_rows.append({"step_index": fin_step, "type": "PLANNER_RESPONSE", "content": "Updated all three files."})
-        bal_rows.append(
-            {
-                "step_index": fin_step + 1,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY><summary>### 2. Progress\n- Updated core_alpha.py, core_beta.py, and test_balanced_suite.py.</summary></CONTEXT_SUMMARY>",
-            }
-        )
-        _write_jsonl(logs_bal / "transcript_full.jsonl", bal_rows)
-        res_bal = mod.build_rehydration(logs_bal / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_bal)
-        assert res_bal is not None
-        msg_bal, st_bal = res_bal
-        self.assertEqual(st_bal["files"], 3)
-        sec_blocks = msg_bal.split("\n### [Modified @")
-        self.assertEqual(len(sec_blocks), 4)
-        test_block = next(b for b in sec_blocks[1:] if "test_balanced_suite.py" in b)
-        self.assertGreaterEqual(len(test_block), 2200)
-        for tag in ("TEST_EDIT_A", "TEST_EDIT_B", "TEST_EDIT_C", "TEST_EDIT_D"):
-            self.assertIn(tag, test_block)
-        # First internal gap keeps full read_file hint; subsequent internal gaps use compact omitted marker
-        self.assertEqual(test_block.count("omitted; read_file for full context"), 1)
-
-        # 3. Single-open incremental fast tail scan (`need_max_step=False`) with & without CHECKPOINT
-        tail_log = self.tmp_root / "fast_tail_scan.jsonl"
-        _write_jsonl(
-            tail_log,
-            [
-                {"step_index": 0, "type": "USER_INPUT", "content": "hi"},
-                {"step_index": 1, "type": "CHECKPOINT", "content": "cp1"},
-                {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "ok"},
-            ],
-        )
-        cp0, max0, off0 = mod._scan_compact_tail_str(str(tail_log), 0, None, need_max_step=True)
-        self.assertEqual((cp0, max0), (1, 2))
-        with tail_log.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"step_index": 3, "type": "USER_INPUT", "content": "next turn"}) + "\n")
-            fh.write(json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "content": "reply"}) + "\n")
-        cp1, max1, off1 = mod._scan_compact_tail_str(str(tail_log), off0, cp0, need_max_step=False)
-        self.assertEqual((cp1, max1), (1, -1))
-        self.assertGreater(off1, off0)
-        with tail_log.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"step_index": 5, "type": "CHECKPOINT", "content": "cp2"}) + "\n")
-        cp2, _, off2 = mod._scan_compact_tail_str(str(tail_log), off1, cp1, need_max_step=False)
-        self.assertEqual(cp2, 5)
-        self.assertGreater(off2, off1)
-
-        # 4. Pre-resolve fast deny + cached resolve preserves all security boundaries
-        rcache: dict[str, Path | None] = {}
-        ws_pfx = helpers._prepare_root_prefixes([self.ws], rcache)
-        excl_dir = self.ws / "scratch_excl"
-        excl_dir.mkdir(exist_ok=True)
-        excl_file = excl_dir / "temp.py"
-        excl_file.write_text("x = 1\n", encoding="utf-8")
-        excl_pfx = helpers._prepare_root_prefixes([excl_dir], rcache)
-        env_file = self.ws / ".env"
-        env_file.write_text("SECRET=1\n", encoding="utf-8")
-        self.assertFalse(
-            helpers.is_eligible_text_file(
-                str(env_file),
-                workspace_roots=[self.ws],
-                resolve_cache=rcache,
-                _allowed_prefixes=ws_pfx,
-                _excluded_prefixes=excl_pfx,
-            )
-        )
-        self.assertFalse(
-            helpers.is_eligible_text_file(
-                str(excl_file),
-                workspace_roots=[self.ws],
-                resolve_cache=rcache,
-                _allowed_prefixes=ws_pfx,
-                _excluded_prefixes=excl_pfx,
-            )
-        )
-        self.assertTrue(
-            helpers.is_eligible_text_file(
-                str(core_a),
-                workspace_roots=[self.ws],
-                resolve_cache=rcache,
-                _allowed_prefixes=ws_pfx,
-                _excluded_prefixes=excl_pfx,
-            )
-        )
-
-    def test_missing_workspace_roots_fail_closed_to_trusted_roots(self) -> None:
-        import rehydrate_helpers as helpers
-
-        # 1. Hook payload without `workspacePaths`/`cwd` must never re-read tool-touched paths outside trusted roots
-        brain_cid = self.tmp_root / "brain" / "cid-no-ws-roots"
-        logs = brain_cid / ".system_generated" / "logs"
-        outside_dir = self.tmp_root / "outside_no_ws_roots"
-        outside_src = outside_dir / "billing.py"
-        outside_spec = outside_dir / "API_SPEC.md"
-        outside_skill = outside_dir / "SKILL.md"
-        artifact_plan = brain_cid / "implementation_plan.md"
-        artifact_skill = brain_cid / "skills" / "deploy" / "SKILL.md"
-        for fpath, marker in (
-            (outside_src, "OUTSIDE_SRC_MARKER = 1"),
-            (outside_spec, "OUTSIDE_SPEC_MARKER"),
-            (outside_skill, "OUTSIDE_SKILL_MARKER"),
-            (artifact_plan, "ARTIFACT_PLAN_MARKER"),
-            (artifact_skill, "ARTIFACT_SKILL_MARKER"),
-        ):
-            fpath.parent.mkdir(parents=True, exist_ok=True)
-            fpath.write_text(marker + "\n", encoding="utf-8")
-
-        rows = [
-            {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>依計畫調整 billing.py</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [
-                    {"name": "edit_file", "args": {"Path": str(outside_src), "Replacement": "OUTSIDE_SRC_MARKER = 1"}},
-                    {"name": "read_file", "args": {"Path": str(outside_spec)}},
-                    {"name": "read_file", "args": {"Path": str(outside_skill)}},
-                    {"name": "edit_file", "args": {"Path": str(artifact_plan), "Replacement": "ARTIFACT_PLAN_MARKER"}},
-                    {"name": "read_file", "args": {"Path": str(artifact_skill)}},
-                ],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 3, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 4, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 5, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 6, "type": "GENERIC", "status": "DONE", "content": "ok"},
-            {"step_index": 7, "type": "PLANNER_RESPONSE", "content": "已依計畫完成 billing.py 的調整。"},
-            {
-                "step_index": 8,
-                "type": "CHECKPOINT",
-                "content": "<CONTEXT_SUMMARY>\n# User Requests\n1. 依計畫調整 billing.py\n<summary>Done</summary>\n</CONTEXT_SUMMARY>",
-            },
-        ]
-        _write_jsonl(logs / "transcript.jsonl", rows)
-        _write_jsonl(logs / "transcript_full.jsonl", rows)
-        p_hook = subprocess.run(
-            [sys.executable, "-S", "-B", str(SCRIPTS_DIR / "rehydrate_after_compact.py"), "--hook"],
-            input=json.dumps({"transcriptPath": str(logs / "transcript.jsonl")}),
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            check=True,
-        )
-        hook_res = json.loads(p_hook.stdout.strip())
-        self.assertIn("injectSteps", hook_res)
-        injected_txt = "\n".join(st_item["systemMessage"]["systemMessage"] for st_item in hook_res["injectSteps"])
-        # Transcript dialogue plus fixed trusted roots (session artifact dir) are still restored
-        self.assertIn("已依計畫完成 billing.py 的調整。", injected_txt)
-        self.assertIn("ARTIFACT_PLAN_MARKER", injected_txt)
-        self.assertIn("ARTIFACT_SKILL_MARKER", injected_txt)
-        # Unknown workspace scope is never treated as unrestricted for workspace files, specs, or skills
-        self.assertNotIn("OUTSIDE_SRC_MARKER", injected_txt)
-        self.assertNotIn("OUTSIDE_SPEC_MARKER", injected_txt)
-        self.assertNotIn("OUTSIDE_SKILL_MARKER", injected_txt)
-
-        # 2. Scope gate itself denies when no trusted root (or an empty allow-list) is supplied
-        self.assertTrue(helpers.is_eligible_text_file(str(outside_src), workspace_roots=[outside_dir]))
-        self.assertFalse(helpers.is_eligible_text_file(str(outside_src)))
-        self.assertFalse(helpers.is_eligible_text_file(str(outside_src), _allowed_prefixes=()))
-
-    def test_anti_decay_ordered_lists_active_state_unclipped_sig_and_local_coverage(self) -> None:
-        import rehydrate_helpers as helpers
-
-        # 1. Ordered lists (`1. `, `2) `), separate findings/errors buckets (>4 findings must not starve 5th or Errors),
-        #    unclipped root-cause signature + deterministic `[lost: ...]`, SHA prefix & `key: val` dedup,
-        #    local line-unit coverage against word-soup, and selective durable Active Context state extraction.
-        cp1 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Audit PR 14\n<summary>\n"
-            "## 2. Progress\n"
-            "1. **Round 1 — Initial PR Review**:\n"
-            "   - Found 3 concrete bugs including `parseUsageRow` swallowing SQLite errors.\n"
-            "2) **Round 2 — Re-verification**:\n"
-            "   - Confirmed all fixes and verified multi-process WAL stress test.\n"
-            "## 3. Key Findings\n"
-            "- **PR #14 (`29025ab431c2451287215950a4673b3e3dd73866`) Status**: Clean and ready to merge.\n"
-            "- **Confirmed Upstream Bug (Outside Scope)**:\n"
-            "  - **Subagent queued follow-up wipes active alerts** (`server.mjs` L403-407 & L528-544): "
-            "When a subagent has an active execution and a user queues `USER_INPUT` (`step_type = 14`), both "
-            "`showTurnMetrics=false` (L531 `turnSteps.findLast()` picks queued step) and `showTurnMetrics=true` "
-            "(L405 `firstTurnStep = userStepIndex ?? metricsUserStepIndex` truncates SQL `WHERE idx >= ?`) "
-            "clear `turnQueue` to `null` and `requestError` to `'none'`.\n"
-            "- **Truncated Cloud Telemetry**: `0 / 0 cached · New conversation` rendered on truncated slices.\n"
-            "- **Docs Sync Note**: `agy-capsule/README.md` does not yet document `v1.4.1` cloud telemetry.\n"
-            "- **Deliberate PR #14 Trade-off**: `usage_history.mjs` L118-121 increments `unread++` on mid-read write "
-            "(`after.key !== before.key`), 23/66 stress scans report transient `unread: 1-2`.\n"
-            "## 4. Errors & Fixes\n"
-            "1. **`node` not recognized in PowerShell**: Fixed by invoking fnm `node.exe` directly.\n"
-            "2. **`curl.exe` to `https://github.com/org/repo/commit/29025ab431c2451287215950a4673b3e3dd73866.patch` "
-            "returned HTTP 503**: Worked around cleanly using GitHub REST API `Accept: application/vnd.github.diff`.\n"
-            "## 5. Active Context\n"
-            "- **Local Workspace State**: `D:\\workspace\\demo-repo` is unmodified by us, at `v1.4.1` + PR #14 "
-            "minus the final 4-line `??` + test update from commit `29025ab431c2451287215950a4673b3e3dd73866`.\n"
-            "- **Scratch Files Persisted**:\n"
-            "  - `probe_usage.mjs`: temporary scratch probe.\n"
-            "- **Background Tasks / Subagents**: None running.\n"
-            "- **Currently editing**: `temp_notes.md`.\n"
-            "## 7. Commitments & Constraints\n"
-            "- **Sandbox Rules**: Always try commands sandboxed first (`BypassSandbox: false`); only elevate single "
-            "network commands that genuinely need it.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        # CP2 drops: (a) workspace 4-line delta (scattering `local`/`workspace`/`state`/`v1.4.1`/`commit`/`29025ab` across
-        # unrelated lines), (b) two-layer root cause symbols of Subagent bug, (c) 5th Key Finding (`unread++` / `after.key`),
-        # (d) `curl.exe` HTTP 503 REST API workaround; while KEEPING short SHA `29025ab`, `node.exe`, and rephrased Sandbox constraint.
-        cp2 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Test PR 2\n<summary>\n"
-            "## 2. Progress\n"
-            "1. **PR 1 Review**: Audited all PR #14 files through commit `29025ab` (clean and merged as `c1fa56b`).\n"
-            "2. **PR 2 Update**: Verified `v1.4.1` local state update with zero regressions.\n"
-            "## 3. Key Findings\n"
-            "- **Upstream Issues**:\n"
-            "  - Subagent queued follow-up `USER_INPUT` (`step_type = 14`) clears `turnQueue` / `requestError` (`server.mjs` L403-407).\n"
-            "  - `agy-capsule/README.md` does not yet document `v1.4.1` cloud telemetry.\n"
-            "- **Environment**: `node` is not in `PATH`; invoke fnm `node.exe` directly.\n"
-            "## 5. Active Context\n"
-            "- **User Workspace**: `D:\\workspace\\demo-repo` remains completely unmodified by us.\n"
-            "## 7. Commitments & Constraints\n"
-            "- **Sandbox & Truthfulness**: Always try commands sandboxed first; only elevate (`BypassSandbox: true`) "
-            "the single network command that genuinely needs it.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-
-        # Helper unit checks: list marker stripping, SHA prefix safety, `: ` key normalization & space-slash safety
-        self.assertEqual(helpers._strip_list_marker("1. item"), "item")
-        self.assertEqual(helpers._strip_list_marker("12) item"), "item")
-        self.assertIsNone(helpers._strip_list_marker("2026.01 release"))
-        self.assertIsNone(helpers._strip_list_marker("1.4.1 release"))
-        self.assertTrue(helpers._code_token_covered("29025ab431c2451287215950a4673b3e3dd73866", "commit `29025ab`", set()))
-        self.assertFalse(helpers._code_token_covered("29025ab431c2451287215950a4673b3e3dd73866", "commit `29025abffff`", set()))
-        self.assertEqual(helpers._normalize_code_span_token("BypassSandbox: false")[0], "bypasssandbox")
-        self.assertEqual(helpers._normalize_code_span_token("ino:mtimeNs:size")[0], "ino:mtimens:size")
-        self.assertEqual(helpers._normalize_code_span_token("0 / 0 cached · New")[0], "0 / 0 cached · new")
-
-        # Extraction checks: ordered lists parsed, separate buckets unstarved, Active Context keeps only durable state
-        done1, cons1 = helpers.extract_checkpoint_milestones(cp1)
-        joined1 = "\n".join(done1)
-        self.assertIn("parseUsageRow", joined1)
-        self.assertIn("usage_history.mjs", joined1)
-        self.assertIn("curl.exe", joined1)
-        self.assertIn("Local Workspace State", joined1)
-        self.assertNotIn("probe_usage.mjs", joined1)
-        self.assertNotIn("None running", joined1)
-        self.assertNotIn("temp_notes.md", joined1)
-        self.assertEqual(len(cons1), 1)
-        # Clean bold+(paren) join without double colon (`alerts (`server.mjs`...)`, not `alerts: (`server.mjs`...)`)
-        self.assertIn("wipes active alerts (`server.mjs`", joined1)
-        self.assertNotIn("wipes active alerts: (`server.mjs`", joined1)
-        for item in done1 + cons1:
-            self.assertEqual(item.count("`") % 2, 0, f"Unbalanced backticks: {item!r}")
-
-        # Anti-decay digest: recovers all 4 decayed truths with zero false positives on SHA or Sandbox constraint
-        digest, cnt = helpers.build_anti_decay_milestone_digest(
-            [(164, 165, cp1)],
-            cp2,
-            self.ws / "transcript_full.jsonl",
-            budget_chars=1400,
-        )
-        self.assertGreaterEqual(cnt, 4)
-        self.assertIn("[State] Local Workspace State:", digest)
-        self.assertIn("minus the final 4-line", digest)
-        self.assertIn("Subagent queued follow-up wipes active alerts", digest)
-        self.assertIn("[lost: `showTurnMetrics`", digest)
-        self.assertIn("curl.exe", digest)
-        self.assertIn("usage_history.mjs", digest)
-        # False-positive suppression: short SHA `29025ab` & rephrased `BypassSandbox` constraint must NOT be duplicated
-        self.assertNotIn("[Constraint]", digest)
-        self.assertNotIn("PR #14 (`29025ab431c", digest)
-        self.assertNotIn("node` not recognized", digest)
-        self.assertEqual(digest.count("`") % 2, 0, f"Unbalanced backticks in digest: {digest!r}")
-
-        # Determinism check: repeated calls must emit byte-identical `[lost: ...]` ordering
-        digest2, cnt2 = helpers.build_anti_decay_milestone_digest(
-            [(164, 165, cp1)],
-            cp2,
-            self.ws / "transcript_full.jsonl",
-            budget_chars=1400,
-        )
-        self.assertEqual((digest, cnt), (digest2, cnt2))
-
-    def test_multi_cp_completed_qa_budget_stale_state_parity_and_demotion(self) -> None:
-        import rehydrate_helpers as helpers
-
-        # 1. Backtick parity on >64-char inline code spans must NOT invert subsequent prose into code tokens
-        long_css_line = (
-            "- `server.mjs` L1276-1288: `.usage-range` and `.usage-nav-total` both "
-            "`flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;`; "
-            "`.usage-model-tokens` adds `white-space: nowrap;`; `usage_ui.mjs` L356 adds `title=\"x\"`."
-        )
-        _, css_code = helpers._milestone_signature_tokens(long_css_line)
-        self.assertIn(".usage-model-tokens", css_code)
-        self.assertIn("usage_ui.mjs", css_code)
-        self.assertNotIn("adds", css_code)
-        pretty_map = helpers._extract_code_symbol_pretty_map(long_css_line)
-        self.assertIn(".usage-model-tokens", pretty_map)
-        self.assertNotIn("adds", pretty_map)
-
-        # 2. Stale/superseded [State] suppression, parenthetical removal scoping, scratch & archived-focus demotion
-        cp_old1 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Inspect old repo\n<summary>\n"
-            "## 3. Key Findings\n"
-            "- **Archived Widget Note (`legacy-widget`)**: Legacy widget cache used `legacyCacheKey` in `widget_old.mjs`.\n"
-            "- **Core Scheduler Note (`core-engine`)**: Lease jitter uses `leaseBackoffMs` in `scheduler.py`.\n"
-            "## 4. Errors & Fixes\n"
-            "1. **`scratch\\probe_legacy.mjs` failed with `TypeError: panel.toggleAttribute is not a function`**: "
-            "Caused by outdated scratch DOM stub missing `replayStats()` and `toggleAttribute`.\n"
-            "2. **Production parser crash in `row_parser.mjs`**: Missing `steps` table check swallowed `SQLITE_BUSY`.\n"
-            "## 5. Active Context\n"
-            "- **Local Workspace State**: `removed-repo` is unmodified by us, behind `abc1234` by a 4-line `??` patch.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp_old2 = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Check PR 2\n<summary>\n"
-            "## 2. Progress\n"
-            f"{long_css_line}\n"
-            "## 5. Active Context\n"
-            "- **User Workspace**: `removed-repo` remains completely unmodified by us.\n"
-            "- **Live Service**: `live-service` is running on build 101.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        cp_latest = (
-            "<CONTEXT_SUMMARY>\n# User Requests\n1. Final audit\n<summary>\n"
-            "## 1. Task Overview\n"
-            "- **Current Focus**: Harden `core-engine` scheduling and anti-decay pipeline.\n"
-            "- **Completed Earlier Focus (Archived)**: Code review of `legacy-widget` latest merged commit `c1fa56b`.\n"
-            "## 5. Active Context\n"
-            "- **User Workspace (`D:\\work`)**: Only `kept-app/` and `scratch_test/` currently exist (`removed-repo` was removed by user).\n"
-            "- **Live Service**: `live-service` upgraded cleanly to build 102.\n"
-            "</summary>\n</CONTEXT_SUMMARY>"
-        )
-        _, removed_anchors, archived_only, _ = helpers._extract_latest_context_signals(cp_latest)
-        self.assertIn("removed-repo", removed_anchors)
-        self.assertNotIn("kept-app", removed_anchors)
-        self.assertNotIn("scratch_test", removed_anchors)
-        self.assertIn("legacy-widget", archived_only)
-        self.assertNotIn("latest", archived_only)
-        self.assertNotIn("commit", archived_only)
-
-        digest, cnt = helpers.build_anti_decay_milestone_digest(
-            [(100, 101, cp_old1), (200, 201, cp_old2)],
-            cp_latest,
-            self.ws / "transcript_full.jsonl",
-            budget_chars=1400,
-        )
-        self.assertGreaterEqual(cnt, 4)
-        # Superseded/removed [State] entries from BOTH cp_old2 and cp_old1 must NOT resurrect
-        self.assertNotIn("[State] User Workspace: `removed-repo`", digest)
-        self.assertNotIn("[State] Local Workspace State: `removed-repo`", digest)
-        self.assertNotIn("[State] Live Service: `live-service`", digest)
-        # Backtick parity fix emits real selector instead of bogus `adds`
-        self.assertIn("[lost: `.usage-model-tokens`", digest)
-        self.assertNotIn("`adds`", digest)
-        # Real active-focus finding & production error outrank archived-focus & scratch probe typo
-        self.assertIn("scheduler.py", digest)
-        self.assertIn("row_parser.mjs", digest)
-        if "widget_old.mjs" in digest:
-            self.assertLess(digest.index("scheduler.py"), digest.index("widget_old.mjs"))
-        if "probe_legacy.mjs" in digest:
-            self.assertLess(digest.index("row_parser.mjs"), digest.index("probe_legacy.mjs"))
-        self.assertEqual(digest.count("`") % 2, 0)
-
-        # 3. Tight budget with long Windows-style transcript path falls back to compact note instead of collapsing to 0
-        long_path = Path(
-            "C:\\Users\\DeveloperName\\.gemini\\antigravity\\brain\\f2b26847-594e-4a0d-b2ea-a7a226fb4bf8\\.system_generated\\logs\\transcript_full.jsonl"
-        )
-        tight_digest, tight_cnt = helpers.build_anti_decay_milestone_digest(
-            [(100, 101, cp_old1), (200, 201, cp_old2)],
-            cp_latest,
-            long_path,
-            budget_chars=360,
-        )
-        self.assertGreaterEqual(tight_cnt, 1)
-        self.assertLessEqual(len(tight_digest), 360)
-        self.assertIn("transcript_full.jsonl", tight_digest)
-
-        # 4. End-to-end 3-checkpoint completed_qa with huge pre-window user paste + long final reply
-        # must NOT starve anti-decay milestones or Workspace Reality Notice
-        (self.ws / "kept-app").mkdir(exist_ok=True)
-        long_paste = "Detailed initial specification dump for old task:\n" + ("spec line alpha beta gamma\n" * 95)
-        long_reply = "Completed full multi-part verification summary:\n" + (
-            "- Verified subsystem component check passed cleanly with deterministic metrics.\n" * 44
-        )
-        logs_3cp = self.tmp_root / "brain" / "cid-3cp-qa-starve" / ".system_generated" / "logs"
-        rows_3cp = [
-            {"step_index": 0, "type": "USER_INPUT", "content": f"<USER_REQUEST>{long_paste}</USER_REQUEST>"},
-            {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "content": "",
-                "tool_calls": [{"name": "read_file", "args": {"Path": str(self.ws / "removed-repo" / "index.js")}}],
-            },
-            {"step_index": 2, "type": "GENERIC", "status": "DONE", "content": "x" * 70000},
-            {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Reviewed old repo."},
-            {"step_index": 10, "type": "CHECKPOINT", "content": cp_old1},
-            {"step_index": 20, "type": "USER_INPUT", "content": "<USER_REQUEST>Review follow-up commit</USER_REQUEST>"},
-            {"step_index": 21, "type": "PLANNER_RESPONSE", "content": "Follow-up verified."},
-            {"step_index": 30, "type": "CHECKPOINT", "content": cp_old2},
-            {"step_index": 40, "type": "USER_INPUT", "content": "<USER_REQUEST>Final audit</USER_REQUEST>"},
-            {"step_index": 41, "type": "GENERIC", "status": "DONE", "content": "y" * 80000},
-            {"step_index": 42, "type": "PLANNER_RESPONSE", "content": long_reply},
-            {"step_index": 50, "type": "CHECKPOINT", "content": cp_latest},
-        ]
-        _write_jsonl(logs_3cp / "transcript_full.jsonl", rows_3cp)
-        res_3cp = mod.build_rehydration(logs_3cp / "transcript_full.jsonl", workspace_roots=[self.ws])
-        self.assertIsNotNone(res_3cp)
-        assert res_3cp is not None
-        msg_3cp, st_3cp = res_3cp
-        self.assertEqual(st_3cp["session_mode"], "completed_qa")
-        self.assertGreaterEqual(st_3cp["decayed_milestones"], 2)
-        self.assertIn("Earlier Checkpoints Milestone Index", msg_3cp)
-        self.assertIn("[cp @ step 10, line 5]:", msg_3cp)
-        self.assertIn("[cp @ step 30, line 8]:", msg_3cp)
-        self.assertNotIn("[State] User Workspace: `removed-repo`", msg_3cp)
-        self.assertNotIn("[State] Local Workspace State: `removed-repo`", msg_3cp)
-        self.assertGreaterEqual(st_3cp["stale_paths"], 1)
-        self.assertIn("Workspace Reality & File Status Notice", msg_3cp)
-        self.assertLessEqual(st_3cp["chars"], st_3cp["ratio_cap"])
-
-    def test_anti_decay_breadth_first_monotonic_on_four_checkpoints(self) -> None:
-        import rehydrate_helpers as helpers
-
-        cp1 = (
-            "## 3. Key Findings\n"
-            "- **Parser Limit**: `chunk_lexer.py` rejects nested `triple_quote_span` tokens exceeding 4KB buffers.\n"
-            "- **Cache Invariant**: `wal_compactor.py` requires `pragma_sync_mode` enabled before checkpoint replay.\n"
-            "## 4. Errors & Fixes\n"
-            "- **`socket_bridge.py` EPIPE**: Fixed half-closed stream crash by awaiting `drain_frame_queue` on EOF.\n"
-        )
-        cp2 = (
-            "## 3. Key Findings\n"
-            "- **Scheduler Drift**: `cron_jitter.py` miscomputes `next_fire_epoch` across DST spring-forward windows.\n"
-            "- **Retry Ceiling**: `backoff_policy.py` caps `jitter_window_ms` at 30s to avoid thundering herds.\n"
-            "## 4. Errors & Fixes\n"
-            "- **`tls_handshake.py` timeout**: Fixed SNI mismatch in `verify_peer_chain` under proxy tunneling.\n"
-            "- **`metrics_sink.py` overflow**: Switched `histogram_bucket_idx` from int16 to int32 counters.\n"
-        )
-        cp3 = (
-            "## 3. Key Findings\n"
-            "- **Rehydrate Guard**: `workspace_notice.py` detects `stale_disk_ref` entries removed outside the IDE.\n"
-            "- **Span Tokenizer**: `backtick_scanner.py` handles `oversized_css_span` without flipping quote parity.\n"
-            "## 4. Errors & Fixes\n"
-            "- **`path_norm.py` basename bug**: Ignored labels with spaces in `extract_display_basename` helper.\n"
-            "- **`digest_order.py` tie-break**: Sorted `lost_symbol_set` deterministically via `pretty_symbol_map`.\n"
-        )
-        cp4_latest = (
-            "## 1. Task Overview\n"
-            "- **Current Focus**: Finalize multi-checkpoint breadth-first allocation in `digest_scheduler.py`.\n"
-            "## 5. Active Context\n"
-            "- Working in `D:\\workspace\\rehydrate-core`.\n"
-        )
-        long_win_path = Path(
-            r"C:\Users\Developer\.gemini\antigravity\brain\f2b26847-594e-4a0d-b2ea-a7a226fb4bf8"
-            r"\.system_generated\logs\transcript_full.jsonl"
-        )
-        prev_cps = [(100, 101, cp1), (200, 201, cp2), (300, 301, cp3)]
-
-        # Breadth-first allocation must cover all 3 prior checkpoints monotonically as budget increases
-        seen_cp_sets: list[set[int]] = []
-        prev_count = 0
-        for budget in (750, 800, 900, 1000, 1200, 1400, 1600):
-            digest, cnt = helpers.build_anti_decay_milestone_digest(
-                prev_cps, cp4_latest, long_win_path, budget_chars=budget
-            )
-            self.assertLessEqual(len(digest), budget)
-            present = {
-                step for step in (100, 200, 300) if f"[cp @ step {step}, line {step + 1}]:" in digest
-            }
-            if seen_cp_sets:
-                # Monotonicity: once an earlier checkpoint is covered, raising budget must never drop it
-                self.assertTrue(
-                    seen_cp_sets[-1].issubset(present),
-                    f"Budget {budget} dropped checkpoints {seen_cp_sets[-1] - present}",
+            for i in range(1, 9):
+                recs.append(
+                    {
+                        "step_index": i,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "",
+                        "tool_calls": [{"name": f"tool_{i}", "args": {}}],
+                    }
                 )
-            seen_cp_sets.append(present)
-            if budget >= 800:
-                self.assertEqual(present, {100, 200, 300}, f"Expected all 3 CPs at budget={budget}")
-                # Chronological row ordering
-                p1 = digest.index("[cp @ step 100, line 101]:")
-                p2 = digest.index("[cp @ step 200, line 201]:")
-                p3 = digest.index("[cp @ step 300, line 301]:")
-                self.assertTrue(p1 < p2 < p3)
-            if budget >= 800:
-                self.assertGreaterEqual(cnt, prev_count)
-                prev_count = cnt
+            recs.append({"step_index": 9, "type": "USER_INPUT", "content": "<USER_REQUEST>\n/compact\n</USER_REQUEST>"})
+            recs.append({"step_index": 10, "type": "CHECKPOINT", "content": "<summary>s</summary>"})
+            _write_jsonl(full, recs)
 
-        # Unbalanced checkpoints: a sparse older CP must not cap a rich newer CP at 4 items when space remains
-        sparse_cp = "## 3. Key Findings\n- **Tiny Note**: `alpha_flag` kept enabled.\n"
-        rich_cp = "## 3. Key Findings\n" + "\n".join(
-            f"- **Item {i}**: `unique_sym_{i}` verified in `mod_{i}.py`." for i in range(1, 7)
-        )
-        unbal_digest, unbal_cnt = helpers.build_anti_decay_milestone_digest(
-            [(10, 11, sparse_cp), (20, 21, rich_cp)],
-            cp4_latest,
-            self.ws / "transcript_full.jsonl",
-            budget_chars=1400,
-        )
-        self.assertIn("[cp @ step 10, line 11]:", unbal_digest)
-        self.assertIn("[cp @ step 20, line 21]:", unbal_digest)
-        self.assertGreaterEqual(unbal_cnt, 6)
+            res = core.build_rehydration(full, up_to_checkpoint_step=10, workspace_roots=[])
+            self.assertIsNotNone(res)
+            msg, _ = res
+            self.assertIn("[Pre-Compaction In-Progress Tools]:", msg)
+            self.assertIn("tool_8", msg)
+            self.assertIn("tool_3", msg)
+            self.assertNotIn("tool_1", msg)
 
-    def test_line_endings_and_no_pycache(self) -> None:
-        self.assertEqual(list(PLUGIN_SRC.rglob("__pycache__")), [])
-        hooks_data = json.loads((PLUGIN_SRC / "hooks.json").read_text(encoding="utf-8"))
-        cmd = hooks_data["agy-rehydrate"]["PreInvocation"][0]["command"]
-        self.assertIn(" -S -B scripts/", cmd)
-        for path in REPO_ROOT.rglob("*"):
-            if not path.is_file() or ".tmp_" in str(path) or "__pycache__" in path.parts or ".git" in path.parts:
-                continue
-            raw = path.read_bytes()
-            suf = path.suffix.lower()
-            if suf == ".bat":
-                stripped = raw.replace(b"\r\n", b"")
-                self.assertNotIn(b"\n", stripped, f"Expected CRLF line endings in {path}")
-            elif suf in {".sh", ".py", ".json", ".md", ".svg"}:
-                self.assertNotIn(b"\r", raw, f"Expected LF line endings in {path}")
+    def test_read_text_clipped_line_snapping_and_nul_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            code = root / "long_code.py"
+            lines = [f"def func_{i:04d}(arg_alpha, arg_beta): return {i}" for i in range(400)]
+            code.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            clipped = core.read_text_clipped(code, max_chars=2000)
+            self.assertIsNotNone(clipped)
+            assert clipped is not None
+            self.assertIn("... [truncated ~", clipped)
+            head, rest = clipped.split("\n... [truncated ~", 1)
+            _, tail = rest.split("] ...\n", 1)
+            # Head must end on a complete line (no partial `def func_...`)
+            self.assertRegex(head.splitlines()[-1], r"^def func_\d{4}\(arg_alpha, arg_beta\): return \d+$")
+            # Tail must start on a complete line
+            self.assertRegex(tail.splitlines()[0], r"^def func_\d{4}\(arg_alpha, arg_beta\): return \d+$")
+
+            # BOM-less UTF-16LE contains NUL bytes and must be rejected
+            utf16_file = root / "utf16_nul.txt"
+            utf16_file.write_bytes("HELLO WORLD\n".encode("utf-16-le"))
+            self.assertIsNone(core.read_text_clipped(utf16_file, max_chars=2000))
+
+    def test_layer4_evicted_modified_do_not_steal_referenced_and_alias_dedup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+
+            refs = []
+            for i in (1, 2):
+                rf = ws / f"ref{i}.py"
+                rf.write_text(f"REF_MARKER_{i} = {i}\n", encoding="utf-8")
+                refs.append(rf)
+
+            mods = []
+            for i in range(1, 8):
+                mf = ws / f"mod{i}.py"
+                mf.write_text(f"MOD_MARKER_{i} = {i}\n", encoding="utf-8")
+                mods.append(mf)
+
+            alias_path = ws / "mod7_alias.py"
+            recs: list[dict] = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nedit 7 files\n</USER_REQUEST>"},
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "content": "read refs",
+                    "tool_calls": [{"name": "read_file", "args": {"Path": str(rf)}} for rf in refs],
+                },
+            ]
+            for idx, mf in enumerate(mods, start=2):
+                recs.append(
+                    {
+                        "step_index": idx,
+                        "type": "PLANNER_RESPONSE",
+                        "content": "",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": str(mf)}},
+                            {"name": "edit_file", "args": {"Path": str(mf)}},
+                        ],
+                    }
+                )
+            recs.append(
+                {
+                    "step_index": 9,
+                    "type": "PLANNER_RESPONSE",
+                    "content": "done",
+                    "tool_calls": [{"name": "read_file", "args": {"Path": str(alias_path)}}],
+                }
+            )
+            recs.append({"step_index": 10, "type": "CHECKPOINT", "content": "<summary>s</summary>"})
+
+            full = root / "brain" / "c-l4" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(full, recs)
+            with _symlink_or_mock_resolve(alias_path, mods[-1]):
+                res = core.build_rehydration(full, up_to_checkpoint_step=10, workspace_roots=[ws])
+            self.assertIsNotNone(res)
+            msg, stats = res
+            self.assertEqual(stats["files"], 7)  # 5 Modified + 2 genuine Referenced
+            for i in range(3, 8):
+                self.assertIn(f"MOD_MARKER_{i}", msg)
+            # Evicted mod1 & mod2 must NOT steal Referenced slots
+            self.assertNotIn("MOD_MARKER_1", msg)
+            self.assertNotIn("MOD_MARKER_2", msg)
+            self.assertIn("REF_MARKER_1", msg)
+            self.assertIn("REF_MARKER_2", msg)
+            # Alias resolving to mod7.py must NOT duplicate mod7.py
+            self.assertEqual(msg.count("MOD_MARKER_7 = 7"), 1)
+
+    def test_rehydration_sysmsg_idempotency_and_nested_strip_safety(self) -> None:
+        # Real markers match; quoted markers inside arbitrary SYSTEM_MESSAGE text do NOT
+        self.assertTrue(core.is_rehydration_system_message("[POST-COMPACT REHYDRATION v1 | checkpoint=10]\n...", 10))
+        self.assertFalse(core.is_rehydration_system_message("[POST-COMPACT REHYDRATION v1 | checkpoint=4]\n...", 10))
+        self.assertTrue(
+            core.is_rehydration_system_message(
+                "<SYSTEM_MESSAGE>\nThe following system message was injected by a PreInvocation hook:\n"
+                "[POST-COMPACT REHYDRATION v1 | checkpoint=10]\nbody\n</SYSTEM_MESSAGE>",
+                10,
+            )
+        )
+        quoted_swarm_msg = (
+            "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n"
+            "<SYSTEM_MESSAGE>\n[swarm] Please audit `[POST-COMPACT REHYDRATION v1 | checkpoint=10]` handling.\n"
+            "</SYSTEM_MESSAGE>"
+        )
+        self.assertFalse(core.is_rehydration_system_message(quoted_swarm_msg, 10))
+        self.assertFalse(core.is_rehydration_system_message(quoted_swarm_msg))
+
+        # End-to-end: quoted marker after CP 10 must NOT suppress CP 10
+        with tempfile.TemporaryDirectory() as td:
+            full = Path(td) / "brain" / "c-quote" / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nwork\n</USER_REQUEST>"},
+                    {"step_index": 10, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
+                    {"step_index": 11, "type": "SYSTEM_MESSAGE", "content": quoted_swarm_msg},
+                ],
+            )
+            res = core.build_rehydration(full, workspace_roots=[])
+            self.assertIsNotNone(res)
+            self.assertEqual(res[1]["checkpoint"], 10)
+
+        # NESTED_REHYDRATE_RE must NOT swallow unrelated multi-line content between an earlier mention and a nested block
+        sample = (
+            "The following is a <SYSTEM_MESSAGE> explanation line.\n"
+            "IMPORTANT_CONTENT_MUST_SURVIVE\n"
+            "<SYSTEM_MESSAGE>\n[POST-COMPACT REHYDRATION v1 | checkpoint=2]\nold\n</SYSTEM_MESSAGE>\n"
+            "AFTER_LINE"
+        )
+        cleaned = core.strip_nested_rehydration(sample)
+        self.assertIn("IMPORTANT_CONTENT_MUST_SURVIVE", cleaned)
+        self.assertIn("AFTER_LINE", cleaned)
+        self.assertNotIn("[POST-COMPACT REHYDRATION v1 | checkpoint=2]", cleaned)
+
+    def test_config_invalid_workspace_falls_back_to_global_value(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            (ws / ".agents").mkdir(parents=True)
+            global_cfg = root / "global.json"
+            ws_cfg = ws / ".agents" / "rehydrate.json"
+
+            global_cfg.write_text(
+                json.dumps(
+                    {
+                        "budgetSingleFileChars": 2500,
+                        "maxModifiedFiles": 3,
+                        "fileScopeSincePrevCheckpoint": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ws_cfg.write_text(
+                json.dumps(
+                    {
+                        "budgetSingleFileChars": "bad",
+                        "maxModifiedFiles": -5,
+                        "fileScopeSincePrevCheckpoint": "nope",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cfg = core.load_rehydrate_config(ws, global_config_path=global_cfg)
+            self.assertEqual(cfg.budget_single_file_chars, 2500)
+            self.assertEqual(cfg.max_modified_files, 3)
+            self.assertFalse(cfg.file_scope_since_prev_checkpoint)
+
+    # -------------------------------------------------------------------------
+    # Hook & CLI regression tests (#6, #10)
+    # -------------------------------------------------------------------------
+
+    def test_hooks_json_portable_command_and_timeout(self) -> None:
+        hj = json.loads((PLUGIN_ROOT / "hooks.json").read_text(encoding="utf-8"))
+        entry = hj["agy-rehydrate"]["PreInvocation"][0]
+        cmd = entry["command"]
+        self.assertNotIn("CorixLab", cmd)
+        self.assertNotIn("C:\\", cmd)
+        self.assertIn("python -S -B scripts/rehydrate_after_compact.py --hook", cmd)
+        self.assertIn("python3 -S -B scripts/rehydrate_after_compact.py --hook", cmd)
+        self.assertGreaterEqual(entry["timeout"], 15)
+
+        shell_cmd = ["cmd", "/c", cmd] if os.name == "nt" else ["sh", "-c", cmd]
+        res = subprocess.run(shell_cmd, cwd=str(PLUGIN_ROOT), input="{}", capture_output=True, text=True, check=True)
+        self.assertEqual(res.stdout.strip(), "{}")
+
+    def test_hook_fresh_gap_enforced_with_existing_state_and_skips_fork_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            logs = root / "brain" / "c-stale" / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            full = logs / "transcript_full.jsonl"
+            state_p = logs / "rehydrate_state.json"
+
+            # Simulate plugin disabled across CP 10 and re-enabled at step 40 (had_state=True, prev_cp=None)
+            records = [
+                {"step_index": 5, "type": "USER_INPUT", "content": "<USER_REQUEST>\nforked\n</USER_REQUEST>"},
+                {"step_index": 10, "type": "CHECKPOINT", "content": "<summary>old cp</summary>"},
+                {"step_index": 40, "type": "USER_INPUT", "content": "<USER_REQUEST>\nmuch later\n</USER_REQUEST>"},
+            ]
+            _write_jsonl(compact, records)
+            _write_jsonl(full, records)
+            rh_entry._save_state_str(str(state_p), None, 0)
+
+            payload = json.dumps({"transcriptPath": str(compact), "cwd": str(ws)})
+            buf = io.StringIO()
+            with (
+                mock.patch.object(sys, "stdin", io.StringIO(payload)),
+                mock.patch.object(sys, "stdout", buf),
+                mock.patch.object(core, "resolve_fork_ancestors", side_effect=AssertionError("must skip fork scan")),
+            ):
+                rc = rh_entry.run_hook()
+            self.assertEqual(rc, 0)
+            self.assertEqual(buf.getvalue().strip(), "{}")
+            st = json.loads(state_p.read_text(encoding="utf-8"))
+            self.assertEqual(st["last_rehydrated_checkpoint"], 10)
+            self.assertEqual(st["last_status"], "stale_skipped")
+
+    def test_hook_full_lag_retries_and_monotonic_truncation_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            logs = root / "brain" / "c-lag" / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            full = logs / "transcript_full.jsonl"
+            state_p = logs / "rehydrate_state.json"
+
+            base_recs = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nphase 1\n</USER_REQUEST>"},
+                {"step_index": 50, "type": "CHECKPOINT", "content": "<summary>cp50</summary>"},
+                {"step_index": 51, "type": "SYSTEM_MESSAGE", "content": "[POST-COMPACT REHYDRATION v1 | checkpoint=50]\n..."},
+                {"step_index": 60, "type": "USER_INPUT", "content": "<USER_REQUEST>\nphase 2\n</USER_REQUEST>"},
+            ]
+            cp100_rec = {"step_index": 100, "type": "CHECKPOINT", "content": "<summary>cp100</summary>"}
+            _write_jsonl(compact, [*base_recs, cp100_rec])
+            _write_jsonl(full, base_recs)  # transcript_full.jsonl lags behind!
+            rh_entry._save_state_str(str(state_p), 50, 10, None, last_status="injected")
+
+            payload = json.dumps({"transcriptPath": str(compact), "cwd": str(ws)})
+
+            def _call_hook() -> dict:
+                buf = io.StringIO()
+                with mock.patch.object(sys, "stdin", io.StringIO(payload)), mock.patch.object(sys, "stdout", buf):
+                    self.assertEqual(rh_entry.run_hook(), 0)
+                return json.loads(buf.getvalue())
+
+            # 1) full_lag -> returns {} and MUST NOT advance last_rehydrated_checkpoint or checked_offset
+            self.assertEqual(_call_hook(), {})
+            st_lag = json.loads(state_p.read_text(encoding="utf-8"))
+            self.assertEqual(st_lag["last_rehydrated_checkpoint"], 50)
+            self.assertEqual(st_lag["checked_offset"], 10)
+
+            # 2) Once transcript_full.jsonl catches up, next turn retries and injects CP 100
+            _write_jsonl(full, [*base_recs, cp100_rec])
+            out2 = _call_hook()
+            self.assertIn("injectSteps", out2)
+            self.assertIn("checkpoint=100", out2["injectSteps"][0]["systemMessage"]["systemMessage"])
+            st_ok = json.loads(state_p.read_text(encoding="utf-8"))
+            self.assertEqual(st_ok["last_rehydrated_checkpoint"], 100)
+            self.assertEqual(st_ok["last_status"], "injected")
+
+            # 3) Momentary 0-byte truncation -> preserves prev_cp=100 & last_status, resets checked_offset=0
+            compact.write_bytes(b"")
+            self.assertEqual(_call_hook(), {})
+            st_trunc = json.loads(state_p.read_text(encoding="utf-8"))
+            self.assertEqual(st_trunc["last_rehydrated_checkpoint"], 100)
+            self.assertEqual(st_trunc["checked_offset"], 0)
+            self.assertEqual(st_trunc["last_status"], "injected")
+
+            # 4) Reappearance with older CP 50 (or CP 100) never rolls back prev_cp or re-injects
+            _write_jsonl(compact, base_recs)
+            self.assertEqual(_call_hook(), {})
+            self.assertEqual(json.loads(state_p.read_text(encoding="utf-8"))["last_rehydrated_checkpoint"], 100)
+
+    def test_extract_step_index_bytes_and_scan_compact_tail_hardening(self) -> None:
+        self.assertEqual(rh_entry._extract_step_index_bytes(b'{"step_index":0,"type":"USER_INPUT"}\n'), 0)
+        self.assertEqual(rh_entry._extract_step_index_bytes(b'\xef\xbb\xbf{"step_index" \t : \t 42}\n'), 42)
+        self.assertEqual(rh_entry._extract_step_index_bytes(b'{"q": "step_index", "count": 9999, "step_index": 2}\n'), 2)
+        self.assertEqual(rh_entry._extract_step_index_bytes(b'{"meta": {"step_index": 9999}, "step_index": 5}\n'), 5)
+        self.assertEqual(
+            rh_entry._extract_step_index_bytes(
+                b'{"content": "' + b"x" * 300 + b'", "step_index": 5, "tool_calls": [{"args": {"step_index": 9999}}]}\n'
+            ),
+            5,
+        )
+        for bad_line in (
+            b'{"step_index": 123.5}\n',
+            b'{"step_index": 5 .2}\n',
+            b'{"step_index": 1e3}\n',
+            b'{"step_index": -5}\n',
+            b'{"step_index": true}\n',
+            b'{"step_index": 01}\n',
+            b'{"meta": {"step_index": 9999}}\n',
+        ):
+            self.assertEqual(rh_entry._extract_step_index_bytes(bad_line), -1, bad_line)
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "compact.jsonl"
+            raw = (
+                b'\xef\xbb\xbf{"step_index": 10, "type": "CHECKPOINT"}\n'
+                b'{"type": "CHECKPOINT"}\n'
+                b'{"step_index": -2, "type": "CHECKPOINT"}\n'
+                b'{"step_index": 4, "type": "CHECKPOINT"}\n'
+                b'{"step_index": 12, "type": "USER_INPUT"}\n'
+            )
+            p.write_bytes(raw)
+            self.assertEqual(rh_entry.scan_compact_tail(p, 0, None, need_max_step=True), (10, 12, len(raw)))
+            self.assertEqual(rh_entry.scan_compact_tail(p, 0, None, need_max_step=False), (10, -1, len(raw)))
+            # prev_offset == st_size with need_max_step=True must still scan max_step
+            self.assertEqual(rh_entry.scan_compact_tail(p, len(raw), 10, need_max_step=True), (10, 12, len(raw)))
+
+    def test_save_state_permission_retry_stdio_bom_broken_pipe_and_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # 1) _save_state_str PermissionError retry succeeds on 3rd attempt
+            st_path = str(root / "rehydrate_state.json")
+            calls = {"n": 0}
+            real_replace = os.replace
+
+            def _flaky_replace(src: str, dst: str) -> None:
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise PermissionError("transient lock")
+                real_replace(src, dst)
+
+            with mock.patch.object(os, "replace", side_effect=_flaky_replace):
+                rh_entry._save_state_str(st_path, 7, 128, None, last_status="injected")
+            self.assertEqual(calls["n"], 3)
+            self.assertEqual(json.loads(Path(st_path).read_text(encoding="utf-8"))["last_rehydrated_checkpoint"], 7)
+
+            with mock.patch.object(os, "replace", side_effect=PermissionError("locked")):
+                rh_entry._save_state_str(st_path, 9, 256)
+            self.assertEqual(list(root.glob("*.tmp")), [])
+
+            # 2) UTF-8 BOM stdin triggers rehydration (not silently dropped)
+            ws = root / "ws"
+            ws.mkdir()
+            logs = root / "brain" / "c-bom" / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            full = logs / "transcript_full.jsonl"
+            recs = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\n中文 BOM 測試\n</USER_REQUEST>"},
+                {"step_index": 1, "type": "CHECKPOINT", "content": "<summary>s</summary>"},
+            ]
+            _write_jsonl(compact, recs)
+            _write_jsonl(full, recs)
+            bom_payload = ("\ufeff" + json.dumps({"transcriptPath": str(compact), "cwd": str(ws)}, ensure_ascii=False)).encode(
+                "utf-8"
+            )
+            fake_in = io.TextIOWrapper(io.BytesIO(bom_payload), encoding="cp950", errors="strict")
+            fake_out = io.StringIO()
+            with mock.patch.object(sys, "stdin", fake_in), mock.patch.object(sys, "stdout", fake_out):
+                self.assertEqual(rh_entry.run_hook(), 0)
+            bom_out = json.loads(fake_out.getvalue())
+            self.assertIn("injectSteps", bom_out)
+            self.assertIn("中文 BOM 測試", bom_out["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            # 3) BrokenPipeError on stdout still returns exit 0
+            class _BrokenStdout:
+                def write(self, _s: str) -> int:
+                    raise BrokenPipeError("broken pipe")
+
+                def flush(self) -> None:
+                    raise BrokenPipeError("broken pipe")
+
+            with mock.patch.object(sys, "stdin", io.StringIO("{}")), mock.patch.object(sys, "stdout", _BrokenStdout()):
+                self.assertEqual(rh_entry.run_hook(), 0)
+
+            # 4) _find_transcript_files_str: traversal rejected & transcript_full.jsonl fallback
+            ad_full_only = root / "conv-full-only"
+            ad_logs = ad_full_only / ".system_generated" / "logs"
+            ad_logs.mkdir(parents=True)
+            ad_full = ad_logs / "transcript_full.jsonl"
+            ad_full.write_text('{"step_index": 0}\n', encoding="utf-8")
+            c1, f1, _ = rh_entry._find_transcript_files_str({"artifactDirectoryPath": f"  {ad_full_only}  "})
+            self.assertEqual((c1, f1), (str(ad_full), str(ad_full)))
+
+            fake_home = root / "home"
+            evil_logs = fake_home / ".gemini" / "antigravity" / "evil" / ".system_generated" / "logs"
+            evil_logs.mkdir(parents=True)
+            (evil_logs / "transcript.jsonl").write_text('{"step_index": 0}\n', encoding="utf-8")
+            good_logs = fake_home / ".gemini" / "antigravity" / "brain" / "cid-full-only" / ".system_generated" / "logs"
+            good_logs.mkdir(parents=True)
+            good_full = good_logs / "transcript_full.jsonl"
+            good_full.write_text('{"step_index": 0}\n', encoding="utf-8")
+            with mock.patch.object(os.path, "expanduser", return_value=str(fake_home)):
+                for bad_cid in ("../evil", "..\\evil", "a/b", "a\\b", ".", "..", "C:evil"):
+                    self.assertEqual(
+                        rh_entry._find_transcript_files_str({"conversationId": bad_cid}),
+                        (None, None, None),
+                        bad_cid,
+                    )
+                c2, f2, _ = rh_entry._find_transcript_files_str({"conversationId": "cid-full-only"})
+                self.assertEqual((c2, f2), (str(good_full), str(good_full)))
+
+    def test_pep562_private_no_heavy_import_and_no_stdlib_leaks(self) -> None:
+        probe = (
+            "import json, sys; "
+            f"sys.path.insert(0, {str(SCRIPTS_DIR)!r}); "
+            "import rehydrate_after_compact as m; "
+            "has_priv = hasattr(m, '_nonexistent_private'); "
+            "heavy_after_priv = ('rehydrate_core' in sys.modules or 'rehydrate_cli' in sys.modules); "
+            "leaks = [n for n in ('re', 'stat', 'unicodedata', 'Path', 'datetime', 'argparse', 'urlparse') if hasattr(m, n)]; "
+            "ok_pub = callable(m.build_rehydration) and isinstance(m.MARKER_PREFIX, str) and callable(m.run_cli); "
+            "print(json.dumps({'has_priv': has_priv, 'heavy': heavy_after_priv, 'leaks': leaks, 'ok_pub': ok_pub}))"
+        )
+        res = subprocess.run([sys.executable, "-S", "-B", "-c", probe], capture_output=True, text=True, check=True)
+        info = json.loads(res.stdout.strip())
+        self.assertEqual(info, {"has_priv": False, "heavy": False, "leaks": [], "ok_pub": True})
+
+    def test_cli_split_cwd_validation_target_resolution_status_and_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws1 = root / "ws1"
+            ws2 = root / "ws2"
+            (ws1 / ".agents").mkdir(parents=True)
+            (ws2 / ".agents").mkdir(parents=True)
+            (ws1 / ".agents" / "rehydrate.json").write_text('{"budgetSingleFileChars": 1111}\n', encoding="utf-8")
+            (ws2 / ".agents" / "rehydrate.json").write_text('{"budgetSingleFileChars": 2222}\n', encoding="utf-8")
+
+            # 1) Split --cwd before & after subcommand merges in order (ws1 wins)
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                rc = cli.run_cli(["--cwd", str(ws1), "show-config", "--cwd", str(ws2)])
+            self.assertEqual(rc, 0)
+            cfg_out = json.loads(buf.getvalue())
+            self.assertEqual(cfg_out["workspaces"], [str(ws1.resolve()), str(ws2.resolve())])
+            self.assertEqual(cfg_out["budgetSingleFileChars"], 1111)
+
+            # Reject empty/UNC/remote file:// --cwd
+            for bad_cwd in ("", "   ", r"\\evil.invalid\share", "//evil.invalid/share", "file://evil.invalid/share"):
+                buf = io.StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    self.assertEqual(cli.run_cli(["show-config", "--cwd", bad_cwd]), 1, bad_cwd)
+
+            # 2) status --limit < 1 rejected
+            for bad_lim in ("0", "-3"):
+                buf = io.StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    self.assertEqual(cli.run_cli(["status", "--limit", bad_lim]), 1, bad_lim)
+
+            # 3) --checkpoint < 0 and missing checkpoint <= N exit 1; mismatch annotates output
+            sample_full = root / "custom_snapshot.jsonl"
+            _write_jsonl(
+                sample_full,
+                [
+                    {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\ninit\n</USER_REQUEST>"},
+                    {"step_index": 4, "type": "CHECKPOINT", "content": "<summary>cp4</summary>"},
+                ],
+            )
+            sib_full = root / "transcript_full.jsonl"
+            _write_jsonl(sib_full, [{"step_index": 0, "type": "USER_INPUT", "content": "sibling"}])
+            sib_compact = root / "transcript.jsonl"
+            _write_jsonl(sib_compact, [{"step_index": 0, "type": "USER_INPUT", "content": "compact"}])
+
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(cli.run_cli(["inspect", str(sample_full), "--checkpoint", "-1"]), 1)
+
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(cli.run_cli(["inspect", str(sample_full), "--checkpoint", "1"]), 1)
+            self.assertIn("no checkpoint", buf.getvalue().lower())
+
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(cli.run_cli(["inspect", str(sample_full), "--checkpoint", "999"]), 0)
+            insp = json.loads(buf.getvalue())
+            self.assertEqual(insp["checkpoint"], 4)
+            self.assertEqual(insp["requested_checkpoint"], 999)
+            self.assertIn("note", insp)
+
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(cli.run_cli(["preview", str(sample_full), "--checkpoint", "999"]), 0)
+            self.assertIn("Note:", buf.getvalue())
+
+            # 4) resolve_target_transcript: blank rejected, custom file honored, transcript.jsonl upgraded
+            self.assertIsNone(cli.resolve_target_transcript(""))
+            self.assertIsNone(cli.resolve_target_transcript("   "))
+            r_custom = cli.resolve_target_transcript(str(sample_full))
+            self.assertIsNotNone(r_custom)
+            assert r_custom is not None
+            self.assertEqual((r_custom[2], r_custom[3]), (sample_full, sample_full))
+            r_comp = cli.resolve_target_transcript(str(sib_compact))
+            self.assertIsNotNone(r_comp)
+            assert r_comp is not None
+            self.assertEqual((r_comp[2], r_comp[3]), (sib_compact, sib_full))
+
+            # 5) Exact CID > prefix match & status formatting (steps=empty, skipped(stale), disabled, rehydrated)
+            fake_home = root / "fake_home"
+            brain = fake_home / ".gemini" / "antigravity" / "brain"
+
+            l_exact = brain / "abcd" / ".system_generated" / "logs"
+            l_exact.mkdir(parents=True)
+            (l_exact / "transcript.jsonl").write_text('{"step_index": 2, "type": "CHECKPOINT"}\n', encoding="utf-8")
+            (l_exact / "rehydrate_state.json").write_text(
+                json.dumps({"last_rehydrated_checkpoint": 2, "checked_offset": 10, "last_status": "stale_skipped"}),
+                encoding="utf-8",
+            )
+            os.utime(l_exact / "transcript.jsonl", (1000, 1000))
+
+            l_pref = brain / "abcd1234" / ".system_generated" / "logs"
+            l_pref.mkdir(parents=True)
+            (l_pref / "transcript.jsonl").write_bytes(b"")
+            os.utime(l_pref / "transcript.jsonl", (2000, 2000))
+
+            l_dis = brain / "sess-dis" / ".system_generated" / "logs"
+            l_dis.mkdir(parents=True)
+            (l_dis / "transcript.jsonl").write_text('{"step_index": 5, "type": "CHECKPOINT"}\n', encoding="utf-8")
+            (l_dis / "rehydrate_state.json").write_text(
+                json.dumps({"last_rehydrated_checkpoint": 5, "checked_offset": 10, "last_status": "disabled"}),
+                encoding="utf-8",
+            )
+            os.utime(l_dis / "transcript.jsonl", (3000, 3000))
+
+            l_inj = brain / "sess-inj" / ".system_generated" / "logs"
+            l_inj.mkdir(parents=True)
+            (l_inj / "transcript.jsonl").write_text('{"step_index": 8, "type": "CHECKPOINT"}\n', encoding="utf-8")
+            (l_inj / "rehydrate_state.json").write_text(
+                json.dumps({"last_rehydrated_checkpoint": 8, "checked_offset": 10, "last_status": "injected"}),
+                encoding="utf-8",
+            )
+            os.utime(l_inj / "transcript.jsonl", (4000, 4000))
+
+            with mock.patch.object(Path, "home", return_value=fake_home):
+                r_exact = cli.resolve_target_transcript("abcd")
+                self.assertIsNotNone(r_exact)
+                assert r_exact is not None
+                self.assertEqual(r_exact[1], "abcd")
+
+                # A `./latest` file in CWD must NOT shadow `resolve_target_transcript("latest")`
+                cwd_latest = root / "latest"
+                cwd_latest.write_text("not a transcript\n", encoding="utf-8")
+                orig_cwd = os.getcwd()
+                try:
+                    os.chdir(root)
+                    r_latest = cli.resolve_target_transcript("latest")
+                finally:
+                    os.chdir(orig_cwd)
+                self.assertIsNotNone(r_latest)
+                assert r_latest is not None
+                self.assertEqual(r_latest[0], "antigravity")
+                self.assertEqual(r_latest[1], "sess-inj")
+
+                buf = io.StringIO()
+                with mock.patch.object(sys, "stdout", buf):
+                    self.assertEqual(cli.run_cli(["status", "--limit", "5"]), 0)
+                st_out = buf.getvalue()
+                self.assertIn("steps=empty", st_out)
+                self.assertIn("skipped(stale)=2", st_out)
+                self.assertIn("disabled=5", st_out)
+                self.assertIn("rehydrated=8", st_out)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

@@ -2,23 +2,25 @@
 
 # AGY 压缩后无损回水插件 (`agy-rehydrate`)
 
-基于 [AGY Post-Compact Rehydration](https://agy-rehydrate.pages.dev/) 封装并增强的 **Google Antigravity（App 2.x 桌面端、CLI `agy` 与 IDE）** 原生独立插件，完整支持 **Windows（PowerShell／CMD）、macOS 与 Linux** 跨平台运行。
+基于 [AGY Harness Hook Tricks: Post-Compact Rehydration](https://agy-harness-hook-tricks.pages.dev/compact-rehydration) 封装并增强的 **Google Antigravity（App 2.x 桌面端、CLI `agy` 与 IDE）** 原生独立插件，完整支持 **Windows（PowerShell／CMD）、macOS 与 Linux** 跨平台运行。
 
 全程采用**零第三方依赖**设计：仅需系统 `PATH` 具备 `Python 3.11.2+` 即可开箱即用。
 
 ---
 
-## 核心机制与跨端增强
+## 核心机制与架构设计（`v2.1.0`）
 
-- **平时零额外开销（~1 ms 增量尾扫）**：每次 `PreInvocation` 按字节偏移（`rehydrate_state.json`）增量扫描新增日志；普通对话轮次直接返回 `{}` 零 Token 消耗，仅在刚写入新 `CHECKPOINT`（手动 `/compact` 或跨过 256K 自动压缩）后的首轮执行无损回水，内置存量老会话守卫（`FRESH_CHECKPOINT_MAX_GAP = 8`）与双重幂等保护。
-- **零配置自适应回水（`adaptive: true`）**：先过滤有效工作区改动资格再自动切换三档模式（`completed_qa` 纯问答结案／`active_coding` 阶段写码／`mid_turn` 256K 工具循环中途压缩），动态估算标头与前言开销并施加压缩前体积比例上限（极短问答若已被原生摘要完整覆盖则直接静默返回 `{}`）：
-  1. **差量早期提问时间线 + 跨多轮里程碑索引**：自动解析原生 `CHECKPOINT`（`# User Requests`），**仅补齐滑出原生 10 条上限或跨 `/fork` 的更早期提问**（零重复；优先折叠上一轮压缩前的原始长日志粘贴并附行号指针）；多轮压缩会话额外提取已从最新摘要消失的早期 `Done` 里程碑／约束并附 `transcript_full.jsonl` 精确行号，抑制跨轮传话衰减。
-  2. **预算驱动近期对话滑窗与延迟压缩防护**：`completed_qa` 与 `active_coding` 保留最近 `2` 轮问答、`mid_turn` 留 `3` 轮（失败工具标记 `[ERROR]`）；预算充裕时倒数第二轮回复也全文保留，仅在超额时按剩余预算动态折叠中段；中途自动压缩后若已推进超过 `FRESH_CHECKPOINT_MAX_GAP` 步才触发 Hook，自动跳过过时对话与 `in_progress` 标记避免与现有步骤冲突。
-  3. **工作区实态漂移与未注入文件提醒**：在满足三层安全边界前提下，主动检测 `<CONTEXT_SUMMARY>` 或先前步骤引用但磁盘已不存在的过期目录／文件（收敛至顶层缺失目录并附上当前工作区顶层条目）、磁盘外部改动，以及未注入本体的历史修改文件提醒先 `read_file` 再改码。
-  4. **活跃规范、技能与编辑锚点视窗（Hunk Window）重读**：在写码或未完成回合重读近期 `SKILL.md`／`PLAN`/`SPEC` 与修改文件的**文件头声明 + 修改区上下 `±45` 行**（支持同压缩视窗内回合数复合时效），并在触及上限时优先整文件退让而非切碎代码块，保持 `## 1..N` 动态连续编号。
+`<CONTEXT_SUMMARY>` 属于有损摘要，而本地 `transcript_full.jsonl` 与磁盘上的工作区文件才是无损真相。
+
+- **平时零额外开销（~1 ms 增量尾扫）**：每次 `PreInvocation` 以 `python -S -B` / `python3 -S -B` 执行（快速路径仅导入 `json`、`os`、`sys`），按字节偏移（`rehydrate_state.json`）增量扫描日志；普通对话轮次直接返回 `{}` 零 Token 消耗，仅在刚写入新 `CHECKPOINT`（手动 `/compact` 或跨过 256K 自动压缩）后的首轮触发无损回水，内置存量老会话防误触守卫（`FRESH_CHECKPOINT_MAX_GAP = 8`）与双重幂等保护。
+- **确定性四层固定配额回水**：以可预期、可配置的四层结构取代易漂移的自适应／NLP 摘要启发式规则：
+  1. **完整用户提问时间线**（`budgetAllUserChars = 24,000`）：跨 `/fork` 分支编号还原完整提问时间线；第 1 条与最近 75 条提问优先全文保留（超额时按预算折叠），过滤更早期的 `<= 4` 字符纯非 ASCII／非数字寒暄，并对 `> 800` 字符的长粘贴内容进行折叠且保留 `transcript_full.jsonl` 精确行号指针。
+  2. **压缩前近期逐字对话**（`budgetRecentTurnsChars = 28,000`、`maxSingleTurnChars = 12,000`）：由新到旧回填逐字 User／Assistant 对话与单行去重工具轨迹（含压缩前尚未完成的工具调用），跨切块时保证单轮原子性绝不截断。
+  3. **活跃技能、规范文档与仓库规则指针**（`budgetSkillsSpecsChars = 14,000`）：列出所触及 Git／项目根目录下的 `AGENTS.md`／`GEMINI.md` 路径指针，并从磁盘实时重读已触及的 `SKILL.md`／`*SPEC*`／`*PLAN*`／`*TEMPLATE*`／`*HANDOFF*` 文档。
+  4. **活跃工作区文件实时重读**（`budgetFilesTotalChars = 28,000`、`budgetSingleFileChars = 8,000`）：从当前压缩周期（`fileScopeSincePrevCheckpoint = true`）实时重读最多 5 个修改文件与 2 个参考文件；严格 Fail-Closed 限定于工作区根目录（可选全局 `extraAllowedPaths`），解析符号链接并拦截 `.env*`、私钥、二进制文件、系统路径与 `scratch/`。
 - **跨 `/fork` 分支祖先链自动溯源**：最高向上回溯 8 层父会话并严格按 `[min_step, K - 1]` 切片隔离分叉后内容。
-- **48 KiB 自动切块与 Fail-Open 保护**：按 `44,000` UTF-8 bytes 自动拆分为多个 `injectSteps` 元素以规避底层单条 `SystemMessageStep` 48 KiB 截断上限；任何异常回退 `{}` 绝不阻塞会话。
-- **内置 `/rehydrate` 诊断技能**：支持 `status`、`inspect`、`preview` 与 `show-config` 只读子命令，未触发 `/compact` 前亦可预演回水效果与追踪文件列表。
+- **48 KiB 自动切块与 Fail-Open 保护**：按 `44,000` UTF-8 bytes 配合 CommonMark 围栏安全裁剪与单轮原子边界拆分为多个 `injectSteps` 元素，避免触发底层单条 `SystemMessageStep` 48 KiB 截断上限；任何异常回退 `{}` 绝不阻塞会话。
+- **内置 `/rehydrate` 诊断技能**：支持 `status`、`inspect`、`preview` 与 `show-config` 只读子命令（支持 `--cwd`、`--checkpoint`、`--limit`、`--full`），未触发 `/compact` 前亦可预演回水效果与追踪文件列表。
 
 ---
 
@@ -47,15 +49,18 @@
 ```json
 {
   "enabled": true,
-  "adaptive": true,
   "budgetAllUserChars": 24000,
-  "budgetRecentTurnsChars": 14000,
-  "budgetSkillsSpecsChars": 12000,
-  "budgetFilesTotalChars": 24000,
-  "budgetSingleFileChars": 10000,
-  "maxRecentEntries": 6,
-  "maxModifiedFiles": 3,
-  "maxReferencedFiles": 0,
-  "maxModifiedAgeSteps": 60
+  "budgetRecentTurnsChars": 28000,
+  "budgetSkillsSpecsChars": 14000,
+  "budgetFilesTotalChars": 28000,
+  "budgetSingleFileChars": 8000,
+  "maxSingleTurnChars": 12000,
+  "maxModifiedFiles": 5,
+  "maxReferencedFiles": 2,
+  "fileScopeSincePrevCheckpoint": true
 }
 ```
+
+全局专属安全配置（仅 `~/.agents/rehydrate.json` 生效，工作区配置无法覆写或放宽）：
+- `"extraAllowedPaths": ["~/path/to/trusted/dir"]`：允许第 4 层额外重读指定的非工作区可信目录（仍受敏感文件、二进制与系统路径过滤保护）。
+- 全局配置 `"enabled": false` 时，工作区的 `.agents/rehydrate.json` 无法将其覆写为 `true`。
