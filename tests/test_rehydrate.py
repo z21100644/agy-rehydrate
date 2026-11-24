@@ -1657,6 +1657,274 @@ class RehydrateTests(unittest.TestCase):
             self.assertIn("line 1 (step 0)", sec1_2)
             self.assertEqual(stats2["folded_paste_msgs"], 1)
 
+    def test_mid_turn_autocompaction_beyond_fresh_gap_still_rehydrates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            logs = root / "brain" / "c-autocompact" / ".system_generated" / "logs"
+            compact = logs / "transcript.jsonl"
+            full = logs / "transcript_full.jsonl"
+            state_p = logs / "rehydrate_state.json"
+
+            # 1) Simulate CP 1150 style 512K auto-compaction mid-turn followed by 18 tool steps + 1 new USER_INPUT
+            records: list[dict] = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\ninitial architecture goal\n</USER_REQUEST>"},
+                {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Working on implementation."},
+                {"step_index": 50, "type": "CHECKPOINT", "content": "<summary>mid-turn auto compact</summary>"},
+            ]
+            for s in range(51, 69):
+                records.append(
+                    {
+                        "step_index": s,
+                        "type": "PLANNER_RESPONSE" if s % 2 == 1 else "GENERIC",
+                        "content": "Continuing tool loop." if s % 2 == 1 else "tool ok",
+                    }
+                )
+            records.append(
+                {"step_index": 69, "type": "USER_INPUT", "content": "<USER_REQUEST>\ncheck status\n</USER_REQUEST>"}
+            )
+            _write_jsonl(compact, records)
+            _write_jsonl(full, records)
+
+            payload = json.dumps({"transcriptPath": str(compact), "cwd": str(ws)})
+            buf = io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(payload)), mock.patch.object(sys, "stdout", buf):
+                self.assertEqual(rh_entry.run_hook(), 0)
+            hook_out = json.loads(buf.getvalue().strip())
+            self.assertIn("injectSteps", hook_out)
+            injected_text = "\n".join(x["systemMessage"]["systemMessage"] for x in hook_out["injectSteps"])
+            self.assertIn("[POST-COMPACT REHYDRATION v1 | checkpoint=50]", injected_text)
+            self.assertIn("initial architecture goal", injected_text)
+            st = json.loads(state_p.read_text(encoding="utf-8"))
+            self.assertEqual(st["last_rehydrated_checkpoint"], 50)
+            self.assertEqual(st["last_status"], "injected")
+
+            # 2) Contrast: if a post-CP USER_INPUT was ALREADY answered by PLANNER_RESPONSE and gap > 8, skip as stale
+            logs_stale = root / "brain" / "c-autocompact-stale" / ".system_generated" / "logs"
+            compact_s = logs_stale / "transcript.jsonl"
+            full_s = logs_stale / "transcript_full.jsonl"
+            state_s = logs_stale / "rehydrate_state.json"
+            stale_recs: list[dict] = [
+                {"step_index": 0, "type": "USER_INPUT", "content": "<USER_REQUEST>\nold goal\n</USER_REQUEST>"},
+                {"step_index": 10, "type": "CHECKPOINT", "content": "<summary>cp10</summary>"},
+                {"step_index": 11, "type": "USER_INPUT", "content": "<USER_REQUEST>\nalready answered turn\n</USER_REQUEST>"},
+            ]
+            for s in range(12, 23):
+                stale_recs.append({"step_index": s, "type": "PLANNER_RESPONSE", "content": "answered"})
+            stale_recs.append(
+                {"step_index": 23, "type": "USER_INPUT", "content": "<USER_REQUEST>\nlater turn\n</USER_REQUEST>"}
+            )
+            _write_jsonl(compact_s, stale_recs)
+            _write_jsonl(full_s, stale_recs)
+            buf2 = io.StringIO()
+            payload2 = json.dumps({"transcriptPath": str(compact_s), "cwd": str(ws)})
+            with mock.patch.object(sys, "stdin", io.StringIO(payload2)), mock.patch.object(sys, "stdout", buf2):
+                self.assertEqual(rh_entry.run_hook(), 0)
+            self.assertEqual(buf2.getvalue().strip(), "{}")
+            st2 = json.loads(state_s.read_text(encoding="utf-8"))
+            self.assertEqual(st2["last_status"], "stale_skipped")
+
+    def test_swarm_worker_and_subagent_touches_and_large_file_active_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "ws"
+            ws.mkdir()
+            brain = root / "brain"
+
+            # Create a 95 KB script (edited mid-file by Swarm worker), a 120 KB JS monolith (unlocated read-only),
+            # a Makefile (edited by subagent), and a stale file edited by an old Epoch-1 worker before prev_cp.
+            big_sh = ws / "luci.mtk_wed"
+            sh_lines = ["#!/bin/sh", "# Header config line"] + [
+                f"helper_fn_{i}() {{ return {i}; }}  # filler padding line to reach 95KB" for i in range(1, 1800)
+            ]
+            sh_lines[1400] = (
+                "wed_restore() {\n"
+                '    local old="$1"\n'
+                '    [ -z "$old" ] || [ ! -e "$old" ] && return 1\n'
+                '    mv -f "$old" /etc/config/mtk_wed\n'
+                "}"
+            )
+            big_sh.write_text("\n".join(sh_lines) + "\n", encoding="utf-8")
+            self.assertGreater(big_sh.stat().st_size, 85_000)
+
+            giant_js = ws / "status.js"
+            js_lines = ["'use strict';", "// Module top header"] + [
+                f"const RENDER_ROW_{i} = 'static_ui_payload_padding_{i}_abcdef0123456789';" for i in range(1, 2200)
+            ]
+            giant_js.write_text("\n".join(js_lines) + "\n", encoding="utf-8")
+            self.assertGreater(giant_js.stat().st_size, 110_000)
+
+            makefile = ws / "Makefile"
+            makefile.write_text("PKG_NAME:=luci-app-mtk-wed\nPKG_VERSION:=2.1.0\nPKG_RELEASE:=1\n", encoding="utf-8")
+
+            stale_old = ws / "abandoned_epoch1.py"
+            stale_old.write_text("STALE_EPOCH1_WORKER_FILE = True\n", encoding="utf-8")
+
+            # Worker-only skill read by monitor (must NOT leak into coordinator Layer 3)
+            worker_only_skill_dir = ws / "internal_monitor_skill"
+            worker_only_skill_dir.mkdir()
+            worker_only_skill = worker_only_skill_dir / "SKILL.md"
+            worker_only_skill.write_text("# MONITOR ONLY DO NOT LOAD IN COORDINATOR\n", encoding="utf-8")
+
+            # Old Epoch-1 worker (before CP 10 at 2026-11-24T10:00:00Z)
+            w_old_logs = brain / "worker-epoch1" / ".system_generated" / "logs"
+            _write_jsonl(
+                w_old_logs / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-24T09:00:00Z",
+                        "content": "edited old",
+                        "tool_calls": [
+                            {"name": "write_file", "args": {"Path": str(stale_old), "Content": "STALE_EPOCH1_WORKER_FILE = True\n"}}
+                        ],
+                    }
+                ],
+            )
+
+            # Active Epoch-2 Swarm worker (recorded in members.json, edits big_sh mid-file and reads worker_only_skill)
+            w_swarm_logs = brain / "worker-swarm-author" / ".system_generated" / "logs"
+            _write_jsonl(
+                w_swarm_logs / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-24T10:05:00Z",
+                        "content": "loaded monitor skill & patched wed_restore",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": str(worker_only_skill)}},
+                            {
+                                "name": "edit_file",
+                                "args": {
+                                    "Path": str(big_sh),
+                                    "Target": "old",
+                                    "Replacement": sh_lines[1400],
+                                },
+                            },
+                        ],
+                    }
+                ],
+            )
+
+            # Active Epoch-2 invoke_subagent worker (edits Makefile)
+            w_sub_logs = brain / "subagent-packager-01" / ".system_generated" / "logs"
+            _write_jsonl(
+                w_sub_logs / "transcript_full.jsonl",
+                [
+                    {
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-24T10:06:00Z",
+                        "content": "bumped Makefile",
+                        "tool_calls": [
+                            {
+                                "name": "edit_file",
+                                "args": {
+                                    "Path": str(makefile),
+                                    "Target": "2.0.0",
+                                    "Replacement": "PKG_VERSION:=2.1.0\nPKG_RELEASE:=1",
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+
+            # Coordinator session with swarm/members.json and invoke_subagent GENERIC output
+            coord_art = brain / "coord-main"
+            swarm_dir = coord_art / ".system_generated" / "swarm"
+            swarm_dir.mkdir(parents=True)
+            (swarm_dir / "members.json").write_text(
+                json.dumps(
+                    {
+                        "members": {
+                            "coordinator": {"conversation_id": "coord-main", "role": "coordinator"},
+                            "old-worker": {"conversation_id": "worker-epoch1", "role": "worker"},
+                            "author": {"conversation_id": "worker-swarm-author", "role": "worker"},
+                            "traversal": {"conversation_id": "../evil", "role": "worker"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            coord_logs = coord_art / ".system_generated" / "logs" / "transcript_full.jsonl"
+            _write_jsonl(
+                coord_logs,
+                [
+                    {
+                        "step_index": 0,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-24T08:50:00Z",
+                        "content": "<USER_REQUEST>\nstart project\n</USER_REQUEST>",
+                    },
+                    {
+                        "step_index": 10,
+                        "type": "CHECKPOINT",
+                        "created_at": "2026-11-24T10:00:00Z",
+                        "content": "<summary>cp10</summary>",
+                    },
+                    {
+                        "step_index": 12,
+                        "type": "USER_INPUT",
+                        "created_at": "2026-11-24T10:01:00Z",
+                        "content": "<USER_REQUEST>\n/swarm fix wed_restore and bump release\n</USER_REQUEST>",
+                    },
+                    {
+                        "step_index": 13,
+                        "type": "PLANNER_RESPONSE",
+                        "created_at": "2026-11-24T10:02:00Z",
+                        "content": "Spawned packager and inspected status.js top.",
+                        "tool_calls": [
+                            {"name": "read_file", "args": {"Path": str(giant_js), "StartLine": 1, "EndLine": 800}},
+                            {"name": "invoke_subagent", "args": {"Role": "Packager", "TypeName": "self"}},
+                        ],
+                    },
+                    {
+                        "step_index": 14,
+                        "type": "GENERIC",
+                        "created_at": "2026-11-24T10:02:05Z",
+                        "content": 'Created At: 2026-11-24T10:02:05Z\nCreated the following subagent:\n{\n  "conversationId": "subagent-packager-01"\n}',
+                    },
+                    {
+                        "step_index": 20,
+                        "type": "CHECKPOINT",
+                        "created_at": "2026-11-24T10:10:00Z",
+                        "content": "<summary>cp20</summary>",
+                    },
+                ],
+            )
+
+            res = core.build_rehydration(
+                coord_logs,
+                up_to_checkpoint_step=20,
+                workspace_roots=[ws],
+                artifact_dir=coord_art,
+            )
+            self.assertIsNotNone(res)
+            assert res is not None
+            msg, stats = res
+
+            # 1) Both Swarm worker edit (`luci.mtk_wed`) and subagent edit (`Makefile`) are restored as Modified!
+            self.assertIn(f"Modified:{big_sh}", stats["file_paths"])
+            self.assertIn(f"Modified:{makefile}", stats["file_paths"])
+            # 2) Stale Epoch-1 worker file before CP 10 is NOT restored
+            self.assertNotIn("STALE_EPOCH1_WORKER_FILE", msg)
+            # 3) Worker-only read of SKILL.md does NOT leak into coordinator Layer 3
+            self.assertNotIn("MONITOR ONLY DO NOT LOAD IN COORDINATOR", msg)
+            # 4) 95 KB `luci.mtk_wed` includes the exact mid-file `wed_restore()` function @ ~line 1401 with line markers!
+            self.assertIn("wed_restore() {", msg)
+            self.assertIn('[ -z "$old" ] || [ ! -e "$old" ]', msg)
+            self.assertIn("omitted", msg)
+            # 5) Unlocated 120 KB `status.js` uses compact structural summary (~1.6K) instead of wasting 8,000 chars
+            self.assertIn(f"Referenced:{giant_js}", stats["file_paths"])
+            self.assertIn("large file (", msg)
+            self.assertLess(stats["layer_chars"]["files"], 10_000)
+            self.assertTrue(_commonmark_fences_balanced(msg))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

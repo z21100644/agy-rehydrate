@@ -15,6 +15,7 @@ Clean, deterministic architecture faithful to the AGY Post-Compact Rehydration d
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Sequence
 from datetime import datetime
 import json
@@ -54,6 +55,10 @@ DEFAULT_FILE_SCOPE_SINCE_PREV_CHECKPOINT = True
 MAX_REPO_RULE_FILES = 6
 MAX_FORK_DEPTH = 8
 FRESH_CHECKPOINT_MAX_GAP = 8
+MAX_AUTOCOMPACT_TURN_GAP = 400
+MAX_CHILD_TRANSCRIPTS = 24
+OVERSIZED_FILE_FACTOR = 4
+OVERSIZED_FILE_PREVIEW_CHARS = 1_600
 MAX_INJECT_STEP_BYTES = 44_000  # Safely under AGY's 49,152-byte (48 KiB) per-SystemMessageStep cap
 MAX_FILE_READ_BYTES = 2 * 1024 * 1024
 
@@ -189,11 +194,16 @@ NESTED_REHYDRATE_RE = re.compile(
 TIMELINE_SPLIT_RE = re.compile(r"\n(?=- \[#|- --- \[/fork )")
 TURN_SPLIT_RE = re.compile(r"\n\n(?=\[Step |\[Pre-Compaction |--- \[/fork )")
 FILE_SPLIT_RE = re.compile(
-    r"\n\n(?=### (?:`[^`\n]+` \(touched @ step \d+\)|\[(?:Modified|Referenced) @ step \d+\] `|Touched Repo Rule Files \(Paths Only\)))"
+    r"\n\n(?=### (?:`[^`\n]+` \(touched @ step \d+\)|\[(?:Modified|Referenced) @ step \d+(?:[^\]]*)\] `|Touched Repo Rule Files \(Paths Only\)))"
 )
 FENCE_LINE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 BACKTICK_RUN_RE = re.compile(r"`{3,}")
 STEP_INDEX_START_RE = re.compile(r'^\s*\{\s*"step_index"\s*:\s*(\d+)\s*[,}]')
+SAFE_CID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+CREATED_SUBAGENT_RE = re.compile(
+    r'Created the following subagent:\s*\{[^{}]{0,600}?"conversationId"\s*:\s*"([A-Za-z0-9._-]{1,128})"',
+    re.S,
+)
 
 
 class RehydrateConfig:
@@ -859,6 +869,231 @@ def read_text_clipped(path_str: Path | str, max_chars: int) -> str | None:
         f"... [truncated ~{omitted} chars in middle; read_file for full content] ...\n"
         f"{tail_part}"
     )
+
+
+def _is_pos_int(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and val >= 1
+
+
+def _render_oversized_compact_preview(text: str, total_lines: int, max_chars: int) -> str:
+    cap = min(OVERSIZED_FILE_PREVIEW_CHARS, max_chars)
+    marker_reserve = 148
+    head_len = max(120, int((cap - marker_reserve) * 0.72))
+    tail_len = max(0, cap - head_len - marker_reserve)
+    head_cut, tail_start = _snap_head_tail(text, head_len, tail_len)
+    omitted = max(0, tail_start - head_cut)
+    if omitted <= 80:
+        return text[:max_chars]
+    head_part = text[:head_cut]
+    tail_part = text[tail_start:] if tail_len > 0 and tail_start < len(text) else ""
+    marker = (
+        f"... [large file ({total_lines} lines / {len(text)} chars): "
+        f"~{omitted} chars omitted in middle; use read_file with StartLine/EndLine] ..."
+    )
+    return f"{head_part}\n{marker}\n{tail_part}" if tail_part else f"{head_part}\n{marker}"
+
+
+def read_workspace_file_slice(
+    path_str: Path | str,
+    max_chars: int,
+    *,
+    touch_events: Sequence[tuple[int, float, str, Any]] = (),
+    min_step: int = -1,
+    oversized_threshold: int | None = None,
+) -> str | None:
+    """Read workspace file for Layer 4: full if `<= max_chars`, exact active edit/read windows if located,
+    compact header/footer summary for unlocated giant monoliths, else standard 68/32 head/tail clip.
+    """
+    try:
+        with open(path_str, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+    if "\x00" in text[:8192]:
+        return None
+    if len(text) <= max_chars:
+        return text
+
+    giant_limit = (
+        oversized_threshold
+        if oversized_threshold is not None
+        else max(32_000, max_chars * OVERSIZED_FILE_FACTOR)
+    )
+    lines = text.splitlines()
+    total_lines = len(lines)
+    if total_lines <= 4 or (len(text) // max(1, total_lines)) > 1000:
+        if len(text) > giant_limit:
+            return _render_oversized_compact_preview(text, max(1, total_lines), max_chars)
+        return read_text_clipped(path_str, max_chars)
+
+    # Filter touch events chronologically: drop anything prior to the latest full-file overwrite, then keep >= min_step.
+    chron = sorted(touch_events, key=lambda x: (x[0], x[1]))
+    last_overwrite_idx = -1
+    for i, ev in enumerate(chron):
+        if ev[2] == "overwrite":
+            last_overwrite_idx = i
+    post_overwrite = chron[last_overwrite_idx + 1 :] if last_overwrite_idx >= 0 else chron
+    active = [ev for ev in reversed(post_overwrite) if ev[0] >= min_step and ev[2] != "overwrite"]
+
+    edit_spans: list[tuple[int, int]] = []
+    read_spans: list[tuple[int, int]] = []
+    if active:
+        line_starts: list[int] | None = None
+        seen_snips: set[str] = set()
+        seen_ranges: set[tuple[str, int, int | None]] = set()
+        for _, _, kind, payload in active:
+            if kind == "edit_str" and isinstance(payload, str):
+                if len(edit_spans) >= 12:
+                    continue
+                norm_snip = payload.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+                if len(norm_snip.strip()) < 16 or norm_snip in seen_snips:
+                    continue
+                seen_snips.add(norm_snip)
+                pos = text.find(norm_snip)
+                if pos == -1 and "\n" in norm_snip:
+                    stripped = norm_snip.strip()
+                    if len(stripped) >= 16:
+                        pos = text.find(stripped)
+                        if pos != -1:
+                            norm_snip = stripped
+                if pos == -1:
+                    continue
+                if "\n" not in norm_snip and len(norm_snip) < 48 and text.find(norm_snip, pos + 1) != -1:
+                    continue
+                if line_starts is None:
+                    line_starts = [0] + [idx + 1 for idx, ch in enumerate(text) if ch == "\n"]
+                s_ln = bisect_right(line_starts, pos)
+                e_ln = bisect_right(line_starts, pos + max(0, len(norm_snip) - 1))
+                edit_spans.append((max(1, s_ln - 14), min(total_lines, e_ln + 8)))
+            elif kind == "edit_range" and isinstance(payload, tuple) and len(payload) == 2:
+                if len(edit_spans) >= 12:
+                    continue
+                raw_s, raw_e = payload
+                rkey = ("edit", raw_s, raw_e)
+                if rkey in seen_ranges:
+                    continue
+                seen_ranges.add(rkey)
+                s_ln = max(1, min(total_lines, int(raw_s)))
+                e_ln = max(s_ln, min(total_lines, min(int(raw_e), s_ln + 100)))
+                edit_spans.append((max(1, s_ln - 12), min(total_lines, e_ln + 6)))
+            elif kind == "read_range" and isinstance(payload, tuple) and len(payload) == 2:
+                if len(read_spans) >= 8:
+                    continue
+                raw_s, raw_e = payload
+                if raw_s <= 5 and (raw_e is None or (raw_e - raw_s) >= 300):
+                    continue
+                rkey = ("read", raw_s, raw_e)
+                if rkey in seen_ranges:
+                    continue
+                seen_ranges.add(rkey)
+                s_ln = max(1, min(total_lines, int(raw_s)))
+                eff_e = (s_ln + 70) if raw_e is None else min(int(raw_e), s_ln + 90)
+                e_ln = max(s_ln, min(total_lines, eff_e))
+                if e_ln <= 25:
+                    continue
+                read_spans.append((s_ln, e_ln))
+
+    # When exact edit windows are located on a modified file, do not dilute its budget with QA read windows.
+    prioritized_spans = edit_spans if edit_spans else read_spans
+    max_spans = 8 if edit_spans else 4
+    if prioritized_spans and max_chars >= 600:
+        hdr_budget = min(1_000, max(200, int(max_chars * 0.16)))
+        hdr_end = 0
+        hdr_chars = 0
+        for ln in lines:
+            add = len(ln) + 1
+            if hdr_chars + add > hdr_budget:
+                break
+            hdr_chars += add
+            hdr_end += 1
+
+        marker_reserve = 420
+        rem = max_chars - hdr_chars - marker_reserve
+        selected: list[tuple[int, int]] = [(1, hdr_end)] if hdr_end > 0 else []
+        added_span_count = 0
+
+        def _is_covered(cs: int, ce: int) -> bool:
+            return any(es <= cs and ee >= ce for es, ee in selected)
+
+        for s_ln, e_ln in prioritized_spans:
+            if added_span_count >= max_spans or rem < 180:
+                break
+            if _is_covered(s_ln, e_ln):
+                continue
+            cost = sum(len(lines[i]) + 1 for i in range(s_ln - 1, e_ln))
+            cur_e = e_ln
+            if cost > rem:
+                acc = 0
+                fit_e = s_ln - 1
+                for i in range(s_ln - 1, e_ln):
+                    ln_cost = len(lines[i]) + 1
+                    if acc + ln_cost > rem:
+                        break
+                    acc += ln_cost
+                    fit_e = i + 1
+                if fit_e < s_ln:
+                    continue
+                cur_e = fit_e
+                cost = acc
+            if _is_covered(s_ln, cur_e):
+                continue
+            selected.append((s_ln, cur_e))
+            rem -= cost
+            added_span_count += 1
+
+        if added_span_count > 0 or edit_spans:
+            if not selected and hdr_end == 0:
+                return read_text_clipped(path_str, max_chars)
+            selected.sort(key=lambda x: (x[0], x[1]))
+            merged: list[tuple[int, int]] = []
+            for s_ln, e_ln in selected:
+                if not merged:
+                    merged.append((s_ln, e_ln))
+                    continue
+                ps, pe = merged[-1]
+                if s_ln <= pe + 1:
+                    merged[-1] = (ps, max(pe, e_ln))
+                elif s_ln <= pe + 9:
+                    gap_cost = sum(len(lines[i]) + 1 for i in range(pe, s_ln - 1))
+                    net_extra = gap_cost - 74
+                    if net_extra <= 0 or (gap_cost <= 260 and net_extra <= max(0, rem)):
+                        rem -= max(0, net_extra)
+                        merged[-1] = (ps, max(pe, e_ln))
+                    else:
+                        merged.append((s_ln, e_ln))
+                else:
+                    merged.append((s_ln, e_ln))
+
+            while True:
+                out_lines: list[str] = []
+                prev_e = 0
+                for ms, me in merged:
+                    if ms > prev_e + 1:
+                        om_cnt = ms - prev_e - 1
+                        out_lines.append(
+                            f"... [lines {prev_e + 1}..{ms - 1} omitted ({om_cnt} lines); read_file for full content] ..."
+                        )
+                    out_lines.extend(lines[ms - 1 : me])
+                    prev_e = me
+                if prev_e < total_lines:
+                    om_tail = total_lines - prev_e
+                    out_lines.append(
+                        f"... [lines {prev_e + 1}..{total_lines} omitted ({om_tail} lines, total {total_lines} lines); read_file for full content] ..."
+                    )
+                rendered = "\n".join(out_lines)
+                if len(rendered) <= max_chars:
+                    return rendered
+                last_s, last_e = merged[-1]
+                if last_e > last_s:
+                    merged[-1] = (last_s, last_e - 1)
+                elif len(merged) > 1:
+                    merged.pop()
+                else:
+                    break
+
+    if len(text) > giant_limit:
+        return _render_oversized_compact_preview(text, total_lines, max_chars)
+    return read_text_clipped(path_str, max_chars)
 
 
 def find_repo_rule_files(
@@ -1560,6 +1795,355 @@ def split_into_inject_chunks(
     ]
 
 
+def _is_safe_cid(cid: Any) -> bool:
+    return isinstance(cid, str) and bool(SAFE_CID_RE.match(cid)) and ".." not in cid
+
+
+def _is_unanswered_autocompact_continuation(full_path: Path, target_cp: int, max_seen_step: int) -> bool:
+    """Return True iff steps after `target_cp` are an active turn continuation with no answered user prompt."""
+    gap = max_seen_step - target_cp
+    if gap <= 0 or gap > MAX_AUTOCOMPACT_TURN_GAP:
+        return False
+    try:
+        st_size = full_path.stat().st_size
+        if st_size <= 0:
+            return False
+        window = 262_144
+        post_recs: list[tuple[int, str, str]] = []
+        with open(full_path, "rb") as fb:
+            while True:
+                seek_pos = max(0, st_size - window)
+                fb.seek(seek_pos)
+                raw_lines = fb.read().splitlines()
+                if seek_pos > 0 and raw_lines:
+                    raw_lines = raw_lines[1:]
+                earliest_step: int | None = None
+                cur_post: list[tuple[int, str, str]] = []
+                for raw in raw_lines:
+                    if not raw or raw.isspace():
+                        continue
+                    try:
+                        obj = json.loads(raw.decode("utf-8-sig", "replace"))
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sidx = obj.get("step_index", -1)
+                    if not isinstance(sidx, int) or isinstance(sidx, bool) or sidx < 0:
+                        continue
+                    if earliest_step is None or sidx < earliest_step:
+                        earliest_step = sidx
+                    if sidx > target_cp:
+                        stype = str(obj.get("type") or "")
+                        scontent = str(obj.get("content") or "") if stype == "USER_INPUT" else ""
+                        cur_post.append((sidx, stype, scontent))
+                post_recs = cur_post
+                if seek_pos == 0 or (earliest_step is not None and earliest_step <= target_cp):
+                    break
+                window *= 4
+    except OSError:
+        return False
+
+    if not post_recs:
+        return False
+    post_recs.sort(key=lambda x: x[0])
+    first_step, first_type, _ = post_recs[0]
+    if first_step > target_cp + 2 or first_type == "USER_INPUT":
+        return False
+
+    prev_s = target_cp
+    saw_real_user = False
+    for sidx, stype, raw_c in post_recs:
+        if sidx - prev_s > 4:
+            return False
+        prev_s = sidx
+        if stype == "USER_INPUT":
+            utxt = extract_user_text(raw_c)
+            if utxt and not is_compact_slash_cmd(utxt):
+                if saw_real_user:
+                    return False
+                saw_real_user = True
+        elif stype == "PLANNER_RESPONSE" and saw_real_user:
+            return False
+    return True
+
+
+_CHILD_SCAN_TOOL_TOKENS = (
+    '"edit_file"',
+    '"write_file"',
+    '"read_file"',
+    '"view_file"',
+    '"write_to_file"',
+    '"replace_file_content"',
+    '"multi_replace_file_content"',
+    '"run_command"',
+    '"run_in_terminal"',
+)
+
+
+def _trim_touch_events(ev_list: list[tuple[int, float, str, Any]]) -> None:
+    """Bound per-file event list without letting read_range calls evict edit/overwrite events."""
+    if len(ev_list) <= 32:
+        return
+    edits = [e for e in ev_list if e[2] != "read_range"][-24:]
+    reads = [e for e in ev_list if e[2] == "read_range"][-12:]
+    merged = sorted([*edits, *reads], key=lambda x: (x[0], x[1]))
+    ev_list[:] = merged
+
+
+def _record_tool_file_touches(
+    valid_tcs: list[dict[str, Any]],
+    step_idx: int,
+    sort_ep: float,
+    *,
+    is_child: bool,
+    cur_cid: str,
+    touched_paths: dict[str, int],
+    skill_spec_touch: dict[str, tuple[str, int]],
+    modified_touch: dict[str, tuple[str, int, float]],
+    read_touch: dict[str, tuple[str, int, float]],
+    file_touch_events: dict[str, list[tuple[int, float, str, Any]]],
+    child_cid_steps: dict[str, int] | None = None,
+) -> None:
+    for tc in valid_tcs:
+        tname = str(tc.get("name") or "")
+        targs = tc.get("args") or tc.get("arguments") or {}
+        if not isinstance(targs, dict):
+            continue
+        if not is_child and child_cid_steps is not None:
+            if tname == "send_message":
+                recip = targs.get("Recipient")
+                if _is_safe_cid(recip) and recip != cur_cid:
+                    child_cid_steps[str(recip)] = step_idx
+            elif tname == "manage_subagents":
+                cids = targs.get("ConversationIds")
+                if isinstance(cids, list):
+                    for c in cids:
+                        if _is_safe_cid(c) and c != cur_cid:
+                            child_cid_steps[str(c)] = step_idx
+
+        fpath = extract_tool_file_path(targs)
+        if fpath:
+            fkey = canonical_path_key(fpath)
+            if fpath not in touched_paths or step_idx >= touched_paths[fpath]:
+                touched_paths[fpath] = step_idx
+            if is_skill_or_spec(fpath):
+                if not is_child or tname in WRITE_TOOL_NAMES:
+                    if fkey not in skill_spec_touch or step_idx >= skill_spec_touch[fkey][1]:
+                        skill_spec_touch[fkey] = (fpath, step_idx)
+            elif tname in WRITE_TOOL_NAMES:
+                prev_m = modified_touch.get(fkey)
+                if prev_m is None or (step_idx, sort_ep) >= (prev_m[1], prev_m[2]):
+                    modified_touch[fkey] = (fpath, step_idx, sort_ep)
+                ev_list = file_touch_events.setdefault(fkey, [])
+                if tname in ("write_file", "write_to_file"):
+                    if targs.get("Append") is True:
+                        c_str = targs.get("Content") or targs.get("CodeContent")
+                        if isinstance(c_str, str) and len(c_str.strip()) >= 16:
+                            ev_list.append((step_idx, sort_ep, "edit_str", c_str[:6000]))
+                    else:
+                        ev_list.append((step_idx, sort_ep, "overwrite", None))
+                elif tname == "edit_file":
+                    repl = targs.get("Replacement")
+                    if isinstance(repl, str) and len(repl.strip()) >= 16:
+                        ev_list.append((step_idx, sort_ep, "edit_str", repl[:6000]))
+                elif tname == "replace_file_content":
+                    repl = targs.get("ReplacementContent")
+                    s_ln, e_ln = targs.get("StartLine"), targs.get("EndLine")
+                    if isinstance(repl, str) and len(repl.strip()) >= 16:
+                        ev_list.append((step_idx, sort_ep, "edit_str", repl[:6000]))
+                    elif _is_pos_int(s_ln) and _is_pos_int(e_ln):
+                        ev_list.append((step_idx, sort_ep, "edit_range", (int(s_ln), max(int(s_ln), int(e_ln)))))
+                elif tname == "multi_replace_file_content":
+                    rchunks = targs.get("ReplacementChunks")
+                    if isinstance(rchunks, list):
+                        for rch in rchunks[:8]:
+                            if not isinstance(rch, dict):
+                                continue
+                            repl = rch.get("ReplacementContent")
+                            s_ln, e_ln = rch.get("StartLine"), rch.get("EndLine")
+                            if isinstance(repl, str) and len(repl.strip()) >= 16:
+                                ev_list.append((step_idx, sort_ep, "edit_str", repl[:6000]))
+                            elif _is_pos_int(s_ln) and _is_pos_int(e_ln):
+                                ev_list.append(
+                                    (step_idx, sort_ep, "edit_range", (int(s_ln), max(int(s_ln), int(e_ln))))
+                                )
+                _trim_touch_events(ev_list)
+            elif tname in READ_TOOL_NAMES:
+                prev_r = read_touch.get(fkey)
+                if prev_r is None or (step_idx, sort_ep) >= (prev_r[1], prev_r[2]):
+                    read_touch[fkey] = (fpath, step_idx, sort_ep)
+                if tname in ("read_file", "view_file"):
+                    s_ln = targs.get("StartLine")
+                    e_ln = targs.get("EndLine")
+                    if _is_pos_int(s_ln):
+                        ev_list = file_touch_events.setdefault(fkey, [])
+                        ev_list.append(
+                            (step_idx, sort_ep, "read_range", (int(s_ln), int(e_ln) if _is_pos_int(e_ln) else None))
+                        )
+                        _trim_touch_events(ev_list)
+        elif tname in ("run_command", "run_in_terminal"):
+            cmd_str = str(targs.get("CommandLine") or targs.get("Command") or "")
+            for cand in ABS_PATH_RE.findall(cmd_str)[:8]:
+                cleaned = cand.rstrip(".,;:)'\"`")
+                if len(cleaned) >= 4 and (cleaned not in touched_paths or step_idx >= touched_paths[cleaned]):
+                    touched_paths[cleaned] = step_idx
+
+
+def _collect_child_file_touches(
+    full_path: Path,
+    effective_artifact_dir: Path | None,
+    cur_cid: str,
+    child_cid_steps: dict[str, int],
+    coord_timeline: list[tuple[float, int]],
+    *,
+    file_min_step: int,
+    prev_cp_epoch: float | None,
+    target_cp: int,
+    target_cp_epoch: float | None,
+    up_to_checkpoint_step: int | None,
+    touched_paths: dict[str, int],
+    skill_spec_touch: dict[str, tuple[str, int]],
+    modified_touch: dict[str, tuple[str, int, float]],
+    read_touch: dict[str, tuple[str, int, float]],
+    file_touch_events: dict[str, list[tuple[int, float, str, Any]]],
+) -> int:
+    """Scan `/swarm` worker (`members.json`) and `invoke_subagent` transcripts for file reads/edits."""
+    candidates: dict[str, int] = dict(child_cid_steps)
+    swarm_roots: list[Path] = []
+    inferred_art = infer_artifact_dir_from_transcript_path(full_path)
+    for root_cand in (effective_artifact_dir, inferred_art):
+        if root_cand is not None and root_cand not in swarm_roots:
+            swarm_roots.append(root_cand)
+    for sroot in swarm_roots:
+        members_path = sroot / ".system_generated" / "swarm" / "members.json"
+        if members_path.is_file():
+            try:
+                mdata = json.loads(members_path.read_text(encoding="utf-8-sig"))
+                if isinstance(mdata, dict) and isinstance(mdata.get("members"), dict):
+                    default_hint = max(0, target_cp - 1)
+                    for m_info in mdata["members"].values():
+                        if not isinstance(m_info, dict) or m_info.get("role") == "coordinator":
+                            continue
+                        w_cid = m_info.get("conversation_id")
+                        if _is_safe_cid(w_cid) and w_cid != cur_cid:
+                            candidates.setdefault(str(w_cid), default_hint)
+            except (OSError, ValueError):
+                pass
+
+    if not candidates:
+        return 0
+
+    brain_dir: Path | None = None
+    if inferred_art is not None and inferred_art.parent.is_dir():
+        brain_dir = inferred_art.parent
+    elif effective_artifact_dir is not None and effective_artifact_dir.parent.is_dir():
+        brain_dir = effective_artifact_dir.parent
+    if brain_dir is None:
+        return 0
+
+    try:
+        brain_prefix = _norm_prefix(brain_dir.resolve())
+    except OSError:
+        return 0
+
+    cand_logs: list[tuple[float, str, Path, int]] = []
+    for child_cid, hint_step in candidates.items():
+        if not _is_safe_cid(child_cid) or child_cid == cur_cid:
+            continue
+        logs_dir = brain_dir / child_cid / ".system_generated" / "logs"
+        chosen: Path | None = None
+        for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+            fp = logs_dir / fname
+            if fp.is_file():
+                chosen = fp
+                break
+        if chosen is None:
+            continue
+        try:
+            resolved_log = chosen.resolve()
+            if not _is_subpath(_norm_prefix(resolved_log), brain_prefix):
+                continue
+            st = resolved_log.stat()
+            if st.st_size <= 0:
+                continue
+            if file_min_step > 0 and prev_cp_epoch is not None and st.st_mtime < prev_cp_epoch - 5.0:
+                continue
+            cand_logs.append((st.st_mtime, child_cid, resolved_log, hint_step))
+        except OSError:
+            continue
+
+    if not cand_logs:
+        return 0
+
+    cand_logs.sort(key=lambda x: x[0], reverse=True)
+    coord_epochs = [ep for ep, _ in coord_timeline]
+    coord_steps = [st for _, st in coord_timeline]
+    max_proj_step = max(0, target_cp - 1)
+    scanned = 0
+
+    for _, _, log_path, hint_step in cand_logs[:MAX_CHILD_TRANSCRIPTS]:
+        try:
+            if target_cp_epoch is not None:
+                first_info = read_first_step_info(log_path)
+                if first_info is not None and first_info[1] is not None and first_info[1] > target_cp_epoch + 2.0:
+                    continue
+            with open(log_path, "r", encoding="utf-8-sig", errors="replace") as wf:
+                scanned += 1
+                for line in wf:
+                    if '"PLANNER_RESPONSE"' not in line or not any(tok in line for tok in _CHILD_SCAN_TOOL_TOKENS):
+                        continue
+                    try:
+                        wobj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(wobj, dict) or wobj.get("type") != "PLANNER_RESPONSE":
+                        continue
+                    tcs = wobj.get("tool_calls") or []
+                    valid_tcs = [tc for tc in tcs if isinstance(tc, dict)]
+                    if not valid_tcs:
+                        continue
+                    w_ep = parse_iso_epoch(wobj.get("created_at"))
+                    if w_ep is not None:
+                        if target_cp_epoch is not None and w_ep > target_cp_epoch + 2.0:
+                            break
+                        if file_min_step > 0 and prev_cp_epoch is not None and w_ep < prev_cp_epoch - 1.0:
+                            continue
+                        if coord_epochs:
+                            pos = bisect_right(coord_epochs, w_ep) - 1
+                            proj_step = coord_steps[max(0, pos)]
+                            if file_min_step > 0 and prev_cp_epoch is not None and w_ep >= prev_cp_epoch - 1.0:
+                                proj_step = max(proj_step, file_min_step)
+                            proj_step = min(proj_step, max_proj_step)
+                        else:
+                            proj_step = min(max(hint_step, max(0, file_min_step)), max_proj_step)
+                        sort_ep = w_ep
+                    else:
+                        if up_to_checkpoint_step is not None and hint_step >= target_cp:
+                            continue
+                        if file_min_step > 0 and hint_step < file_min_step:
+                            continue
+                        proj_step = min(max(hint_step, max(0, file_min_step)), max_proj_step)
+                        sort_ep = float(proj_step)
+
+                    _record_tool_file_touches(
+                        valid_tcs,
+                        proj_step,
+                        sort_ep,
+                        is_child=True,
+                        cur_cid=cur_cid,
+                        touched_paths=touched_paths,
+                        skill_spec_touch=skill_spec_touch,
+                        modified_touch=modified_touch,
+                        read_touch=read_touch,
+                        file_touch_events=file_touch_events,
+                    )
+        except OSError:
+            continue
+
+    return scanned
+
+
 def build_rehydration(
     full_path: Path,
     up_to_checkpoint_step: int | None = None,
@@ -1577,6 +2161,7 @@ def build_rehydration(
     """Build deterministic 4-layer lossless rehydration payload and UTF-8 safe `injectSteps` chunks."""
     cfg = config or RehydrateConfig()
     checkpoints: list[int] = []
+    cp_epochs: dict[int, float | None] = {}
     already_rehydrated_after: set[int] = set()
     max_seen_step = -1
     cur_first_step: int | None = None
@@ -1627,6 +2212,7 @@ def build_rehydration(
             stype = obj.get("type")
             if stype == "CHECKPOINT":
                 checkpoints.append(step_idx)
+                cp_epochs[step_idx] = parse_iso_epoch(obj.get("created_at"))
                 last_cp = step_idx
             elif stype == "SYSTEM_MESSAGE" and last_cp is not None:
                 if is_rehydration_system_message(str(obj.get("content") or ""), checkpoint=last_cp):
@@ -1680,6 +2266,7 @@ def build_rehydration(
         and up_to_checkpoint_step is None
         and max_seen_step > target_cp
         and (max_seen_step - target_cp) > max_fresh_gap
+        and not _is_unanswered_autocompact_continuation(full_path, target_cp, max_seen_step)
     ):
         _set_status("stale_skipped", target_cp)
         return None
@@ -1716,10 +2303,13 @@ def build_rehydration(
     all_checkpoints: list[int] = list(checkpoints)
     user_messages: list[tuple[int, str, Path | None, int]] = []
     dialogue_entries: list[tuple[str, int | None]] = []
-    modified_touch: dict[str, tuple[str, int]] = {}
-    read_touch: dict[str, tuple[str, int]] = {}
+    modified_touch: dict[str, tuple[str, int, float]] = {}
+    read_touch: dict[str, tuple[str, int, float]] = {}
     skill_spec_touch: dict[str, tuple[str, int]] = {}
     touched_paths: dict[str, int] = {}
+    file_touch_events: dict[str, list[tuple[int, float, str, Any]]] = {}
+    child_cid_steps: dict[str, int] = {}
+    coord_timeline: list[tuple[float, int]] = []
     pending_tools: list[str] = []
 
     for seg_idx, seg in enumerate(segments):
@@ -1742,6 +2332,7 @@ def build_rehydration(
                     '"USER_INPUT"' not in line
                     and '"PLANNER_RESPONSE"' not in line
                     and '"CHECKPOINT"' not in line
+                    and "Created the following subagent:" not in line
                 ):
                     continue
                 try:
@@ -1756,8 +2347,14 @@ def build_rehydration(
                 if step_idx > seg_max:
                     break
                 stype = obj.get("type")
+                rec_ep = parse_iso_epoch(obj.get("created_at"))
+                if rec_ep is not None and (not coord_timeline or rec_ep >= coord_timeline[-1][0]):
+                    coord_timeline.append((rec_ep, step_idx))
+                sort_ep = rec_ep if rec_ep is not None else float(step_idx)
+
                 if stype == "CHECKPOINT":
                     all_checkpoints.append(step_idx)
+                    cp_epochs[step_idx] = rec_ep
                 elif stype == "USER_INPUT":
                     utext = extract_user_text(str(obj.get("content") or ""))
                     if utext and not is_compact_slash_cmd(utext):
@@ -1772,27 +2369,19 @@ def build_rehydration(
                         tool_summary = summarize_tool_calls(valid_tcs)
                         if tool_summary:
                             pending_tools.append(tool_summary)
-                        for tc in valid_tcs:
-                            tname = str(tc.get("name") or "")
-                            targs = tc.get("args") or tc.get("arguments") or {}
-                            if not isinstance(targs, dict):
-                                continue
-                            fpath = extract_tool_file_path(targs)
-                            if fpath:
-                                fkey = canonical_path_key(fpath)
-                                touched_paths[fpath] = step_idx
-                                if is_skill_or_spec(fpath):
-                                    skill_spec_touch[fkey] = (fpath, step_idx)
-                                elif tname in WRITE_TOOL_NAMES:
-                                    modified_touch[fkey] = (fpath, step_idx)
-                                elif tname in READ_TOOL_NAMES:
-                                    read_touch[fkey] = (fpath, step_idx)
-                            elif tname in ("run_command", "run_in_terminal"):
-                                cmd_str = str(targs.get("CommandLine") or targs.get("Command") or "")
-                                for cand in ABS_PATH_RE.findall(cmd_str)[:8]:
-                                    cleaned = cand.rstrip(".,;:)'\"`")
-                                    if len(cleaned) >= 4:
-                                        touched_paths[cleaned] = step_idx
+                        _record_tool_file_touches(
+                            valid_tcs,
+                            step_idx,
+                            sort_ep,
+                            is_child=False,
+                            cur_cid=cur_cid,
+                            touched_paths=touched_paths,
+                            skill_spec_touch=skill_spec_touch,
+                            modified_touch=modified_touch,
+                            read_touch=read_touch,
+                            file_touch_events=file_touch_events,
+                            child_cid_steps=child_cid_steps,
+                        )
                     mcontent = strip_nested_rehydration(str(obj.get("content") or "").strip())
                     if mcontent:
                         tool_prefix = ""
@@ -1800,6 +2389,12 @@ def build_rehydration(
                             tool_prefix = f"  (Tools run: {_format_pending_tools(pending_tools)})\n"
                             pending_tools.clear()
                         dialogue_entries.append((f"[Step {step_idx} | Assistant]:\n{tool_prefix}{mcontent}", None))
+                elif stype == "GENERIC":
+                    gcontent = str(obj.get("content") or "")
+                    for m_sub in CREATED_SUBAGENT_RE.finditer(gcontent):
+                        scid = m_sub.group(1)
+                        if _is_safe_cid(scid) and scid != cur_cid:
+                            child_cid_steps[scid] = step_idx
 
     if pending_tools:
         dialogue_entries.append(
@@ -1808,6 +2403,26 @@ def build_rehydration(
 
     prev_cp = max((c for c in all_checkpoints if c < target_cp), default=None)
     file_min_step = (prev_cp + 1) if (cfg.file_scope_since_prev_checkpoint and prev_cp is not None) else -1
+    prev_cp_epoch = cp_epochs.get(prev_cp) if prev_cp is not None else None
+    target_cp_epoch = cp_epochs.get(target_cp)
+
+    child_sessions_scanned = _collect_child_file_touches(
+        full_path,
+        effective_artifact_dir,
+        cur_cid,
+        child_cid_steps,
+        coord_timeline,
+        file_min_step=file_min_step,
+        prev_cp_epoch=prev_cp_epoch,
+        target_cp=target_cp,
+        target_cp_epoch=target_cp_epoch,
+        up_to_checkpoint_step=up_to_checkpoint_step,
+        touched_paths=touched_paths,
+        skill_spec_touch=skill_spec_touch,
+        modified_touch=modified_touch,
+        read_touch=read_touch,
+        file_touch_events=file_touch_events,
+    )
 
     # Layer 2: Recent Pre-Compaction Verbatim Dialogue (computed before Layer 1 to deduplicate long pastes)
     kept_turn_items: list[tuple[str, int | None, bool]] = []
@@ -1868,26 +2483,26 @@ def build_rehydration(
                 used_skills += len(block) + 2
 
     # Layer 4: Active Workspace Files (Top Modified + Top Referenced; scoped to current compaction cycle by default)
-    cycle_mod_step_by_rkey: dict[str, int] = {}
-    mod_candidates: list[tuple[str, Path, str, int]] = []
-    for _, (p, st) in sorted(modified_touch.items(), key=lambda x: x[1][1], reverse=True):
+    cycle_mod_by_rkey: dict[str, tuple[int, float]] = {}
+    mod_candidates: list[tuple[str, Path, str, int, str]] = []
+    for fkey, (p, st, sep) in sorted(modified_touch.items(), key=lambda x: (x[1][1], x[1][2]), reverse=True):
         if st < file_min_step:
             continue
         resolved = _resolve_eligible_file(p, allowed_prefixes=ws_allowed, excluded_prefixes=scratch_excluded)
         if resolved is None:
             continue
         rkey = canonical_path_key(str(resolved))
-        if rkey in restored_resolved_keys or rkey in cycle_mod_step_by_rkey:
+        if rkey in restored_resolved_keys or rkey in cycle_mod_by_rkey:
             continue
-        cycle_mod_step_by_rkey[rkey] = st
+        cycle_mod_by_rkey[rkey] = (st, sep)
         if len(mod_candidates) < cfg.max_modified_files:
-            mod_candidates.append((rkey, resolved, p, st))
-    mod_rkeys = {k for k, _, _, _ in mod_candidates}
+            mod_candidates.append((rkey, resolved, p, st, fkey))
+    mod_rkeys = {k for k, _, _, _, _ in mod_candidates}
 
-    ref_candidates: list[tuple[str, Path, str, int]] = []
+    ref_candidates: list[tuple[str, Path, str, int, str]] = []
     seen_ref_rkeys: set[str] = set()
     if cfg.max_referenced_files > 0:
-        for _, (p, st) in sorted(read_touch.items(), key=lambda x: x[1][1], reverse=True):
+        for fkey, (p, st, sep) in sorted(read_touch.items(), key=lambda x: (x[1][1], x[1][2]), reverse=True):
             if st < file_min_step:
                 continue
             resolved = _resolve_eligible_file(p, allowed_prefixes=ws_allowed, excluded_prefixes=scratch_excluded)
@@ -1896,25 +2511,33 @@ def build_rehydration(
             rkey = canonical_path_key(str(resolved))
             if rkey in restored_resolved_keys or rkey in seen_ref_rkeys:
                 continue
-            mod_st = cycle_mod_step_by_rkey.get(rkey)
-            if mod_st is not None and (mod_st >= st or rkey in mod_rkeys):
+            mod_info = cycle_mod_by_rkey.get(rkey)
+            if mod_info is not None and (mod_info >= (st, sep) or rkey in mod_rkeys):
                 continue
             seen_ref_rkeys.add(rkey)
-            ref_candidates.append((rkey, resolved, p, st))
+            ref_candidates.append((rkey, resolved, p, st, fkey))
             if len(ref_candidates) >= cfg.max_referenced_files:
                 break
 
     file_blocks: list[str] = []
     restored_file_paths: list[str] = []
     used_files = 0
+    oversized_threshold = max(32_000, cfg.budget_single_file_chars * OVERSIZED_FILE_FACTOR)
     if cfg.budget_files_total_chars >= 800:
         for role_label, items in (("Modified", mod_candidates), ("Referenced", ref_candidates)):
-            for _, resolved_path, fpath, fstep in items:
+            for rkey, resolved_path, fpath, fstep, orig_fkey in items:
                 rem = cfg.budget_files_total_chars - used_files
                 if rem < 800:
                     break
-                content = read_text_clipped(
-                    resolved_path, min(cfg.budget_single_file_chars, max(200, rem - len(fpath) - 64))
+                events_for_file = file_touch_events.get(orig_fkey) or file_touch_events.get(rkey) or ()
+                if rkey != orig_fkey and rkey in file_touch_events and orig_fkey in file_touch_events:
+                    events_for_file = [*file_touch_events[orig_fkey], *file_touch_events[rkey]]
+                content = read_workspace_file_slice(
+                    resolved_path,
+                    min(cfg.budget_single_file_chars, max(200, rem - len(fpath) - 64)),
+                    touch_events=events_for_file,
+                    min_step=file_min_step,
+                    oversized_threshold=oversized_threshold,
                 )
                 if content:
                     fence = _fence_for(content)
@@ -2021,6 +2644,7 @@ def build_rehydration(
         "simulated": simulated,
         "fork_hops": len(resolved_ancestors),
         "fork_ancestors": resolved_ancestors,
+        "child_sessions_scanned": child_sessions_scanned,
         "max_seen_step": max_seen_step,
         "user_msgs": real_user_count,
         "kept_user_msgs": kept_user_count,

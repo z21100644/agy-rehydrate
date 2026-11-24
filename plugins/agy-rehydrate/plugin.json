@@ -1,7 +1,7 @@
 {
   "name": "agy-rehydrate",
   "displayName": "AGY Post-Compact Rehydration",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Deterministic 4-layer post-compaction context rehydration and /fork lineage stitching for Antigravity App, CLI, and IDE: restores complete user prompt timeline, recent verbatim dialogue, active skills/specs & repo rule pointers, and live workspace files after /compact or 256K auto-compaction.",
   "logo": "assets/logo.svg",
   "author": "Adapted from AGY Harness Hook Tricks (Post-Compact Rehydration)",

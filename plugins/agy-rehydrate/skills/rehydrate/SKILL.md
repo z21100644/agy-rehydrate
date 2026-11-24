@@ -9,7 +9,7 @@ description: >-
 
 # Post-Compact Rehydration (`/rehydrate`)
 
-`agy-rehydrate` runs via `PreInvocation` with ~1 ms in-process incremental tail checks on normal turns and triggers deterministic 4-layer recovery (complete user timeline, recent verbatim dialogue, active skills/specs + repo rule pointers, and live top modified/referenced workspace files, plus `/fork` lineage stitching) on the **first turn immediately after `/compact` or 256K auto-compaction** across Antigravity 2.x App, CLI, and IDE.
+`agy-rehydrate` runs via `PreInvocation` with ~1 ms in-process incremental tail checks on normal turns and triggers deterministic 4-layer recovery (complete user timeline, recent verbatim dialogue, active skills/specs + repo rule pointers, and live top modified/referenced workspace files across the main session and `/swarm` / subagent workers, plus `/fork` lineage stitching) on the **first invocation after `/compact` or mid-turn 256K/512K auto-compaction** across Antigravity 2.x App, CLI, and IDE.
 
 ## Read-Only Diagnostic CLI
 
